@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="Operating System 일일 심화 학습 아카이브">
+  <title>Operating System · Daily Archive</title>
+  <style>
+    :root{color-scheme:dark;--bg:#06111a;--panel:#0c1b26;--line:#1d3945;--text:#ecfeff;--muted:#9cb9be;--accent:#5eead4}
+    *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% -10%,#0e3b3a,transparent 34%),var(--bg);color:var(--text);font:16px/1.7 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    a{color:inherit}.wrap{width:min(1040px,calc(100% - 32px));margin:auto}.hero{padding:62px 0 30px}.eyebrow{color:var(--accent);font-size:.82rem;font-weight:900;letter-spacing:.13em}.hero h1{font-size:clamp(2.2rem,7vw,4.6rem);line-height:1.05;margin:.18em 0}.hero p{max-width:720px;color:var(--muted)}.nav{display:flex;gap:12px;flex-wrap:wrap;margin:24px 0}.button{border:1px solid var(--line);border-radius:999px;padding:9px 15px;text-decoration:none;background:#071723}.primary{border-color:var(--accent);color:var(--accent)}
+    .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:16px 0 28px}.stat,.panel,.lesson{border:1px solid var(--line);background:rgba(12,27,38,.94);border-radius:18px}.stat{padding:20px}.label,.meta{color:var(--muted);font-size:.82rem}.value{font-size:1.55rem;font-weight:900}progress{width:100%;height:12px;accent-color:var(--accent)}.panel{padding:20px;margin-bottom:20px}.controls{display:grid;grid-template-columns:1fr 180px;gap:12px}input,select{width:100%;border:1px solid var(--line);border-radius:12px;background:#071723;color:var(--text);padding:12px;font:inherit}.list{display:grid;gap:14px;padding-bottom:64px}.lesson{display:grid;grid-template-columns:88px 1fr auto;gap:18px;align-items:center;padding:20px;text-decoration:none}.lesson:hover{border-color:var(--accent)}.day,.arrow{color:var(--accent);font-weight:900}.lesson h2{font-size:1.1rem;margin:0 0 4px}.lesson p{color:var(--muted);margin:0}.empty{text-align:center;color:var(--muted);padding:50px 20px;border:1px dashed var(--line);border-radius:18px}
+    @media(max-width:720px){.stats{grid-template-columns:1fr}.controls{grid-template-columns:1fr}.lesson{grid-template-columns:68px 1fr}.arrow{display:none}}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <header class="hero"><div class="eyebrow">DAILY LEARNING · GITHUB PAGES</div><h1 id="subject">Operating System 심화 학습</h1><p id="tagline">이메일과 동일한 HTML 원본을 순서대로 보관합니다.</p><nav class="nav"><a class="button primary" href="../">전체 커리큘럼</a><a class="button" href="https://github.com/limseunghyun95/operating-system-learning-pages">Pages 저장소</a></nav></header>
+    <section class="stats"><article class="stat"><div class="label">진행률</div><div class="value" id="progressText">0 / 63</div><progress id="progress" max="63" value="0"></progress></article><article class="stat"><div class="label">최근 학습</div><div class="value" id="latest">—</div></article><article class="stat"><div class="label">마지막 갱신</div><div class="value" id="updated">—</div></article></section>
+    <section class="panel controls"><label><span class="label">검색</span><input id="query" type="search" placeholder="제목이나 요약 검색"></label><label><span class="label">주차</span><select id="week"><option value="all">전체 주차</option></select></label></section>
+    <section id="list" class="list" aria-live="polite"><div class="empty">학습자료를 불러오는 중입니다.</div></section>
+  </main>
+  <script>
+    const state={lessons:[]},el=id=>document.getElementById(id);
+    const fmt=v=>v?new Intl.DateTimeFormat("ko-KR",{timeZone:"Asia/Seoul",dateStyle:"medium"}).format(new Date(v)):"—";
+    function render(){const q=el("query").value.trim().toLocaleLowerCase("ko"),w=el("week").value,list=el("list");list.replaceChildren();const rows=state.lessons.filter(x=>(w==="all"||String(x.week)===w)&&(!q||`${x.title} ${x.summary||""}`.toLocaleLowerCase("ko").includes(q)));if(!rows.length){const d=document.createElement("div");d.className="empty";d.textContent="조건에 맞는 학습자료가 없습니다.";list.append(d);return}for(const x of rows){const a=document.createElement("a");a.className="lesson";a.href=x.path;a.innerHTML=`<div class="day">DAY ${String(x.day).padStart(2,"0")}</div><div><div class="meta">WEEK ${x.week} · ${fmt(x.publishedAt)}</div><h2></h2><p></p></div><div class="arrow">→</div>`;a.querySelector("h2").textContent=x.title;a.querySelector("p").textContent=x.summary||"";list.append(a)}}
+    async function boot(){try{const r=await fetch("manifest.json",{cache:"no-store"});if(!r.ok)throw new Error(`HTTP ${r.status}`);const m=await r.json();state.lessons=(m.lessons||[]).filter(x=>Number.isInteger(x.day)&&/^day-\d{2}\.html$/.test(x.path||"")).sort((a,b)=>b.day-a.day);document.documentElement.style.setProperty("--accent",m.accent||"#5eead4");el("subject").textContent=`${m.subject} 심화 학습`;el("tagline").textContent=m.tagline;el("progress").max=m.totalDays;el("progress").value=state.lessons.length;el("progressText").textContent=`${state.lessons.length} / ${m.totalDays}`;el("latest").textContent=state.lessons[0]?`Day ${String(state.lessons[0].day).padStart(2,"0")}`:"—";el("updated").textContent=fmt(m.updatedAt);for(let i=1;i<=Math.ceil(m.totalDays/7);i++){const o=document.createElement("option");o.value=String(i);o.textContent=`Week ${i}`;el("week").append(o)}render()}catch(e){el("list").innerHTML=`<div class="empty">아카이브를 불러오지 못했습니다: ${e.message}</div>`}}
+    el("query").addEventListener("input",render);el("week").addEventListener("change",render);boot();
+  </script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "subject": "Operating System",
+  "tagline": "process에서 kernel·hardware·production incident까지",
+  "accent": "#5eead4",
+  "totalDays": 63,
+  "updatedAt": "2026-07-29T12:00:00+09:00",
+  "lessons": [
+    {
+      "day": 1,
+      "week": 1,
+      "title": "program, process, thread와 실행 중이라는 말의 의미",
+      "summary": "정적인 실행 파일이 process가 되고 thread가 CPU에서 명령을 수행하기까지의 경계를 추적합니다.",
+      "path": "day-01.html",
+      "kind": "lesson",
+      "publishedAt": "2026-07-29T12:00:00+09:00"
+    }
+  ]
+}

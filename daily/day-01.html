@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Operating System Day 01 · program, process, thread</title>
+</head>
+<body style="margin:0;background:#06111a;color:#15323a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.72">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#06111a">
+    <tr><td align="center" style="padding:24px 12px">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:680px;background:#f4fbfa;border-radius:20px;overflow:hidden">
+        <tr><td style="padding:34px 34px 28px;background:#0c2930;color:#ecfeff">
+          <div style="color:#5eead4;font-size:12px;font-weight:800;letter-spacing:2px">OPERATING SYSTEM · WEEK 1 / DAY 01</div>
+          <h1 style="margin:10px 0 8px;font-size:31px;line-height:1.2">program, process, thread와<br>“실행 중”이라는 말의 의미</h1>
+          <p style="margin:0;color:#b8d8d7">정적인 파일이 CPU에서 명령을 실행하기까지 · 이론 30분 + 관찰 실습 30분</p>
+        </td></tr>
+        <tr><td style="padding:30px 34px">
+          <div style="padding:18px;border-left:5px solid #0f766e;background:#dff7f3;border-radius:10px">
+            <strong>한 줄 요약</strong><br>
+            program은 저장된 명령과 데이터이고, process는 OS가 자원과 격리 경계를 부여한 실행 인스턴스이며,
+            thread는 그 process 안에서 CPU가 실제로 스케줄하는 실행 흐름이다.
+          </div>
+
+          <h2 style="margin:30px 0 12px;color:#0c4a4e">1. 먼저 용어부터</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse">
+            <tr><td style="padding:10px;border:1px solid #b9d9d5"><strong>Program</strong></td><td style="padding:10px;border:1px solid #b9d9d5">디스크에 저장된 실행 파일과 코드. 아직 CPU 시간을 쓰지 않는 정적 산출물.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #b9d9d5"><strong>Process</strong></td><td style="padding:10px;border:1px solid #b9d9d5">주소 공간, 열린 파일, 권한, signal 상태 등을 가진 실행 자원 컨테이너.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #b9d9d5"><strong>Thread</strong></td><td style="padding:10px;border:1px solid #b9d9d5">program counter, register, stack을 가진 스케줄 가능한 실행 흐름. 같은 process의 주소 공간과 열린 파일을 공유한다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #b9d9d5"><strong>PID/TID</strong></td><td style="padding:10px;border:1px solid #b9d9d5">process와 thread를 식별하는 번호. Linux 구현 세부에서는 task ID와 thread group 개념이 함께 등장한다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #b9d9d5"><strong>Address space</strong></td><td style="padding:10px;border:1px solid #b9d9d5">process가 볼 수 있는 virtual address 범위. code, heap, stack, mapped file 등이 배치된다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #b9d9d5"><strong>Context</strong></td><td style="padding:10px;border:1px solid #b9d9d5">실행을 멈췄다가 이어가기 위해 보존할 CPU register와 kernel 상태.</td></tr>
+          </table>
+
+          <h2 style="margin:30px 0 12px;color:#0c4a4e">2. Architecture: 실행 파일에서 CPU까지</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:separate;border-spacing:0 8px">
+            <tr><td style="width:22%;padding:13px;background:#0f766e;color:white;border-radius:9px"><strong>Executable</strong></td><td style="padding:13px;background:#e8f5f2">code·data와 loader가 읽을 metadata</td></tr>
+            <tr><td align="center" colspan="2" style="color:#0f766e;font-weight:800">↓ load / exec</td></tr>
+            <tr><td style="padding:13px;background:#0f766e;color:white;border-radius:9px"><strong>Process</strong></td><td style="padding:13px;background:#e8f5f2">virtual address space · file descriptors · credentials · signal disposition</td></tr>
+            <tr><td align="center" colspan="2" style="color:#0f766e;font-weight:800">↓ contains one or more</td></tr>
+            <tr><td style="padding:13px;background:#0f766e;color:white;border-radius:9px"><strong>Thread</strong></td><td style="padding:13px;background:#e8f5f2">program counter · registers · stack · scheduling state</td></tr>
+            <tr><td align="center" colspan="2" style="color:#0f766e;font-weight:800">↓ scheduler dispatch</td></tr>
+            <tr><td style="padding:13px;background:#0f766e;color:white;border-radius:9px"><strong>CPU core</strong></td><td style="padding:13px;background:#e8f5f2">register에 현재 thread state를 올리고 instruction을 fetch/decode/execute</td></tr>
+          </table>
+          <p><strong>핵심:</strong> CPU는 “process 전체”를 한꺼번에 실행하지 않는다. 특정 순간에는 한 core가 특정 thread의 instruction stream을 실행한다. process는 그 실행에 필요한 공유 자원과 보호 경계를 제공한다.</p>
+
+          <h2 style="margin:30px 0 12px;color:#0c4a4e">3. process와 thread가 공유하는 것</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse">
+            <tr style="background:#dff7f3"><th align="left" style="padding:10px;border:1px solid #b9d9d5">항목</th><th align="left" style="padding:10px;border:1px solid #b9d9d5">process 단위</th><th align="left" style="padding:10px;border:1px solid #b9d9d5">thread 단위</th></tr>
+            <tr><td style="padding:10px;border:1px solid #b9d9d5">주소 공간</td><td style="padding:10px;border:1px solid #b9d9d5">격리 경계</td><td style="padding:10px;border:1px solid #b9d9d5">같은 process 안에서 공유</td></tr>
+            <tr><td style="padding:10px;border:1px solid #b9d9d5">열린 파일</td><td style="padding:10px;border:1px solid #b9d9d5">descriptor table 보유</td><td style="padding:10px;border:1px solid #b9d9d5">보통 공유하므로 offset/close 경쟁 가능</td></tr>
+            <tr><td style="padding:10px;border:1px solid #b9d9d5">CPU register</td><td style="padding:10px;border:1px solid #b9d9d5">직접 실행 단위 아님</td><td style="padding:10px;border:1px solid #b9d9d5">각 thread가 별도 context 보유</td></tr>
+            <tr><td style="padding:10px;border:1px solid #b9d9d5">stack</td><td style="padding:10px;border:1px solid #b9d9d5">주소 공간 안에 존재</td><td style="padding:10px;border:1px solid #b9d9d5">호출 프레임을 위해 별도 영역 사용</td></tr>
+          </table>
+          <p>공유는 빠른 통신을 가능하게 하지만 자동으로 안전하지 않다. 두 thread가 같은 heap object를 동시에 수정하면 race condition이 발생할 수 있다. 반대로 process 사이에는 주소 공간 경계가 있어 IPC가 필요하지만, 한 process의 메모리 손상이 다른 process로 바로 번지는 위험을 줄인다.</p>
+
+          <h2 style="margin:30px 0 12px;color:#0c4a4e">4. CS Deep Dive: “실행 가능”과 “실행 중”</h2>
+          <p>thread는 대략 <strong>running</strong>, <strong>runnable</strong>, <strong>blocked/sleeping</strong> 상태를 오간다. runnable은 CPU만 받으면 실행할 수 있지만 run queue에서 기다리는 상태다. blocked는 I/O 완료, lock, timer 같은 사건이 없으면 진행할 수 없다.</p>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:separate;border-spacing:8px">
+            <tr>
+              <td align="center" style="padding:14px;background:#fff7d6;border:1px solid #efd37a;border-radius:9px"><strong>Runnable</strong><br><small>CPU 대기</small></td>
+              <td align="center" style="color:#0f766e;font-weight:900">⇄</td>
+              <td align="center" style="padding:14px;background:#dff7f3;border:1px solid #8ed8ce;border-radius:9px"><strong>Running</strong><br><small>core에서 실행</small></td>
+              <td align="center" style="color:#0f766e;font-weight:900">⇄</td>
+              <td align="center" style="padding:14px;background:#edf0f3;border:1px solid #c9d2d8;border-radius:9px"><strong>Blocked</strong><br><small>event 대기</small></td>
+            </tr>
+          </table>
+          <p>따라서 process가 “살아 있다”와 CPU를 계속 쓰고 있다는 말은 다르다. 대부분의 서버 thread는 network I/O를 기다리며 잠들어 있을 수 있다. 성능 진단에서 CPU 사용률만 보고 병목을 단정하면 안 되는 이유다.</p>
+
+          <h2 style="margin:30px 0 12px;color:#0c4a4e">5. 실무 Best Practice와 오류 처리</h2>
+          <ul style="padding-left:22px">
+            <li><strong>process 격리:</strong> 신뢰 경계나 장애 blast radius가 중요하면 별도 process를 고려한다.</li>
+            <li><strong>thread 공유:</strong> 공유 mutable state를 최소화하고 ownership, lock, shutdown 순서를 문서화한다.</li>
+            <li><strong>식별자 재사용:</strong> PID는 영구 ID가 아니다. PID 하나만 저장해 나중에 다른 process를 종료하는 사고를 피하려면 시작 시간이나 pidfd 같은 안전 장치를 함께 고려한다.</li>
+            <li><strong>종료 처리:</strong> parent는 child의 종료 상태를 회수해야 zombie 누적을 막는다. daemon/container에서는 PID 1의 reaping 책임도 확인한다.</li>
+            <li><strong>관찰:</strong> process 수, thread 수, runnable/blocked 상태, context switch, open descriptor를 함께 본다.</li>
+          </ul>
+          <div style="padding:16px;background:#fff4d6;border:1px solid #ebca6a;border-radius:10px"><strong>놓치기 쉬운 함정:</strong> thread 생성이 무조건 process 생성보다 “가볍다”는 문장만 외우지 말자. 실제 비용은 stack 예약, runtime, scheduler, TLS, contention, isolation 요구에 따라 달라진다.</div>
+
+          <h2 style="margin:30px 0 12px;color:#0c4a4e">6. 30분 관찰 실습</h2>
+          <p><strong>목표:</strong> 하나의 process 안에 여러 thread가 존재하고, process 식별과 실행 상태가 다르다는 것을 관찰한다.</p>
+          <pre style="white-space:pre-wrap;overflow-wrap:anywhere;background:#0c2930;color:#dff7f3;padding:16px;border-radius:10px;font-size:13px"><code># macOS/Linux 공통에 가까운 관찰
+python3 -c 'import os,threading,time
+print("pid=",os.getpid())
+for i in range(3):
+    threading.Thread(target=lambda: time.sleep(30),name=f"worker-{i}").start()
+print("threads=",threading.enumerate())
+time.sleep(30)'
+
+# 다른 터미널에서 위 PID로 확인
+ps -o pid,ppid,state,nlwp,command -p &lt;PID&gt;  # Linux
+ps -M &lt;PID&gt;                                  # macOS</code></pre>
+          <p><strong>예상:</strong> PID는 하나지만 thread는 main을 포함해 여러 개다. sleeping thread는 살아 있으나 CPU instruction을 계속 실행하지 않는다.</p>
+          <p><strong>오류 처리:</strong> macOS의 `ps`에는 `nlwp`가 없을 수 있다. 명령 실패를 개념 실패로 해석하지 말고 OS별 관찰 인터페이스 차이로 분류한다. Linux라면 `/proc/&lt;PID&gt;/task`의 entry 수도 확인한다.</p>
+
+          <h2 style="margin:30px 0 12px;color:#0c4a4e">7. 대기업 면접 질문</h2>
+          <ol style="padding-left:22px">
+            <li><strong>Process와 thread의 차이는?</strong><br>자원·보호 경계와 scheduling context를 분리하고, 공유 항목 때문에 생기는 성능 이점과 race 위험을 함께 답한다.</li>
+            <li><strong>Thread가 1,000개면 1,000개가 동시에 실행되나?</strong><br>동시성(concurrency)과 병렬성(parallelism)을 구분하고 core 수, runnable 상태, scheduler, blocking을 설명한다.</li>
+            <li><strong>서비스가 살아 있는데 응답하지 않는 이유는?</strong><br>모든 thread가 lock/I/O에 blocked, run queue 포화, deadlock, stop-the-world 등 상태 가설과 관찰 증거를 제시한다.</li>
+          </ol>
+
+          <h2 style="margin:30px 0 12px;color:#0c4a4e">8. 리뷰</h2>
+          <ol style="padding-left:22px">
+            <li>program과 process가 같은 것이 아닌 이유를 자원 관점에서 말해보자.</li>
+            <li>같은 process의 thread가 공유하지 않는 대표 상태 세 가지는?</li>
+            <li>runnable과 blocked는 왜 다른가?</li>
+            <li>process 격리와 thread 공유 중 어떤 것을 선택할지 결정하는 질문은?</li>
+          </ol>
+          <p><strong>내일 연결:</strong> application thread가 file이나 network를 사용하려면 왜 kernel mode로 넘어가야 할까? Day 02에서 system call과 trap을 추적한다.</p>
+
+          <h2 style="margin:30px 0 12px;color:#0c4a4e">공식 기준 자료</h2>
+          <ul style="padding-left:22px">
+            <li><a href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/V2_chap02.html" style="color:#0f766e">POSIX.1-2024 General Information</a></li>
+            <li><a href="https://man7.org/linux/man-pages/man2/fork.2.html" style="color:#0f766e">Linux man-pages · fork(2)</a></li>
+            <li><a href="https://man7.org/linux/man-pages/man3/exec.3.html" style="color:#0f766e">Linux man-pages · exec(3)</a></li>
+            <li><a href="https://docs.kernel.org/mm/process_addrs.html" style="color:#0f766e">Linux kernel · Process Addresses</a></li>
+          </ul>
+        </td></tr>
+        <tr><td style="padding:20px 34px;background:#e0efed;color:#42656a;font-size:12px">Operating System 9주 63일 · Day 01 · 다음 자료는 manifest 기준으로 이어집니다.</td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>
