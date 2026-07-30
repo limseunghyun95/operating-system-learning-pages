@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-07-29T12:00:00+09:00",
+  "updatedAt": "2026-07-30T09:20:32+09:00",
   "lessons": [
     {
       "day": 1,
@@ -14,6 +14,15 @@
       "path": "day-01.html",
       "kind": "lesson",
       "publishedAt": "2026-07-29T12:00:00+09:00"
+    },
+    {
+      "day": 2,
+      "week": 1,
+      "title": "user mode, kernel mode, system call, trap",
+      "summary": "application의 함수 호출이 system-call ABI와 CPU 진입 명령을 거쳐 kernel service를 실행하고 오류·signal·reschedule을 처리한 뒤 돌아오는 보호 경계를 추적합니다.",
+      "path": "day-02.html",
+      "kind": "lesson",
+      "publishedAt": "2026-07-30T09:20:32+09:00"
     }
   ]
 }
