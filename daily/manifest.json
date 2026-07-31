@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-07-30T09:20:32+09:00",
+  "updatedAt": "2026-07-31T09:24:12+09:00",
   "lessons": [
     {
       "day": 1,
@@ -23,6 +23,15 @@
       "path": "day-02.html",
       "kind": "lesson",
       "publishedAt": "2026-07-30T09:20:32+09:00"
+    },
+    {
+      "day": 3,
+      "week": 1,
+      "title": "process address space와 PCB/task 구조",
+      "summary": "Linux에서 thread별 task_struct와 공유 mm_struct, VMA·page table·resident page 경계를 /proc 관찰로 연결합니다.",
+      "path": "day-03.html",
+      "kind": "lesson",
+      "publishedAt": "2026-07-31T09:24:12+09:00"
     }
   ]
 }
