@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-07-31T09:24:12+09:00",
+  "updatedAt": "2026-08-01T09:10:52+09:00",
   "lessons": [
     {
       "day": 1,
@@ -32,6 +32,15 @@
       "path": "day-03.html",
       "kind": "lesson",
       "publishedAt": "2026-07-31T09:24:12+09:00"
+    },
+    {
+      "day": 4,
+      "week": 1,
+      "title": "fork, exec, wait, exit status와 zombie",
+      "summary": "fork의 COW 생성, exec의 동일 PID program 교체, wait의 종료 status 회수와 zombie lifecycle을 Linux에서 관찰합니다.",
+      "path": "day-04.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-01T09:10:52+09:00"
     }
   ]
 }
