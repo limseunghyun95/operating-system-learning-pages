@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-08-01T09:10:52+09:00",
+  "updatedAt": "2026-08-02T09:00:08+09:00",
   "lessons": [
     {
       "day": 1,
@@ -41,6 +41,15 @@
       "path": "day-04.html",
       "kind": "lesson",
       "publishedAt": "2026-08-01T09:10:52+09:00"
+    },
+    {
+      "day": 5,
+      "week": 1,
+      "title": "context switch와 저장·복원되는 상태",
+      "summary": "Linux scheduler의 entry→pick next→mm→switch_to→resume 흐름과 직접·간접 전환 비용을 /proc·pidstat·perf로 관찰합니다.",
+      "path": "day-05.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-02T09:00:08+09:00"
     }
   ]
 }

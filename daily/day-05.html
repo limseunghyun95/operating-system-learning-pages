@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operating System 심화 커리큘럼 Day 05 - context switch와 저장·복원되는 상태</title>
+</head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.68;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#07111f;">
+    <tr>
+      <td align="center" style="padding:20px 10px 44px;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#0b1728;border:1px solid #1e3a4c;border-radius:18px;overflow:hidden;">
+          <tr>
+            <td style="padding:30px 28px;background:#102438;border-bottom:1px solid #1e3a4c;">
+              <div style="font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:#5eead4;font-weight:800;">Operating System · Day 05 / 63</div>
+              <h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">context switch와 저장·복원되는 상태</h1>
+              <p style="margin:0;color:#a5f3fc;font-size:16px;">한 줄 요약 — context switch는 CPU가 실행할 task를 바꾸며 register·kernel stack·memory context를 전환하는 과정이고, cache·TLB·branch predictor는 논리적으로 저장하는 대상이 아니라 성능에 간접 비용을 남기는 microarchitecture 상태다.</p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:26px 28px;">
+              <h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 선수 용어 사전</h2>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:14px;">
+                <tr><td style="padding:10px;border:1px solid #29465d;color:#f8fafc;font-weight:700;width:31%;">context</td><td style="padding:10px;border:1px solid #29465d;">중단한 실행을 나중에 이어가기 위해 필요한 CPU·kernel 상태의 묶음.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">task</td><td style="padding:10px;border:1px solid #29465d;">Linux scheduler가 CPU에 배치하는 단위. process의 main thread와 각 thread가 모두 task다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">run queue</td><td style="padding:10px;border:1px solid #29465d;">특정 CPU에서 실행 가능하며 차례를 기다리는 task를 scheduler가 관리하는 자료구조.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">preemption</td><td style="padding:10px;border:1px solid #29465d;">실행 중 task가 스스로 block하지 않았어도 scheduler가 CPU를 회수하는 것.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">pt_regs</td><td style="padding:10px;border:1px solid #29465d;">system call·interrupt·exception 진입 때 user register 상태를 표현하는 architecture별 kernel 구조.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">switch_to</td><td style="padding:10px;border:1px solid #29465d;">선택된 next task의 architecture-specific CPU 상태와 stack으로 실제 전환하는 kernel 경계.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">TLB / PCID·ASID</td><td style="padding:10px;border:1px solid #29465d;">TLB는 address translation cache다. PCID/ASID는 서로 다른 address space의 entry를 tag해 불필요한 flush를 줄인다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">CPU migration</td><td style="padding:10px;border:1px solid #29465d;">task가 이전과 다른 logical CPU에서 다음 실행을 이어가는 것. context switch와 관련 있지만 같은 사건은 아니다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">FPU/SIMD state</td><td style="padding:10px;border:1px solid #29465d;">floating point·vector register와 제어 상태. x86에서는 XSAVE 계열 형식으로 관리되는 확장 상태를 포함한다.</td></tr>
+              </table>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 책갈피를 꽂고 다른 실행 흐름을 펼친다</h2>
+              <div style="padding:16px;background:#0f2035;border-left:4px solid #5eead4;border-radius:8px;">
+                <p style="margin:0 0 9px;">CPU core 하나는 한 순간에 하나의 instruction stream을 실행한다. task A를 멈추고 B를 실행하려면 A가 다시 돌아올 위치와 stack 등 <strong style="color:#f8fafc;">architectural state</strong>를 보존하고 B의 state를 복원해야 한다.</p>
+                <p style="margin:0;">하지만 모든 hardware 내부 상태를 파일처럼 저장하는 것은 아니다. cache line, TLB entry, branch predictor history는 남거나 밀려나며, 이 “따뜻함의 손실”이 직접 switch 코드보다 더 큰 간접 비용이 될 수 있다.</p>
+              </div>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: A에서 B로 전환되는 경계</h2>
+              <div style="overflow:auto;padding:16px;background:#06101d;border:1px solid #29465d;border-radius:10px;">
+                <pre style="margin:0;color:#c4f1f9;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;">User task A
+  │ system call / exception / interrupt
+  ▼
+entry code: user registers → A의 kernel stack(pt_regs)
+  │ block, need_resched, preemption point
+  ▼
+__schedule()
+  ├─ A runtime accounting + state 갱신
+  ├─ CPU run queue에서 next task B 선택
+  └─ context_switch(A, B)
+       ├─ address space가 다르면 mm/page-table context 전환
+       ├─ switch_to(A, B)
+       │    A의 kernel SP·callee-saved register 저장
+       │    B의 kernel SP·register·TLS/FPU 등 복원
+       └─ CPU-local current = B, B의 kernel stack 사용
+  ▼
+B가 과거 schedule 지점에서 재개
+  │ 필요하면 return-to-user 경로
+  ▼
+User task B의 instruction pointer부터 실행</pre>
+              </div>
+              <p style="margin:11px 0 0;color:#a7c7da;font-size:14px;"><strong style="color:#fbbf24;">중요:</strong> scheduler에 들어갔다고 항상 다른 task로 바뀌는 것은 아니다. 다시 같은 task가 선택될 수 있다. 또한 interrupt·system call로 user→kernel mode가 바뀌어도 current task가 그대로면 task context switch가 아니다.</p>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. 비슷해 보이지만 다른 사건</h2>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:14px;">
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">mode switch</td><td style="padding:9px;border:1px solid #29465d;">user↔kernel privilege level 전환. syscall 뒤 같은 task로 돌아오면 context switch는 없을 수 있다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">task context switch</td><td style="padding:9px;border:1px solid #29465d;">CPU의 current가 task A에서 B로 바뀐다. 같은 process의 thread 사이에서도 발생한다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">CPU migration</td><td style="padding:9px;border:1px solid #29465d;">task가 다른 CPU에서 재개한다. switch는 같은 CPU에서도 일어나므로 migration과 1:1이 아니다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">VM context switch</td><td style="padding:9px;border:1px solid #29465d;">host↔guest 또는 vCPU 전환은 추가 virtualization state를 다루며 일반 task switch와 비용 구조가 다르다.</td></tr>
+              </table>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. CS/kernel/hardware deep dive</h2>
+              <h3 style="margin:16px 0 8px;color:#f8fafc;font-size:17px;">5.1 register가 한 번에 한 구조체에 모두 저장되는 것은 아니다</h3>
+              <p style="margin:0 0 9px;">x86-64를 예로 들면 user→kernel 진입에서 user-visible register 상태는 task의 kernel stack에 <code style="color:#fbbf24;">pt_regs</code> 형태로 구성된다. 실제 <code style="color:#fbbf24;">switch_to</code> 경로는 inactive task frame에 stack pointer와 ABI상 보존해야 할 register를 저장하고 next task의 stack으로 바꾼다. 다음에 A가 선택되면 과거 <code style="color:#fbbf24;">schedule()</code> 호출이 반환되는 것처럼 이어진다.</p>
+              <p style="margin:0;">즉 “PCB 전체를 CPU에 복사한다”가 아니라, 진입 경로·compiler ABI·architecture switch code가 나눠서 필요한 state를 보존한다. 정확한 register 목록은 architecture와 kernel 구현에 따라 달라진다.</p>
+
+              <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.2 address-space switch와 TLB</h3>
+              <p style="margin:0 0 9px;">서로 다른 process로 전환하면 next의 <code style="color:#fbbf24;">mm_struct</code>와 page-table root를 활성화해야 한다. 단순히 CR3를 바꾸고 TLB를 전부 비우는 모델만 외우면 부정확하다. 현대 x86 Linux는 PCID/ASID와 TLB generation을 이용해 유효한 translation을 재사용하고 필요한 경우에만 flush한다.</p>
+              <p style="margin:0;">같은 address space를 공유하는 thread 사이 전환은 보통 page-table context가 같지만 register·kernel stack·TLS·scheduler state 전환은 여전히 필요하다. 따라서 “thread switch는 공짜”도 틀리다.</p>
+
+              <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.3 architecture-specific extra state</h3>
+              <p style="margin:0 0 9px;">현재 x86-64 Linux의 <code style="color:#fbbf24;">__switch_to()</code>는 FPU state, FS/GS base, TLS, segment, PKRU, CPU-local current task와 kernel stack top 등 architecture state를 다룬다. 다음 user→kernel 진입이 올바른 task stack을 쓰도록 privilege transition 정보도 맞춘다.</p>
+              <p style="margin:0;">FPU/SIMD 확장 상태는 크고 CPU 기능마다 달라 비용이 고정되지 않는다. kernel은 사용 상태와 hardware 지원을 고려해 관리한다. “매 switch마다 모든 vector byte를 무조건 memcpy한다”처럼 단정하지 않는다.</p>
+
+              <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.4 무엇을 저장하지 않는가</h3>
+              <p style="margin:0 0 9px;">L1/L2/L3 cache, TLB 전체, branch predictor를 task_struct에 직렬화하지 않는다. switch 뒤에도 일부는 남고 다른 task의 working set에 의해 교체된다. 보안 mitigation이나 address-space 변경이 선택적 flush를 유발할 수 있지만 일반적인 “모두 저장 후 모두 복원”은 아니다.</p>
+              <p style="margin:0;">그래서 context switch 비용은 <strong style="color:#f8fafc;">직접 비용</strong>(scheduler, register/mm 전환)과 <strong style="color:#f8fafc;">간접 비용</strong>(cache/TLB locality, predictor warm-up, migration)을 함께 측정해야 한다.</p>
+
+              <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.5 voluntary와 nonvoluntary</h3>
+              <p style="margin:0;">task가 I/O, futex, timer 등 unavailable resource를 기다리며 block하면 voluntary switch로 집계된다. time slice 소진, higher-priority task wakeup 등으로 CPU를 빼앗기면 nonvoluntary switch다. 두 수치는 원인을 완전히 증명하지는 않지만 “대기 중심인지 CPU 경쟁 중심인지”를 좁히는 첫 단서다.</p>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. 실무 best practice</h2>
+              <ol style="margin:0;padding-left:22px;">
+                <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">총량보다 rate와 SLO를 본다.</strong> lifetime 누적 counter의 시간당 delta를 p95/p99 latency, CPU utilization, run queue, off-CPU time과 함께 본다.</li>
+                <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">voluntary/nonvoluntary를 분리한다.</strong> 전자는 I/O·lock·sleep, 후자는 oversubscription·CPU contention 가설을 먼저 세우되 trace로 검증한다.</li>
+                <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">thread 수를 core 수 공식 하나로 결정하지 않는다.</strong> CPU-bound와 blocking 비율, cgroup CPU quota, latency target을 부하 실험으로 맞춘다.</li>
+                <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">작은 작업을 batch한다.</strong> 지나치게 짧은 task, 잦은 lock handoff, 1ms sleep polling은 useful work 대비 scheduling 비율을 키운다.</li>
+                <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">affinity는 측정 후 적용한다.</strong> cache locality를 높일 수 있지만 load imbalance·NUMA 원격 접근·장애 시 capacity 손실을 만들 수 있다.</li>
+                <li><strong style="color:#f8fafc;">원인 규명에는 sched_switch와 sched_wakeup을 연결한다.</strong> switch 횟수만이 아니라 runnable→running까지의 wakeup latency와 off-CPU stack을 본다.</li>
+              </ol>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. error handling과 관측 실패 대응</h2>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:14px;">
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">/proc PID 없음</td><td style="padding:9px;border:1px solid #29465d;">읽는 사이 task가 종료된 정상 race일 수 있다. PID와 시작 시간을 다시 확인하고 sample을 폐기한다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">pidstat 없음</td><td style="padding:9px;border:1px solid #29465d;">sysstat package 도구다. 설치 권한이 없으면 /proc/PID/status를 일정 간격으로 읽어 delta를 계산한다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">perf 권한 거부</td><td style="padding:9px;border:1px solid #29465d;">perf_event_paranoid, capability, container policy를 확인한다. 운영 host에 광범위한 권한을 상시 부여하지 말고 승인된 관측 경로를 사용한다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">tracefs 접근 실패</td><td style="padding:9px;border:1px solid #29465d;">tracefs mount·권한·kernel config를 확인한다. production에서는 bounded duration과 PID/cgroup filter로 trace 양을 제한한다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">taskset EINVAL</td><td style="padding:9px;border:1px solid #29465d;">container cpuset에서 허용되지 않은 CPU일 수 있다. /proc/self/status의 Cpus_allowed_list에서 대상 CPU를 고른다.</td></tr>
+              </table>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. 놓치기 쉬운 함정</h2>
+              <ul style="margin:0;padding-left:22px;">
+                <li style="margin-bottom:7px;">system call 횟수와 context switch 횟수는 같지 않다. syscall이 block하지 않으면 같은 task로 바로 돌아올 수 있다.</li>
+                <li style="margin-bottom:7px;">scheduler 진입과 실제 switch도 1:1이 아니다. next로 현재 task가 다시 선택될 수 있다.</li>
+                <li style="margin-bottom:7px;">높은 context-switch rate 자체는 장애가 아니다. 높은 처리량의 event-driven service에서도 정상일 수 있다.</li>
+                <li style="margin-bottom:7px;">반대로 rate가 낮아도 한 번의 migration 뒤 cache miss가 latency에 크게 영향을 줄 수 있다.</li>
+                <li style="margin-bottom:7px;">process switch만 세면 안 된다. thread가 scheduler의 task 단위이므로 thread 간 전환도 포함된다.</li>
+                <li>“context switch는 N ns”라는 고정값을 외우지 않는다. CPU, kernel, mitigation, working set, mm 공유, migration에 따라 달라진다.</li>
+              </ul>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. 30분 실습: sleep task와 CPU 경쟁 task 비교</h2>
+              <p style="margin:0 0 10px;color:#a7c7da;">Linux 전용이다. 1ms sleep을 반복하는 task는 voluntary switch가, 같은 CPU를 두고 경쟁하는 두 busy-loop task는 nonvoluntary switch가 증가하는지 관찰한다.</p>
+              <pre style="margin:0;padding:14px;background:#06101d;border:1px solid #29465d;border-radius:10px;color:#d1fae5;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;">LAB_DIR=$(mktemp -d)
+CPU=$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' /proc/self/status |
+      sed 's/[-,].*//')
+
+python3 -c 'import time; [time.sleep(.001) for _ in range(30000)]' &amp;
+SLEEPER=$!
+taskset -c "$CPU" python3 -c 'while True: pass' &amp;
+HOG1=$!
+taskset -c "$CPU" python3 -c 'while True: pass' &amp;
+HOG2=$!
+trap 'kill "$SLEEPER" "$HOG1" "$HOG2" 2&gt;/dev/null; wait 2&gt;/dev/null' EXIT
+
+snapshot() {
+  pid="$1"
+  printf 'PID=%s\n' "$pid"
+  sed -n '/^voluntary_ctxt_switches:/p;
+          /^nonvoluntary_ctxt_switches:/p' "/proc/$pid/status"
+}
+
+sleep 1
+snapshot "$SLEEPER"
+snapshot "$HOG1"
+snapshot "$HOG2"
+sleep 5
+snapshot "$SLEEPER"
+snapshot "$HOG1"
+snapshot "$HOG2"
+
+command -v pidstat &gt;/dev/null &amp;&amp;
+  pidstat -w -p "$SLEEPER,$HOG1,$HOG2" 1 3
+command -v perf &gt;/dev/null &amp;&amp;
+  perf stat -e context-switches,cpu-migrations -p "$HOG1" sleep 3</pre>
+              <p style="margin:10px 0 0;"><strong style="color:#f8fafc;">예상:</strong> SLEEPER는 resource를 기다리며 voluntary counter가 빠르게 증가한다. 같은 허용 CPU에 고정된 HOG1/HOG2는 scheduler가 번갈아 CPU를 주어 nonvoluntary counter가 증가한다. 실제 수치는 kernel·scheduler·quota에 따라 달라진다.</p>
+              <p style="margin:8px 0 0;color:#a7c7da;font-size:14px;">실패 주입: HOG를 2개→8개로 늘리고 <code style="color:#fbbf24;">nvcswch/s</code>, run queue, 처리량 변화를 함께 기록한다. 숫자만 올랐다는 이유로 개선/악화를 결론 내리지 않는다.</p>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 실패 시나리오</h2>
+              <div style="padding:15px;background:#241528;border:1px solid #7f1d4d;border-radius:9px;">
+                <p style="margin:0 0 8px;"><strong style="color:#f9a8d4;">상황:</strong> cgroup CPU quota가 4 core인 service에 worker thread를 400개 두었다. CPU 평균은 65%인데 p99가 급등하고 context switch와 migrations가 폭증했다.</p>
+                <p style="margin:0 0 8px;"><strong style="color:#f9a8d4;">진단:</strong> voluntary switch가 많으면 lock/queue/I/O 대기 stack을, nonvoluntary와 run queue가 높으면 oversubscription·quota throttling을 본다. sched_wakeup→sched_switch 지연과 off-CPU profile로 가설을 검증한다.</p>
+                <p style="margin:0;"><strong style="color:#f9a8d4;">개선:</strong> bounded worker pool, request batching, blocking 구간 분리, queue backpressure를 적용하고 부하 실험에서 throughput과 p99를 함께 비교한다. 무작정 affinity나 realtime priority를 적용하지 않는다.</p>
+              </div>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. 대기업 면접 질문 3개</h2>
+              <p style="margin:0 0 9px;"><strong style="color:#f8fafc;">Q1. context switch 때 무엇을 저장하고 무엇을 저장하지 않나요?</strong><br>답변 포인트: register/IP/SP, kernel stack, task·scheduler state, 필요 시 mm/TLS/FPU를 말한다. cache/TLB/predictor는 PCB에 저장하지 않으며 tag·선택적 flush·warm-up이라는 간접 비용을 설명한다.</p>
+              <p style="margin:0 0 9px;"><strong style="color:#f8fafc;">Q2. system call과 context switch는 어떻게 다른가요?</strong><br>답변 포인트: syscall은 privilege mode 전환이고 current task가 유지될 수 있다. block 또는 preemption 뒤 scheduler가 다른 task를 고를 때 task context switch가 발생한다.</p>
+              <p style="margin:0;"><strong style="color:#f8fafc;">Q3. process switch가 thread switch보다 항상 비싼가요?</strong><br>답변 포인트: 다른 mm이면 page-table/TLB context 비용이 추가될 가능성이 있지만 PCID/ASID가 줄일 수 있다. 같은 mm thread도 register/FPU/TLS와 cache working-set 비용이 있어 workload 측정 없이는 “항상”이라 단정하지 않는다.</p>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 퀴즈·누적 리뷰</h2>
+              <ol style="margin:0;padding-left:22px;">
+                <li style="margin-bottom:6px;">mode switch만 있고 task switch가 없는 예시를 들어 보자.</li>
+                <li style="margin-bottom:6px;">같은 process의 두 thread 사이 switch에서도 바뀌는 상태 4가지는?</li>
+                <li style="margin-bottom:6px;">cache를 저장하지 않는데 context switch가 cache 성능을 악화시킬 수 있는 이유는?</li>
+                <li style="margin-bottom:6px;">Day 03 복습: mm_struct가 같은 switch와 다른 switch에서 page-table 경계는 어떻게 다른가?</li>
+                <li>Day 04 복습: fork 뒤 parent와 child가 동시에 runnable할 때 scheduler와 context switch가 생명주기에 어떻게 연결되는가?</li>
+              </ol>
+              <p style="margin:11px 0 0;color:#a7c7da;font-size:14px;">회상 기준: <strong style="color:#f8fafc;">entry → __schedule → pick next → mm → switch_to → resume</strong> 순서를 그림 없이 말할 수 있으면 통과다.</p>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 다음 날 연결</h2>
+              <p style="margin:0;">Day 06에서는 Week 1 실패 실습으로 orphan과 zombie를 직접 만들고 <code style="color:#fbbf24;">ps</code>, <code style="color:#fbbf24;">/proc</code>, PPID·state·context-switch counter를 함께 추적한다. 생성·실행·종료·reap의 전체 흐름을 증거로 연결한다.</p>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 공식 출처</h2>
+              <ul style="margin:0;padding-left:22px;color:#a7c7da;">
+                <li><a href="https://github.com/torvalds/linux/blob/master/kernel/sched/core.c" style="color:#67e8f9;">Linux kernel source — kernel/sched/core.c</a>: __schedule, context_switch, finish_task_switch 경로</li>
+                <li><a href="https://github.com/torvalds/linux/blob/master/arch/x86/include/asm/switch_to.h" style="color:#67e8f9;">Linux x86 source — switch_to.h</a>: inactive_task_frame과 switch_to 경계</li>
+                <li><a href="https://github.com/torvalds/linux/blob/master/arch/x86/kernel/process_64.c" style="color:#67e8f9;">Linux x86-64 source — process_64.c</a>: __switch_to의 FPU, TLS, FS/GS, current stack 처리</li>
+                <li><a href="https://github.com/torvalds/linux/blob/master/arch/x86/mm/tlb.c" style="color:#67e8f9;">Linux x86 source — tlb.c</a>: switch_mm_irqs_off, PCID/ASID와 선택적 TLB flush</li>
+                <li><a href="https://docs.kernel.org/next/scheduler/sched-arch.html" style="color:#67e8f9;">Linux kernel docs — Scheduler architecture hints</a>: switch_to와 runqueue locking</li>
+                <li><a href="https://docs.kernel.org/trace/ftrace.html" style="color:#67e8f9;">Linux kernel docs — ftrace</a>: scheduler wakeup·switch tracing</li>
+                <li><a href="https://man7.org/linux/man-pages/man5/proc_pid_status.5.html" style="color:#67e8f9;">Linux man-pages — proc_pid_status(5)</a>: voluntary/nonvoluntary counters</li>
+                <li><a href="https://man7.org/linux/man-pages/man1/perf-stat.1.html" style="color:#67e8f9;">Linux perf manual — perf-stat(1)</a>: context-switch와 CPU-migration event 관측</li>
+                <li><a href="https://man7.org/linux/man-pages/man1/pidstat.1.html" style="color:#67e8f9;">Linux manual — pidstat(1)</a>: cswch/s와 nvcswch/s 해석</li>
+              </ul>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:18px 28px;background:#081522;border-top:1px solid #1e3a4c;color:#7fa4ba;font-size:12px;">Operating System 심화 커리큘럼 · 초보 용어에서 kernel/hardware와 production diagnosis까지</td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
