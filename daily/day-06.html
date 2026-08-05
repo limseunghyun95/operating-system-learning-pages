@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operating System 심화 커리큘럼 Day 06 - 실패 실습: orphan/zombie 만들고 ps, /proc로 추적</title>
+</head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.68;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#07111f;">
+    <tr>
+      <td align="center" style="padding:20px 10px 44px;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#0b1728;border:1px solid #1e3a4c;border-radius:18px;overflow:hidden;">
+          <tr>
+            <td style="padding:30px 28px;background:#102438;border-bottom:1px solid #1e3a4c;">
+              <div style="font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:#5eead4;font-weight:800;">Operating System · Day 06 / 63</div>
+              <h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">실패 실습: orphan/zombie 만들고 ps, /proc로 추적</h1>
+              <p style="margin:0;color:#a5f3fc;font-size:16px;">한 줄 요약 — orphan은 부모가 먼저 종료되어 새 보호자에게 reparent된 <strong style="color:#f8fafc;">살아 있는 child</strong>이고, zombie는 이미 종료했지만 부모가 wait로 종료 결과를 회수하지 않은 <strong style="color:#f8fafc;">죽은 child의 최소 기록</strong>이다.</p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:26px 28px;">
+              <h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 선수 용어 사전</h2>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:14px;">
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;width:31%;">parent / child</td><td style="padding:9px;border:1px solid #29465d;">process가 fork/clone으로 새 process를 만들 때 생기는 생명주기 관계. parent는 child의 종료 결과를 회수할 책임이 있다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">PID / PPID</td><td style="padding:9px;border:1px solid #29465d;">process ID와 parent process ID. PID namespace마다 같은 task가 서로 다른 PID로 보일 수 있다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">orphan</td><td style="padding:9px;border:1px solid #29465d;">실행 중 parent가 먼저 종료한 child. kernel이 가까운 subreaper 또는 namespace의 init에게 부모 책임을 넘긴다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">zombie / defunct</td><td style="padding:9px;border:1px solid #29465d;">실행은 끝났으나 종료 status와 resource usage를 parent가 아직 회수하지 않은 child의 상태. <code style="color:#fbbf24;">ps</code>에서는 Z 또는 &lt;defunct&gt;로 보인다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">reap / wait</td><td style="padding:9px;border:1px solid #29465d;">wait/waitpid/waitid로 child의 종료 결과를 읽고 kernel의 마지막 process-table record를 해제하는 것.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">exit status</td><td style="padding:9px;border:1px solid #29465d;">정상 종료 code 또는 signal 종료 정보를 encoding한 값. shell의 한 자리 숫자보다 더 풍부한 lifecycle 정보다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">SIGCHLD</td><td style="padding:9px;border:1px solid #29465d;">child가 멈추거나 종료될 때 parent에게 전달되는 signal. signal은 “알림”이고 wait는 “회수”다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">init / PID 1</td><td style="padding:9px;border:1px solid #29465d;">PID namespace의 첫 process. orphan을 채택하고 종료한 child를 reap해야 하는 특별한 책임이 있다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">child subreaper</td><td style="padding:9px;border:1px solid #29465d;">PR_SET_CHILD_SUBREAPER로 지정되어 고아 descendant를 namespace init보다 먼저 채택할 수 있는 process. service manager가 사용한다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">pidfd</td><td style="padding:9px;border:1px solid #29465d;">숫자 PID가 아니라 특정 process instance를 가리키는 file descriptor. PID 재사용 race를 줄이고 poll/waitid와 연결한다.</td></tr>
+              </table>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 보호자 변경과 영수증 미회수는 다른 축이다</h2>
+              <div style="padding:16px;background:#0f2035;border-left:4px solid #5eead4;border-radius:8px;">
+                <p style="margin:0 0 9px;"><strong style="color:#f8fafc;">orphan</strong>은 “누가 앞으로 돌볼 것인가”라는 소유권 문제다. child는 여전히 CPU를 실행하거나 sleep할 수 있고 memory와 file descriptor도 가진다.</p>
+                <p style="margin:0 0 9px;"><strong style="color:#f8fafc;">zombie</strong>는 “끝난 결과를 누가 가져갈 것인가”라는 완료 통지 문제다. user code는 더 실행하지 않고 대부분의 resource는 해제됐지만 PID·종료 정보 등 최소 record가 남는다.</p>
+                <p style="margin:0;">따라서 orphan이 나중에 종료하면 잠깐 zombie가 될 수 있지만, orphan과 zombie는 동의어가 아니다.</p>
+              </div>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture·상태 전이: 누가 언제 record를 지우는가</h2>
+              <div style="overflow:auto;padding:16px;background:#06101d;border:1px solid #29465d;border-radius:10px;">
+                <pre style="margin:0;color:#c4f1f9;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;">child RUNNING / SLEEPING
+  │
+  ├─ child가 먼저 exit
+  │    do_exit(): mm·files 등 실행 자원 정리
+  │      → exit_notify(): parent에 SIGCHLD
+  │      → EXIT_ZOMBIE (PID·status·rusage record 유지)
+  │             │
+  │             └─ parent wait*() → status 회수
+  │                    → release_task() → EXIT_DEAD → record 제거
+  │
+  └─ parent가 먼저 exit
+       forget_original_parent()
+         → 가장 가까운 살아 있는 subreaper
+         → 없으면 PID namespace의 init(PID 1)
+       child의 PPID 변경, 실행 상태는 그대로 (orphan)
+              │
+              └─ 훗날 exit → 새 parent가 wait*()로 reap</pre>
+              </div>
+              <p style="margin:11px 0 0;color:#a7c7da;font-size:14px;"><strong style="color:#fbbf24;">핵심 invariant:</strong> 생성된 모든 child에는 결국 종료 결과를 회수할 owner가 있어야 한다. “프로세스를 시작했다”는 것은 spawn 성공뿐 아니라 timeout, signal, wait, retry까지 소유한다는 뜻이다.</p>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. CS/kernel deep dive</h2>
+              <h3 style="margin:16px 0 8px;color:#f8fafc;font-size:17px;">4.1 zombie에 남는 것과 이미 사라진 것</h3>
+              <p style="margin:0 0 9px;">exit 경로는 address space, open file reference 같은 실행 자원을 대부분 놓는다. 하지만 parent가 종료 원인을 알 수 있도록 PID, encoded exit status, resource usage, parent 관계가 process table에 남는다. 그래서 zombie의 RSS가 거의 0이어도 무해하다고 할 수 없다.</p>
+              <p style="margin:0;">zombie가 누적되면 PID/process-table slot 또는 cgroup의 PID quota를 소비해 새 fork/clone이 <code style="color:#fbbf24;">EAGAIN</code>으로 실패할 수 있다. 이는 memory leak과 모양이 다른 lifecycle-record leak이다.</p>
+
+              <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">4.2 왜 kill -9로 zombie를 죽일 수 없는가</h3>
+              <p style="margin:0;">SIGKILL은 실행 중인 task가 종료 경로로 가도록 만드는 signal이다. zombie는 이미 <code style="color:#fbbf24;">do_exit()</code>를 지나 실행 context가 없으므로 다시 죽일 대상이 없다. 해결은 살아 있는 parent/adopter가 wait하도록 고치거나, 안전하게 parent를 재시작해 책임을 subreaper/init으로 넘기는 것이다.</p>
+
+              <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">4.3 SIGCHLD는 queue가 아니라 알림이다</h3>
+              <p style="margin:0 0 9px;">여러 child가 거의 동시에 끝나도 standard signal은 사건 수만큼 queue된다고 보장할 수 없다. handler에서 한 번만 wait하면 zombie가 남을 수 있다. main loop는 <code style="color:#fbbf24;">waitpid(-1, &amp;status, WNOHANG)</code>를 반복해 0 또는 ECHILD가 나올 때까지 drain한다.</p>
+              <p style="margin:0;">Linux에서 SIGCHLD 기본 disposition이 “ignore”라고 표시돼도, 명시적 <code style="color:#fbbf24;">SIG_IGN</code> 또는 <code style="color:#fbbf24;">SA_NOCLDWAIT</code> 설정은 종료 child를 zombie로 남기지 않는 별도 semantics다. 이 경우 뒤의 wait가 ECHILD가 될 수 있으므로 종료 status가 필요한 프로그램에 무작정 쓰면 안 된다.</p>
+
+              <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">4.4 container에서도 PPID가 항상 1은 아니다</h3>
+              <p style="margin:0 0 9px;">reparent 대상은 host의 PID 1로 고정되지 않는다. 가까운 child subreaper가 있으면 그 process가 먼저 채택하고, PID namespace 안에서는 그 namespace의 init이 기준이 된다. 같은 task도 host와 container에서 PID·PPID가 다르게 보인다.</p>
+              <p style="margin:0;">namespace init이 죽으면 kernel은 namespace의 다른 process를 종료한다. 그러므로 application이 container PID 1이라면 signal forwarding과 child reaping을 구현하거나 검증된 tiny init/service supervisor를 둬야 한다.</p>
+
+              <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">4.5 숫자 PID의 TOCTOU와 pidfd</h3>
+              <p style="margin:0;">관측한 process가 사라진 뒤 그 PID가 재사용되면, 뒤늦은 kill이나 검사 명령이 다른 process를 겨냥할 수 있다. <code style="color:#fbbf24;">pidfd_open()</code>은 process instance를 FD로 붙잡고 poll로 zombie 전환을 관측하거나 child라면 waitid와 연결해 이 race를 줄인다.</p>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. ps와 /proc 증거를 읽는 법</h2>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:14px;">
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;width:31%;">ps state/stat</td><td style="padding:9px;border:1px solid #29465d;">Z는 zombie, S는 interruptible sleep, R은 running/runnable. STAT의 추가 문자는 별도 flag이므로 첫 문자부터 구분한다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">/proc/PID/status</td><td style="padding:9px;border:1px solid #29465d;">State, Pid, PPid, NSpid를 사람이 읽기 쉬운 형태로 제공한다. namespace 경계를 함께 확인하기 좋다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">/proc/PID/stat</td><td style="padding:9px;border:1px solid #29465d;">3번 field가 state, 4번이 PPID다. 다만 comm이 괄호 안에 있고 공백·괄호를 포함할 수 있어 단순 split parser는 위험하다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">/proc/PID 부재</td><td style="padding:9px;border:1px solid #29465d;">읽는 순간 reaping돼 사라진 정상 race일 수 있다. 한 번의 snapshot을 영구 상태처럼 해석하지 않는다.</td></tr>
+              </table>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. 실무 best practice</h2>
+              <ol style="margin:0;padding-left:22px;">
+                <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">child owner를 코드에 명시한다.</strong> 어떤 component가 wait, timeout, cancellation, exit-status logging을 담당하는지 API contract로 정한다.</li>
+                <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">SIGCHLD handler는 최소화한다.</strong> async-signal-safe한 notification만 만들고 일반 event loop에서 WNOHANG waitpid를 끝까지 drain한다. EINTR은 retry한다.</li>
+                <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">종료 순서를 설계한다.</strong> spawn 뒤 TERM → bounded grace period → KILL → wait/reap까지 한 transaction으로 취급한다.</li>
+                <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">container PID 1을 검증한다.</strong> exec-form entrypoint, signal forwarding, orphan adoption, reaping 여부를 통합 테스트한다. 필요하면 tiny init을 둔다.</li>
+                <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">PID만 오래 저장하지 않는다.</strong> pidfd 또는 최소한 PID와 start time을 함께 검증해 PID reuse 오작동을 막는다.</li>
+                <li><strong style="color:#f8fafc;">증상을 quota와 연결한다.</strong> Z state 개수, spawn EAGAIN, cgroup <code style="color:#fbbf24;">pids.current/pids.max</code>, child exit/reap rate와 oldest-zombie age를 함께 본다.</li>
+              </ol>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. error handling과 관측 실패 대응</h2>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:14px;">
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">waitpid = EINTR</td><td style="padding:9px;border:1px solid #29465d;">다른 signal에 interrupted됐다. 정책상 취소가 아니라면 loop에서 재시도한다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">waitpid = ECHILD</td><td style="padding:9px;border:1px solid #29465d;">해당 child가 아니거나 이미 reap됐거나 SIGCHLD를 명시적으로 SIG_IGN/SA_NOCLDWAIT 처리했는지 확인한다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">/proc = ENOENT</td><td style="padding:9px;border:1px solid #29465d;">snapshot 사이 exit/reap된 정상 race다. 실패가 아니라 관측 시점 변화로 기록한다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">/proc = EACCES</td><td style="padding:9px;border:1px solid #29465d;">hidepid mount, ptrace access policy, container 권한을 확인한다. 진단 때문에 production 권한을 광범위하게 풀지 않는다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">zombie가 안 보임</td><td style="padding:9px;border:1px solid #29465d;">shell/runtime이 자동 reap했거나 관찰 창이 짧을 수 있다. 실습처럼 parent가 wait 전에 일정 시간 sleep하도록 만든다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">PPID가 예상과 다름</td><td style="padding:9px;border:1px solid #29465d;">subreaper, PID namespace, supervisor를 확인한다. PPID=1 자체가 아니라 “원래 parent에서 adopter로 바뀜”을 검증한다.</td></tr>
+              </table>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. 놓치기 쉬운 함정</h2>
+              <ul style="margin:0;padding-left:22px;">
+                <li style="margin-bottom:7px;">orphan은 살아 있고 zombie는 죽었다. 이름의 인상으로 반대로 기억하지 않는다.</li>
+                <li style="margin-bottom:7px;">zombie는 CPU를 쓰지 않지만 무한히 쌓여도 괜찮은 상태가 아니다. PID와 quota가 유한하다.</li>
+                <li style="margin-bottom:7px;">SIGCHLD handler를 등록했다고 reap이 끝난 것이 아니다. 모든 종료 child를 wait해야 한다.</li>
+                <li style="margin-bottom:7px;">zombie에 SIGKILL을 반복하지 않는다. 살아 있는 parent의 reaping bug를 찾아야 한다.</li>
+                <li style="margin-bottom:7px;">PPID=1을 portable invariant로 삼지 않는다. subreaper와 namespace가 개입한다.</li>
+                <li style="margin-bottom:7px;">ps 한 번과 /proc 한 번은 서로 다른 순간이다. PID와 start time을 포함한 반복 관측이 필요하다.</li>
+                <li>legacy double-fork를 기본 해법으로 쓰지 않는다. 현대 service manager에서는 foreground 실행과 명시적 lifecycle 관리가 더 관측 가능하다.</li>
+              </ul>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. 30분 안전 실습: 두 실패를 따로 만든다</h2>
+              <p style="margin:0 0 10px;color:#a7c7da;">Linux의 일회용 VM/container 또는 개인 shell에서만 실행한다. root 권한은 필요 없고 모든 실습 process는 약 15초 안에 스스로 끝난다. 운영 서버에서 실행하지 않는다.</p>
+              <h3 style="margin:14px 0 8px;color:#f8fafc;font-size:17px;">9.1 zombie: child가 먼저 죽고 parent가 wait를 늦춘다</h3>
+              <pre style="margin:0;padding:14px;background:#06101d;border:1px solid #29465d;border-radius:10px;color:#d1fae5;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;">LAB_DIR=$(mktemp -d)
+python3 - "$LAB_DIR" &lt;&lt;'PY' &amp;
+import os, sys, time
+lab = sys.argv[1]
+child = os.fork()
+if child == 0:
+    os._exit(23)
+for name, value in (("z-parent.pid", os.getpid()),
+                    ("z-child.pid", child)):
+    with open(f"{lab}/{name}", "w") as f:
+        f.write(str(value))
+time.sleep(12)                 # 의도적으로 reap 지연
+got, status = os.waitpid(child, 0)
+with open(f"{lab}/z-reaped.txt", "w") as f:
+    f.write(f"pid={got} exit={os.waitstatus_to_exitcode(status)}\n")
+PY
+Z_OBSERVER=$!
+while [ ! -s "$LAB_DIR/z-child.pid" ]; do sleep .1; done
+Z_PARENT=$(sed -n '1p' "$LAB_DIR/z-parent.pid")
+Z_CHILD=$(sed -n '1p' "$LAB_DIR/z-child.pid")
+sleep 1
+ps -o pid,ppid,state,stat,etime,cmd -p "$Z_PARENT,$Z_CHILD"
+sed -n '/^State:/p;/^Pid:/p;/^PPid:/p;/^NSpid:/p' \
+  "/proc/$Z_CHILD/status"
+wait "$Z_OBSERVER"
+test ! -e "/proc/$Z_CHILD" &amp;&amp; echo "reaped: /proc entry removed"
+sed -n '1p' "$LAB_DIR/z-reaped.txt"</pre>
+              <p style="margin:9px 0 0;"><strong style="color:#f8fafc;">증거:</strong> wait 전 child state는 Z이고 PPID는 Z_PARENT다. wait가 status 23을 회수한 뒤 /proc entry가 사라진다. 이것이 kill이 아니라 reap의 효과다.</p>
+
+              <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">9.2 orphan: 중간 parent가 먼저 죽고 child는 계속 산다</h3>
+              <pre style="margin:0;padding:14px;background:#06101d;border:1px solid #29465d;border-radius:10px;color:#d1fae5;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;">python3 - "$LAB_DIR" &lt;&lt;'PY' &amp;
+import os, sys, time
+lab = sys.argv[1]
+middle = os.fork()
+if middle == 0:
+    child = os.fork()
+    if child == 0:
+        with open(f"{lab}/o-child.pid", "w") as f:
+            f.write(str(os.getpid()))
+        with open(f"{lab}/o-old-ppid.txt", "w") as f:
+            f.write(str(os.getppid()))
+        time.sleep(12)         # parent가 없어도 살아서 sleep
+        os._exit(0)
+    os._exit(0)               # child를 orphan으로 만든다
+os.waitpid(middle, 0)
+time.sleep(13)
+PY
+O_OBSERVER=$!
+while [ ! -s "$LAB_DIR/o-child.pid" ]; do sleep .1; done
+O_CHILD=$(sed -n '1p' "$LAB_DIR/o-child.pid")
+OLD_PPID=$(sed -n '1p' "$LAB_DIR/o-old-ppid.txt")
+sleep 1
+NEW_PPID=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$O_CHILD/status")
+printf 'child=%s old_ppid=%s new_ppid=%s\n' \
+  "$O_CHILD" "$OLD_PPID" "$NEW_PPID"
+ps -o pid,ppid,state,stat,etime,cmd -p "$O_CHILD"
+sed -n '/^State:/p;/^Pid:/p;/^PPid:/p;/^NSpid:/p' \
+  "/proc/$O_CHILD/status"
+wait "$O_OBSERVER"</pre>
+              <p style="margin:9px 0 0;"><strong style="color:#f8fafc;">증거:</strong> child는 Z가 아니라 보통 S이며 old_ppid와 new_ppid가 달라진다. new_ppid가 반드시 1일 필요는 없다. shell이나 container runtime의 subreaper가 adopter일 수 있다.</p>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. production 실패 시나리오</h2>
+              <div style="padding:15px;background:#241528;border:1px solid #7f1d4d;border-radius:9px;">
+                <p style="margin:0 0 8px;"><strong style="color:#f9a8d4;">상황:</strong> container의 application이 PID 1이며 요청마다 helper를 spawn하지만 timeout path에서 wait하지 않는다. traffic 증가 후 Z process와 <code style="color:#fbbf24;">pids.current</code>가 계속 오른다.</p>
+                <p style="margin:0 0 8px;"><strong style="color:#f9a8d4;">장애:</strong> memory/CPU 여유가 있어도 cgroup pids.max 또는 PID slot에 닿아 fork/clone이 EAGAIN으로 실패한다. health check가 새 helper를 만들지 못해 cascade가 시작된다.</p>
+                <p style="margin:0 0 8px;"><strong style="color:#f9a8d4;">증거:</strong> Z count, PPID별 zombie 집계, child spawn/exit/reap rate, oldest-zombie age, pids.current/max, EAGAIN log를 같은 timeline에 놓는다.</p>
+                <p style="margin:0;"><strong style="color:#f9a8d4;">복구·예방:</strong> faulty parent를 안전하게 drain/restart하고 adopter가 reap하는지 확인한다. 이후 모든 종료 path에서 wait loop를 보장하고, PID 1에 tiny init/subreaper를 두며 quota 70–80% 이전 alert와 spawn backpressure를 설정한다.</p>
+              </div>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. 대기업 면접 질문 3개</h2>
+              <p style="margin:0 0 10px;"><strong style="color:#f8fafc;">Q1. orphan과 zombie의 차이를 kernel 생명주기로 설명해 보세요.</strong><br>답변 포인트: orphan은 parent가 먼저 종료한 실행 중 child라 reparent된다. zombie는 child가 먼저 종료해 자원 대부분을 반납했지만 wait 전이라 PID/status record가 남은 EXIT_ZOMBIE 상태다.</p>
+              <p style="margin:0 0 10px;"><strong style="color:#f8fafc;">Q2. kill -9로 zombie를 제거할 수 없는 이유와 운영 복구법은?</strong><br>답변 포인트: 이미 실행 context가 없고 exit를 마쳤으므로 signal 대상이 아니다. parent가 wait하도록 수정하고, 긴급 시 parent를 안전하게 재시작해 init/subreaper가 채택·reap하도록 하며 PID quota를 감시한다.</p>
+              <p style="margin:0;"><strong style="color:#f8fafc;">Q3. container PID 1에 특별한 책임이 생기는 이유는?</strong><br>답변 포인트: PID namespace init은 orphan adopter이고 signal semantics도 특별하다. signal forwarding, graceful shutdown, 모든 descendant reaping을 구현하거나 tiny init을 사용해야 한다. subreaper와 namespace별 PID도 언급한다.</p>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 퀴즈·누적 리뷰</h2>
+              <ol style="margin:0;padding-left:22px;">
+                <li style="margin-bottom:6px;">zombie에서 이미 해제된 resource와 wait 전까지 남는 정보는 각각 무엇인가?</li>
+                <li style="margin-bottom:6px;">SIGCHLD를 한 번 받았을 때 waitpid를 loop로 호출해야 하는 이유는?</li>
+                <li style="margin-bottom:6px;">orphan의 new PPID가 host PID 1이 아닐 수 있는 두 이유는?</li>
+                <li style="margin-bottom:6px;">Day 02 복습: SIGCHLD notification과 wait system call의 역할 경계는?</li>
+                <li style="margin-bottom:6px;">Day 04 복습: fork→exit→wait 중 zombie가 존재하는 정확한 구간은?</li>
+                <li>Day 05 복습: zombie가 CPU context switch를 일으키지 않는데도 시스템 전체를 고갈시킬 수 있는 자원은?</li>
+              </ol>
+              <p style="margin:11px 0 0;color:#a7c7da;font-size:14px;">회상 기준: <strong style="color:#f8fafc;">exit → EXIT_ZOMBIE → SIGCHLD → wait → release</strong>와 <strong style="color:#f8fafc;">parent exit → reparent → adopter wait</strong> 두 경로를 그림 없이 설명하면 통과다.</p>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 다음 날 연결</h2>
+              <p style="margin:0;">Day 07은 Week 1 전체 리뷰다. application 요청 하나가 process/thread, syscall, task/mm, fork·exec·wait, context switch, 종료/reaping을 거쳐 어디서 실패하는지 하나의 kernel 경계 그림으로 설명한다.</p>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 공식·1차 출처</h2>
+              <ul style="margin:0;padding-left:22px;color:#a7c7da;">
+                <li><a href="https://man7.org/linux/man-pages/man2/waitpid.2.html" style="color:#67e8f9;">Linux man-pages — wait(2)</a>: zombie, wait semantics, orphan adoption, EINTR/ECHILD</li>
+                <li><a href="https://man7.org/linux/man-pages/man2/PR_SET_CHILD_SUBREAPER.2const.html" style="color:#67e8f9;">Linux man-pages — PR_SET_CHILD_SUBREAPER(2const)</a>: 가장 가까운 subreaper의 orphan 채택</li>
+                <li><a href="https://man7.org/linux/man-pages/man7/pid_namespaces.7.html" style="color:#67e8f9;">Linux man-pages — pid_namespaces(7)</a>: namespace init과 PID 가시성</li>
+                <li><a href="https://man7.org/linux/man-pages/man5/proc_pid_status.5.html" style="color:#67e8f9;">Linux man-pages — proc_pid_status(5)</a>: State, PPid, NSpid</li>
+                <li><a href="https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html" style="color:#67e8f9;">Linux man-pages — proc_pid_stat(5)</a>: process state Z와 stat field</li>
+                <li><a href="https://man7.org/linux/man-pages/man1/ps.1.html" style="color:#67e8f9;">Linux man-pages — ps(1)</a>: Z/defunct 상태 표시</li>
+                <li><a href="https://man7.org/linux/man-pages/man2/pidfd_open.2.html" style="color:#67e8f9;">Linux man-pages — pidfd_open(2)</a>: PID reuse race를 줄이는 process FD</li>
+                <li><a href="https://man7.org/linux/man-pages/man2/sigaction.2.html" style="color:#67e8f9;">Linux man-pages — sigaction(2)</a>: SIGCHLD, SA_NOCLDWAIT</li>
+                <li><a href="https://github.com/torvalds/linux/blob/master/kernel/exit.c" style="color:#67e8f9;">Linux kernel source — kernel/exit.c</a>: do_exit, exit_notify, forget_original_parent, release_task</li>
+                <li><a href="https://github.com/torvalds/linux/blob/master/include/linux/sched.h" style="color:#67e8f9;">Linux kernel source — include/linux/sched.h</a>: EXIT_ZOMBIE와 EXIT_DEAD 상태</li>
+              </ul>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:18px 28px;background:#081522;border-top:1px solid #1e3a4c;color:#7fa4ba;font-size:12px;">Operating System 심화 커리큘럼 · 초보 용어에서 kernel/hardware와 production diagnosis까지</td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
