@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operating System 심화 커리큘럼 Day 07 - 리뷰: 요청 한 번을 process·kernel 경계로 설명</title>
+</head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.68;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#07111f;">
+    <tr>
+      <td align="center" style="padding:20px 10px 44px;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#0b1728;border:1px solid #1e3a4c;border-radius:18px;overflow:hidden;">
+          <tr>
+            <td style="padding:30px 28px;background:#102438;border-bottom:1px solid #1e3a4c;">
+              <div style="font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:#5eead4;font-weight:800;">Operating System · Day 07 / 63 · Week 1 Review</div>
+              <h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">리뷰: 요청 한 번을 process·kernel 경계로 설명</h1>
+              <p style="margin:0;color:#a5f3fc;font-size:16px;">한 줄 요약 — request는 kernel이 scheduling하는 단위가 아니다. worker <strong style="color:#f8fafc;">task</strong>가 user code와 system call을 왕복하고, I/O 대기 때 CPU를 반납했다가 wakeup·context switch 뒤 재개하며, child를 만들었다면 종료 status까지 wait로 회수해야 한 요청의 OS 생명주기가 닫힌다.</p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:26px 28px;">
+              <h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 선수 용어 사전</h2>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:14px;">
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;width:31%;">request</td><td style="padding:9px;border:1px solid #29465d;">HTTP 요청, RPC, queue message처럼 application이 정의한 작업 단위. kernel의 process/task와 1:1이라고 보장되지 않는다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">process</td><td style="padding:9px;border:1px solid #29465d;">virtual address space, file descriptor, 권한, signal disposition 같은 실행 자원을 담는 격리 단위.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">thread / task</td><td style="padding:9px;border:1px solid #29465d;">thread는 process 안의 실행 흐름이고, Linux task는 scheduler가 CPU에 배치하는 단위다. thread마다 register·stack·schedule state가 있다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">system-call ABI</td><td style="padding:9px;border:1px solid #29465d;">syscall number·argument register·return value·error 표현을 user와 kernel이 합의한 binary 규약.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">pt_regs / trap frame</td><td style="padding:9px;border:1px solid #29465d;">system call·exception 진입 시 user register 상태를 kernel stack 쪽에 표현해 안전하게 복귀하도록 하는 architecture별 상태.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">file descriptor</td><td style="padding:9px;border:1px solid #29465d;">process의 FD table에서 open file description·socket·pipe 같은 kernel object를 찾는 작은 정수 handle.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">blocking / off-CPU</td><td style="padding:9px;border:1px solid #29465d;">필요 조건이 아직 없어 task가 실행을 멈추고 CPU를 반납한 상태. 느리지만 CPU 사용률은 낮을 수 있다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">wait queue / wakeup</td><td style="padding:9px;border:1px solid #29465d;">kernel이 조건을 기다리는 task를 연결하고, 조건이 충족되면 runnable 후보로 되돌리는 mechanism.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">run queue</td><td style="padding:9px;border:1px solid #29465d;">실행 가능하지만 CPU 차례를 기다리는 task를 scheduler가 관리하는 per-CPU 중심 자료구조.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">context switch</td><td style="padding:9px;border:1px solid #29465d;">현재 CPU의 실행 task를 A에서 B로 바꾸며 register·stack·memory context 등을 저장·복원하는 사건.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">causal timeline</td><td style="padding:9px;border:1px solid #29465d;">request의 user 실행, syscall, sleep, wakeup, child lifecycle을 동일 시간축과 identity로 연결한 증거 흐름.</td></tr>
+              </table>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 요청이라는 baton을 여러 실행 경계가 넘겨받는다</h2>
+              <div style="padding:16px;background:#0f2035;border-left:4px solid #5eead4;border-radius:8px;">
+                <p style="margin:0 0 9px;">process는 <strong style="color:#f8fafc;">건물</strong>, worker thread는 그 안에서 움직이는 <strong style="color:#f8fafc;">작업자</strong>, request는 작업자가 처리하는 <strong style="color:#f8fafc;">작업표</strong>다. 작업표 하나가 건물 하나를 뜻하지 않고, 한 작업자가 여러 요청을 순차 처리하거나 여러 작업자가 같은 process에서 동시에 처리할 수 있다.</p>
+                <p style="margin:0 0 9px;">worker가 kernel service를 요청하면 건물을 바꾸는 것이 아니라 같은 task가 user mode에서 kernel mode로 들어간다. 조건이 없어서 block할 때에만 scheduler가 다른 task에 CPU를 줄 수 있다.</p>
+                <p style="margin:0;">면접 답변은 “함수를 호출했다”로 끝내지 말고 <strong style="color:#f8fafc;">누가 실행 중인지 → 어느 경계를 건넜는지 → 왜 sleep했는지 → 무엇이 깨웠는지 → 누가 cleanup하는지</strong>를 이어야 한다.</p>
+              </div>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture·상태 전이: blocking read 요청 한 번</h2>
+              <div style="overflow:auto;padding:16px;background:#06101d;border:1px solid #29465d;border-radius:10px;">
+                <pre style="margin:0;color:#c4f1f9;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;">service process: mm + FD table + credentials + signal state
+└─ worker task T (RUNNING, user mode)
+   │ application parser가 read(fd, user_buf, n) 호출
+   ▼
+libc wrapper → syscall number/arguments를 ABI register에 배치
+   │ CPU syscall instruction: privilege transition
+   ▼
+architecture entry → pt_regs/kernel stack → seccomp/audit/tracing
+   │ sys_read → FD lookup → object-specific read operation
+   ├─ data 있음: bytes를 반환하고 바로 user mode 복귀 가능
+   │
+   └─ data 없음(blocking FD)
+        T: RUNNING → INTERRUPTIBLE SLEEP, wait queue 연결
+        schedule() → 다른 task U로 context switch       [T off-CPU]
+                         │
+                    I/O completion/event가 조건 충족
+                         ▼
+                    wakeup(T): SLEEPING → RUNNABLE
+                    run queue 대기 → scheduler 선택
+                    U → T context switch
+                         │
+        read 재개 → bytes/EOF/errno 결정 → syscall exit work
+   ▼
+T (user mode): parse → business logic → write(response)
+   │ optional child work: fork(COW) → child execve → exit
+   │                      parent wait* → status 회수/reap
+   ▼
+response 완료·deadline/cancel 정리 → 다음 request 대기</pre>
+              </div>
+              <p style="margin:11px 0 0;color:#a7c7da;font-size:14px;"><strong style="color:#fbbf24;">구분:</strong> syscall 진입은 mode switch지만 항상 task context switch는 아니다. block 뒤 다른 task가 선택되어야 context switch가 생긴다. wakeup은 runnable 자격 회복이지 즉시 실행 보장이 아니다.</p>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. Week 1 CS/kernel deep dive</h2>
+              <h3 style="margin:16px 0 8px;color:#f8fafc;font-size:17px;">4.1 request, process, task는 서로 다른 identity다</h3>
+              <p style="margin:0 0 9px;">kernel scheduler는 request ID를 모른다. CPU에 올리는 것은 task이고, memory translation은 task가 가리키는 <code style="color:#fbbf24;">mm_struct</code>, FD lookup은 공유하거나 복제된 files table을 통해 이뤄진다. 한 request가 async callback·thread pool·child process를 거치면 여러 task에 걸칠 수 있다.</p>
+              <p style="margin:0;">반대로 한 worker task는 connection keep-alive에서 여러 request를 연속 처리할 수 있다. 그래서 observability는 PID만으로 부족하고 request ID, TID, timestamp, child PID/start time을 causal하게 연결해야 한다.</p>
+
+              <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">4.2 syscall 경계는 단순 함수 call보다 무겁고 엄격하다</h3>
+              <p style="margin:0 0 9px;">CPU는 privilege level과 stack/context를 바꾸고 kernel entry code는 architecture register frame을 세운다. Linux 공통 entry는 RCU/context tracking, tracing, seccomp, audit 같은 entry work를 순서에 맞게 처리한 뒤 실제 syscall을 invoke한다.</p>
+              <p style="margin:0;">복귀도 단순 <code style="color:#fbbf24;">ret</code>가 아니다. pending signal, tracing, task work, reschedule 조건을 처리한 뒤 user register를 복원한다. 다만 syscall이 곧 process 전환을 뜻하지는 않는다.</p>
+
+              <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">4.3 blocking은 busy wait가 아니라 상태 전이 protocol이다</h3>
+              <p style="margin:0 0 9px;">조건 확인과 wait queue 등록 순서가 잘못되면 조건이 이미 참이 됐는데도 영원히 자는 lost wakeup이 생길 수 있다. kernel subsystem은 “조건 확인 → sleep 준비 → 재확인 → schedule”과 wakeup 쪽 synchronization을 맞춰 이 race를 피한다.</p>
+              <p style="margin:0;">sleep 중 task는 CPU를 쓰지 않는다. event가 깨우면 runnable이 되지만 run queue 경쟁, CPU affinity, priority에 따라 실제 running까지 scheduler latency가 추가된다. 그래서 I/O latency와 run-queue latency를 분리한다.</p>
+
+              <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">4.4 read/write 성공은 요청 완료와 같지 않다</h3>
+              <p style="margin:0 0 9px;"><code style="color:#fbbf24;">read()</code>는 요청한 count보다 적은 bytes를 정상 반환할 수 있고 0은 stream EOF를 뜻한다. nonblocking이면 EAGAIN/EWOULDBLOCK, data 전 signal이면 EINTR가 가능하다. application protocol framing이 완성될 때까지 loop와 buffer state를 관리해야 한다.</p>
+              <p style="margin:0;"><code style="color:#fbbf24;">write()</code>도 partial success가 가능하다. 남은 offset부터 재시도하되 deadline을 지켜야 하며, peer가 닫혔다면 EPIPE와 SIGPIPE를 함께 설계한다. “syscall return ≥ 0”과 “business response가 상대에게 완전히 전달됨”은 다른 보장이다.</p>
+
+              <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">4.5 fork·exec·wait는 optional subflow다</h3>
+              <p style="margin:0 0 9px;">요청마다 process가 새로 생기는 것은 아니다. 정말 격리된 child 작업이 필요할 때 parent가 fork/clone으로 task와 page table 구조를 만들고 COW로 page를 공유한다. child의 execve는 새 PID를 만들지 않고 같은 process의 program image를 교체한다.</p>
+              <p style="margin:0;">fork 뒤 multithreaded child는 exec 전 async-signal-safe 함수만 호출해야 한다. exec 실패는 return하므로 child가 parent code를 계속 실행하지 않게 즉시 오류를 기록하고 <code style="color:#fbbf24;">_exit()</code>해야 한다. parent는 timeout·signal·wait를 소유해 zombie를 남기지 않는다.</p>
+
+              <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">4.6 비용은 user CPU만으로 설명되지 않는다</h3>
+              <p style="margin:0;">request latency는 user execution + kernel execution + off-CPU wait + runnable queue wait + context-switch의 직접/간접 비용으로 나뉜다. cache/TLB/predictor working-set 교란은 task_struct에 저장되는 state가 아니지만 재개 뒤 성능을 늦출 수 있다.</p>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. 실무 best practice: 요청 생명주기를 닫는 법</h2>
+              <ol style="margin:0;padding-left:22px;">
+                <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">하나의 deadline을 전파한다.</strong> ingress timeout, blocking I/O, queue wait, child 실행, response write 각각에 남은 budget을 전달한다.</li>
+                <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">resource owner를 명시한다.</strong> FD close, buffer release, child cancel/wait, request context cleanup을 정상·timeout·signal path 모두에서 한 번만 수행한다.</li>
+                <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">partial I/O를 정상 상태로 설계한다.</strong> bytes_done offset과 protocol framing을 보존하고 EINTR/EAGAIN/EOF/EPIPE를 서로 다른 사건으로 처리한다.</li>
+                <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">unbounded spawn·queue를 피한다.</strong> worker pool, concurrency limit, bounded queue, backpressure로 PID·memory·run queue 고갈을 막는다.</li>
+                <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">request ID와 execution ID를 함께 관측한다.</strong> trace ID에 PID/TID, syscall duration, off-CPU reason, child PID와 exit status를 연결한다.</li>
+                <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">graceful shutdown을 integration test한다.</strong> accept 중단 → inflight drain → child TERM/KILL/wait → FD close 순서와 container PID 1의 signal forwarding/reaping을 확인한다.</li>
+                <li><strong style="color:#f8fafc;">도구가 의미를 바꿀 수 있음을 안다.</strong> strace는 ptrace overhead를 추가하므로 짧고 좁은 filter로 증거를 모으고 production SLO 수치 자체로 사용하지 않는다.</li>
+              </ol>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. error handling decision table</h2>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:14px;">
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">read &gt; 0</td><td style="padding:9px;border:1px solid #29465d;">일부 bytes 성공이다. message framing이 끝났는지 확인하고 부족하면 남은 deadline 안에서 계속 읽는다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">read = 0</td><td style="padding:9px;border:1px solid #29465d;">stream EOF다. 빈 payload 성공과 구분하고 incomplete frame이면 protocol error로 정리한다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">EINTR</td><td style="padding:9px;border:1px solid #29465d;">아무 byte도 전달되기 전 signal interruption이다. cancellation/deadline을 먼저 확인하고 유효하면 재시도한다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">EAGAIN/EWOULDBLOCK</td><td style="padding:9px;border:1px solid #29465d;">nonblocking FD가 지금 준비되지 않았다. busy loop 대신 readiness mechanism과 deadline에 다시 등록한다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">partial write</td><td style="padding:9px;border:1px solid #29465d;">성공한 byte 수만큼 offset을 전진한다. 동일 buffer 처음부터 재전송하면 response가 중복된다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">EPIPE/SIGPIPE</td><td style="padding:9px;border:1px solid #29465d;">peer가 read end를 닫았다. process 전체가 예기치 않게 죽지 않도록 signal policy와 request cleanup을 함께 둔다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">fork EAGAIN/ENOMEM</td><td style="padding:9px;border:1px solid #29465d;">PID/cgroup/user limit 또는 kernel memory pressure를 구분한다. retry storm 대신 backpressure와 degraded path를 사용한다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">exec 실패</td><td style="padding:9px;border:1px solid #29465d;">exec는 성공 시 돌아오지 않는다. return했다면 errno를 전달하고 child에서 _exit해 parent control flow 오염을 막는다.</td></tr>
+                <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">wait EINTR/ECHILD</td><td style="padding:9px;border:1px solid #29465d;">EINTR은 정책상 취소가 아니면 재시도한다. ECHILD는 ownership·이미 reap·SIGCHLD disposition을 확인한다.</td></tr>
+              </table>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. 놓치기 쉬운 함정</h2>
+              <ul style="margin:0;padding-left:22px;">
+                <li style="margin-bottom:7px;">request 하나가 process 하나라는 가정은 prefork server 일부에서만 우연히 맞을 수 있다.</li>
+                <li style="margin-bottom:7px;">kernel mode에서 오래 보냈다고 반드시 context switch가 많은 것은 아니고, syscall 수가 context switch 수와 같지도 않다.</li>
+                <li style="margin-bottom:7px;">wakeup 직후 running이라고 쓰지 않는다. runnable queue에서 기다릴 수 있다.</li>
+                <li style="margin-bottom:7px;">blocking task를 CPU bottleneck으로 오진하지 않는다. 낮은 CPU와 높은 latency는 off-CPU 증거를 요구한다.</li>
+                <li style="margin-bottom:7px;">read 한 번이 request 한 개를 반환한다고 가정하지 않는다. stream에는 message boundary가 없다.</li>
+                <li style="margin-bottom:7px;">fork가 모든 physical page를 즉시 복사하거나 exec가 새 process/PID를 만든다고 설명하지 않는다.</li>
+                <li style="margin-bottom:7px;">child exit와 cleanup 완료를 같다고 보지 않는다. wait 전에는 zombie record가 남는다.</li>
+                <li>/proc과 strace는 snapshot·관측 도구다. PID reuse, process exit race, 권한, tracer overhead를 기록한다.</li>
+              </ul>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. 30분 실습: pipe 요청의 sleep→wakeup→fork→wait 추적</h2>
+              <p style="margin:0 0 10px;color:#a7c7da;">Linux 일회용 VM/container에서 실행한다. payload에 secret을 넣지 않는다. strace가 없거나 ptrace가 금지된 환경이면 설치·권한을 임의로 바꾸지 말고 <code style="color:#fbbf24;">ps</code>와 <code style="color:#fbbf24;">/proc</code> 관찰까지만 수행한다.</p>
+              <pre style="margin:0;padding:14px;background:#06101d;border:1px solid #29465d;border-radius:10px;color:#d1fae5;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;">LAB_DIR=$(mktemp -d)
+TRACE_PREFIX="$LAB_DIR/trace"
+TRACE_CMD=()
+if command -v strace &gt;/dev/null; then
+  TRACE_CMD=(strace -ff -ttT -s 80 -o "$TRACE_PREFIX"
+             -e trace=process,read,write)
+else
+  echo "strace 없음: /proc 관찰만 수행하세요"
+fi
+
+"${TRACE_CMD[@]}" python3 - "$LAB_DIR" &lt;&lt;'PY' &amp;
+import os, sys, time
+lab = sys.argv[1]
+req_r, req_w = os.pipe()
+res_r, res_w = os.pipe()
+child = os.fork()
+if child == 0:
+    os.close(req_w); os.close(res_r)
+    with open(f"{lab}/worker.pid", "w") as f:
+        f.write(str(os.getpid()))
+    data = os.read(req_r, 4096)       # go 전까지 blocking sleep
+    os.write(res_w, data.upper())
+    os._exit(7)
+
+os.close(req_r); os.close(res_w)
+with open(f"{lab}/parent.pid", "w") as f:
+    f.write(str(os.getpid()))
+while not os.path.exists(f"{lab}/go"):
+    time.sleep(.05)
+os.write(req_w, b"request-42\n")
+os.close(req_w)
+reply = os.read(res_r, 4096)
+got, status = os.waitpid(child, 0)
+with open(f"{lab}/result.txt", "w") as f:
+    f.write(f"reply={reply!r} child={got} "
+            f"exit={os.waitstatus_to_exitcode(status)}\n")
+PY
+
+TRACER=$!
+while [ ! -s "$LAB_DIR/worker.pid" ]; do sleep .1; done
+WORKER=$(sed -n '1p' "$LAB_DIR/worker.pid")
+PARENT=$(sed -n '1p' "$LAB_DIR/parent.pid")
+
+echo "[1] request data 전: worker가 pipe read에서 sleep"
+ps -o pid,ppid,state,stat,wchan,etime,cmd -p "$PARENT,$WORKER"
+sed -n '/^State:/p;/^Pid:/p;/^PPid:/p;
+        /^voluntary_ctxt_switches:/p;
+        /^nonvoluntary_ctxt_switches:/p' "/proc/$WORKER/status"
+test -r "/proc/$WORKER/wchan" &amp;&amp; sed -n '1p' "/proc/$WORKER/wchan"
+
+echo "[2] request 전달: blocked read가 깨어나고 child가 응답 후 exit"
+: &gt; "$LAB_DIR/go"
+wait "$TRACER"
+sed -n '1p' "$LAB_DIR/result.txt"
+test ! -e "/proc/$WORKER" &amp;&amp; echo "wait 완료: worker /proc 제거"
+
+if command -v strace &gt;/dev/null; then
+  grep -hE 'execve|clone|fork|read|write|wait4|exit_group' \
+    "$LAB_DIR"/trace.* | tail -40
+fi</pre>
+              <p style="margin:10px 0 0;"><strong style="color:#f8fafc;">예상 증거:</strong> go 전 worker는 S state와 pipe 관련 wchan을 보이고 voluntary switch가 있다. go 뒤 parent의 write가 child read를 깨우고, child write·exit 뒤 parent wait4가 exit 7을 회수한다. 마지막 /proc 부재는 reap 완료를 뜻한다.</p>
+              <p style="margin:8px 0 0;color:#a7c7da;font-size:14px;">리뷰 과제: trace에서 각 줄에 <strong style="color:#f8fafc;">user→kernel, block, wakeup 이후 재개, child lifecycle, cleanup</strong> label을 붙이고 “syscall인데 context switch가 없을 수 있는 줄”과 “context switch가 반드시 필요한 구간”을 구분한다.</p>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. 실패 시나리오: CPU 25%인데 p99가 4초다</h2>
+              <div style="padding:15px;background:#241528;border:1px solid #7f1d4d;border-radius:9px;">
+                <p style="margin:0 0 8px;"><strong style="color:#f9a8d4;">잘못된 결론:</strong> “CPU가 남으니 worker를 더 늘리면 된다.” 실제로는 downstream read가 3.8초 block되고 request마다 child를 spawn해 timeout 시 wait도 누락한다.</p>
+                <p style="margin:0 0 8px;"><strong style="color:#f9a8d4;">증거:</strong> request timeline에서 user CPU는 짧고 read syscall/off-CPU 구간이 길다. worker State=S·wchan, 낮은 run queue, 증가하는 Z child·pids.current, wait 누락 log가 같은 시점에 나타난다.</p>
+                <p style="margin:0 0 8px;"><strong style="color:#f9a8d4;">즉시 대응:</strong> ingress concurrency와 queue를 제한하고 downstream deadline/circuit breaker를 적용한다. 기존 child를 안전하게 cancel→wait하고 faulty instance를 drain한다.</p>
+                <p style="margin:0;"><strong style="color:#f9a8d4;">구조 개선:</strong> per-request spawn을 bounded pool로 바꾸고, end-to-end deadline·partial I/O state machine·child owner를 테스트한다. CPU, off-CPU, runnable delay, zombie/PID 지표를 별도 SLO signal로 둔다.</p>
+              </div>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 대기업 면접 질문 3개</h2>
+              <p style="margin:0 0 10px;"><strong style="color:#f8fafc;">Q1. blocking read로 요청 하나가 처리되는 과정을 user/kernel 경계부터 설명해 보세요.</strong><br>답변 포인트: request와 task를 구분하고 libc·ABI·syscall entry·FD lookup·wait queue·sleep·schedule·I/O completion·wakeup·runnable·context switch·return 순서로 말한다. read의 partial/EOF/EINTR도 연결한다.</p>
+              <p style="margin:0 0 10px;"><strong style="color:#f8fafc;">Q2. system call과 context switch는 왜 1:1이 아닌가요?</strong><br>답변 포인트: syscall은 privilege mode 경계이며 data가 준비되면 current task 그대로 복귀할 수 있다. block/preemption 뒤 scheduler가 다른 task를 선택해야 task context switch다. wakeup과 running도 구분한다.</p>
+              <p style="margin:0;"><strong style="color:#f8fafc;">Q3. CPU가 낮은데 latency가 높은 서비스를 어떻게 진단하나요?</strong><br>답변 포인트: user/kernel CPU, off-CPU wait, runnable delay를 분해한다. request trace, syscall duration, task state/wchan, sched wakeup→switch, downstream latency를 연결하고 queue/backpressure/deadline 및 child reaping을 점검한다.</p>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. 퀴즈·Week 1 누적 리뷰</h2>
+              <ol style="margin:0;padding-left:22px;">
+                <li style="margin-bottom:6px;">Day 01: request, process, thread, task를 각각 한 문장으로 구분하라.</li>
+                <li style="margin-bottom:6px;">Day 02: syscall entry에서 CPU privilege, register frame, kernel entry work는 어떻게 바뀌는가?</li>
+                <li style="margin-bottom:6px;">Day 03: worker thread 둘이 공유하는 mm/FD와 각자 갖는 stack/register는 무엇인가?</li>
+                <li style="margin-bottom:6px;">Day 04: fork·exec·wait 중 새 PID가 생기는 지점과 program image가 바뀌는 지점은?</li>
+                <li style="margin-bottom:6px;">Day 05: mode switch만 있고 task context switch가 없는 request 구간을 찾아라.</li>
+                <li style="margin-bottom:6px;">Day 06: timeout child가 exit한 뒤 parent가 wait하지 않으면 어떤 상태·자원이 남는가?</li>
+                <li>종합: “CPU가 낮으니 OS 문제는 아니다”라는 주장에 어떤 counterexample과 증거를 제시할 것인가?</li>
+              </ol>
+              <p style="margin:11px 0 0;color:#a7c7da;font-size:14px;">통과 기준: 3분 안에 <strong style="color:#f8fafc;">identity(process/task/request) → syscall boundary → sleep/wakeup/schedule → I/O result → optional child lifecycle → cleanup/error</strong> 순서로 whiteboard 설명하고, 각 구간의 관측 도구를 하나씩 붙인다.</p>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 다음 날 연결</h2>
+              <p style="margin:0;">Day 08부터 CPU scheduling을 본격적으로 시작한다. 오늘 분해한 user CPU, kernel CPU, off-CPU, runnable wait 위에 workload, CPU burst, latency, throughput, fairness를 올려 “어떤 task를 언제 실행해야 SLO를 지키는가”를 설계한다.</p>
+
+              <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 공식·1차 출처</h2>
+              <ul style="margin:0;padding-left:22px;color:#a7c7da;">
+                <li><a href="https://docs.kernel.org/core-api/entry.html" style="color:#67e8f9;">Linux kernel docs — entry/exit handling</a>: syscall entry·exit, pt_regs, RCU/tracing/audit/signal work 순서</li>
+                <li><a href="https://github.com/torvalds/linux/blob/master/arch/x86/entry/common.c" style="color:#67e8f9;">Linux x86 source — arch/x86/entry/common.c</a>: do_syscall_64와 user-mode 복귀 경계</li>
+                <li><a href="https://github.com/torvalds/linux/blob/master/fs/read_write.c" style="color:#67e8f9;">Linux source — fs/read_write.c</a>: read/write syscall과 VFS 경로</li>
+                <li><a href="https://github.com/torvalds/linux/blob/master/kernel/sched/core.c" style="color:#67e8f9;">Linux source — kernel/sched/core.c</a>: __schedule, context_switch, wakeup core</li>
+                <li><a href="https://man7.org/linux/man-pages/man2/read.2.html" style="color:#67e8f9;">Linux man-pages — read(2)</a>: partial read, EOF, EINTR, EAGAIN/EWOULDBLOCK</li>
+                <li><a href="https://man7.org/linux/man-pages/man2/write.2.html" style="color:#67e8f9;">Linux man-pages — write(2)</a>: partial write, EINTR, EPIPE/SIGPIPE</li>
+                <li><a href="https://man7.org/linux/man-pages/man2/fork.2.html" style="color:#67e8f9;">Linux man-pages — fork(2)</a>: process 생성, COW, multithreaded child 제약, resource-limit 오류</li>
+                <li><a href="https://man7.org/linux/man-pages/man2/execve.2.html" style="color:#67e8f9;">Linux man-pages — execve(2)</a>: 동일 process의 program image 교체와 오류</li>
+                <li><a href="https://man7.org/linux/man-pages/man2/waitpid.2.html" style="color:#67e8f9;">Linux man-pages — wait(2)</a>: child status, WNOHANG, zombie reaping, EINTR/ECHILD</li>
+                <li><a href="https://man7.org/linux/man-pages/man5/proc_pid_status.5.html" style="color:#67e8f9;">Linux man-pages — proc_pid_status(5)</a>: task state·PPID·context-switch counter</li>
+                <li><a href="https://man7.org/linux/man-pages/man1/strace.1.html" style="color:#67e8f9;">strace manual — strace(1)</a>: syscall·signal·process lifecycle tracing과 overhead 주의</li>
+              </ul>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:18px 28px;background:#081522;border-top:1px solid #1e3a4c;color:#7fa4ba;font-size:12px;">Operating System 심화 커리큘럼 · 초보 용어에서 kernel/hardware와 production diagnosis까지</td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
