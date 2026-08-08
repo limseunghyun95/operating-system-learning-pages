@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-08-06T09:10:58+09:00",
+  "updatedAt": "2026-08-08T09:10:36+09:00",
   "lessons": [
     {
       "day": 1,
@@ -68,6 +68,15 @@
       "path": "day-07.html",
       "kind": "review",
       "publishedAt": "2026-08-06T09:10:58+09:00"
+    },
+    {
+      "day": 8,
+      "week": 2,
+      "title": "workload, burst, latency, throughput, fairness",
+      "summary": "workload의 arrival·service 분포를 queueing model로 해석하고 latency·throughput·fairness를 Linux scheduler·PSI·cgroup 증거로 함께 측정합니다.",
+      "path": "day-08.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-08T09:10:36+09:00"
     }
   ]
 }
