@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-08-08T09:10:36+09:00",
+  "updatedAt": "2026-08-09T09:29:54+09:00",
   "lessons": [
     {
       "day": 1,
@@ -77,6 +77,15 @@
       "path": "day-08.html",
       "kind": "lesson",
       "publishedAt": "2026-08-08T09:10:36+09:00"
+    },
+    {
+      "day": 9,
+      "week": 2,
+      "title": "FCFS, SJF, Round Robin과 starvation",
+      "summary": "동일 workload를 FCFS·SJF·Round Robin으로 Gantt simulation해 waiting·response·turnaround와 context-switch 비용을 비교하고 starvation 방지 정책까지 설계합니다.",
+      "path": "day-09.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-09T09:29:54+09:00"
     }
   ]
 }
