@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-08-09T09:29:54+09:00",
+  "updatedAt": "2026-08-10T09:40:49+09:00",
   "lessons": [
     {
       "day": 1,
@@ -86,6 +86,15 @@
       "path": "day-09.html",
       "kind": "lesson",
       "publishedAt": "2026-08-09T09:29:54+09:00"
+    },
+    {
+      "day": 10,
+      "week": 2,
+      "title": "priority, preemption, time slice",
+      "summary": "priority와 scheduling class를 구분하고 need_resched부터 실제 context switch까지의 preemption 경로, class별 time-slice semantics와 priority inversion 대응을 Linux 증거로 연결합니다.",
+      "path": "day-10.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-10T09:40:49+09:00"
     }
   ]
 }
