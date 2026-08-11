@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-08-10T09:40:49+09:00",
+  "updatedAt": "2026-08-11T09:24:36+09:00",
   "lessons": [
     {
       "day": 1,
@@ -95,6 +95,15 @@
       "path": "day-10.html",
       "kind": "lesson",
       "publishedAt": "2026-08-10T09:40:49+09:00"
+    },
+    {
+      "day": 11,
+      "week": 2,
+      "title": "multicore, run queue, load balancing, CPU affinity",
+      "summary": "per-CPU run queue와 topology-aware load balancing을 따라가며 affinity·cpuset의 실제 계약, migration의 cache·NUMA 비용과 SMT·heterogeneous capacity 함정을 실습합니다.",
+      "path": "day-11.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-11T09:24:36+09:00"
     }
   ]
 }
