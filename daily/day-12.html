@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operating System 심화 커리큘럼 Day 12 - Linux CFS에서 EEVDF로 이어지는 mental model</title>
+</head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.68;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#07111f;">
+    <tr><td align="center" style="padding:20px 10px 44px;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#0b1728;border:1px solid #1e3a4c;border-radius:18px;overflow:hidden;">
+        <tr><td style="padding:30px 28px;background:#102438;border-bottom:1px solid #1e3a4c;">
+          <div style="font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:#5eead4;font-weight:800;">Operating System · Day 12 / 63 · CPU Scheduling</div>
+          <h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">Linux CFS에서 EEVDF로 이어지는 mental model</h1>
+          <p style="margin:0;color:#a5f3fc;font-size:16px;">한 줄 요약 — CFS는 weight로 보정한 <strong style="color:#f8fafc;">vruntime이 가장 뒤처진 task</strong>를 골라 장기 CPU share를 맞췄고, EEVDF는 여기에 <strong style="color:#f8fafc;">lag로 받을 자격을 제한한 뒤 가장 이른 virtual deadline</strong>을 선택해 fairness와 latency 요구를 더 분리한다. virtual deadline은 실시간 완료 보장이 아니다.</p>
+        </td></tr>
+        <tr><td style="padding:26px 28px;">
+          <h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 선수 용어 사전</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:14px;">
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;width:31%;">fair class</td><td style="padding:9px;border:1px solid #29465d;">Linux의 normal task(SCHED_OTHER/NORMAL, BATCH, IDLE)를 다루는 scheduling class. RT·DEADLINE class와 별도다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">scheduling entity</td><td style="padding:9px;border:1px solid #29465d;">scheduler가 CPU service를 배분하는 단위. thread일 수도 있고 group scheduling에서는 task group을 대표할 수도 있다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">weight</td><td style="padding:9px;border:1px solid #29465d;">nice에서 변환되는 상대 CPU share 값. weight가 클수록 같은 실제 CPU time에 vruntime이 천천히 증가한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">vruntime</td><td style="padding:9px;border:1px solid #29465d;">virtual runtime. 실제 실행 시간을 weight로 정규화한 공정성 좌표. 작을수록 상대적으로 service를 덜 받은 상태다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">min_vruntime</td><td style="padding:9px;border:1px solid #29465d;">run queue의 virtual timeline이 전진한 기준점. CFS 문서는 단조 증가하며 새/깨어난 entity 배치에 쓰인다고 설명한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">red-black tree</td><td style="padding:9px;border:1px solid #29465d;">삽입·삭제·검색을 O(log n)에 유지하는 balanced binary search tree. fair run queue의 ordered timeline을 구현한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">ideal service</td><td style="padding:9px;border:1px solid #29465d;">모든 runnable entity가 weight 비율대로 나눴다면 지금까지 받았어야 할 CPU service.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">lag</td><td style="padding:9px;border:1px solid #29465d;">ideal service−actual service의 공정성 빚 mental model. 양수면 CPU를 받을 빚이 남았고 음수면 share보다 앞서 받았다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">eligibility</td><td style="padding:9px;border:1px solid #29465d;">EEVDF가 next 후보로 인정하는 조건. Linux 문서는 lag≥0인 entity를 eligible로 설명한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">virtual deadline</td><td style="padding:9px;border:1px solid #29465d;">virtual timeline에서 이번 service request가 끝나야 할 순서 좌표. wall-clock deadline이나 SCHED_DEADLINE 보장이 아니다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">requested slice</td><td style="padding:9px;border:1px solid #29465d;">entity가 한 번에 받고자 하는 service 크기. 짧은 request는 VD를 앞당겨 latency에 유리할 수 있지만 switch 비용을 늘릴 수 있다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">deferred dequeue</td><td style="padding:9px;border:1px solid #29465d;">sleeping entity를 즉시 완전히 제거하지 않고 lag가 virtual time에 따라 decay하도록 표시하는 현재 EEVDF sleep 처리 방식.</td></tr>
+          </table>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 주행거리계에서 빚 장부+예약표로</h2>
+          <div style="padding:16px;background:#0f2035;border-left:4px solid #5eead4;border-radius:8px;">
+            <p style="margin:0 0 9px;"><strong style="color:#f8fafc;">CFS 주행거리계:</strong> 각 task의 실제 주행 시간을 weight로 보정해 vruntime 계기판에 더한다. 가장 작은 계기판, 즉 가장 덜 달린 task를 먼저 태운다.</p>
+            <p style="margin:0 0 9px;"><strong style="color:#f8fafc;">EEVDF 빚 장부:</strong> 먼저 “이 task가 공정 share보다 덜 받아 CPU를 받을 자격이 있는가?”를 lag로 거른다. 이미 앞서 받은 task는 짧은 slice를 요청해도 잠시 제외된다.</p>
+            <p style="margin:0;"><strong style="color:#f8fafc;">EEVDF 예약표:</strong> eligible task 중 이번 요청의 virtual deadline이 가장 이른 task를 고른다. 짧은 요청은 빨리 응답받되 eligibility가 장기 share 탈취를 막는 구조다.</p>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture·선택 흐름</h2>
+          <div style="overflow:auto;padding:16px;background:#06101d;border:1px solid #29465d;border-radius:10px;">
+            <pre style="margin:0;color:#c4f1f9;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;">normal thread wakeup / fork / current update
+                 │
+                 ▼
+        sched_entity in per-CPU cfs_rq
+        weight(nice) · vruntime · slice
+        lag/vlag · virtual deadline · group hierarchy
+                 │
+     running: delta_exec를 account
+        vruntime += delta_exec × NICE_0_LOAD / weight
+                 │
+                 ├──────── historical CFS mental model ────────┐
+                 │  vruntime-ordered rbtree                    │
+                 │  leftmost/min vruntime entity pick          │
+                 │                                             │
+                 └──────── current EEVDF mental model ─────────┤
+                    1) lag ≥ 0 entity만 eligible               │
+                    2) eligible 중 earliest virtual deadline   │
+                    3) earlier VD면 preemption 후보            │
+                                                               ▼
+                                                     context switch / run
+                                                               │
+                        block/sleep ─ deferred dequeue/lag decay
+                        migrate     ─ Day 11 per-CPU rq 정규화
+
+같은 기반: weight·vruntime·rbtree·cfs_rq·group scheduling
+달라진 핵심: 단순 “가장 뒤처진 vruntime” → eligibility + VD 선택</pre>
+          </div>
+          <p style="margin:10px 0 0;color:#a7c7da;font-size:14px;"><strong style="color:#fbbf24;">이름 함정:</strong> EEVDF 전환 뒤에도 userspace policy는 SCHED_OTHER이고 kernel 내부의 <code style="color:#fbbf24;">cfs_rq</code>·<code style="color:#fbbf24;">sched_entity</code> 같은 이름이 남는다. “CFS라는 모든 코드가 삭제됐다”는 뜻이 아니다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. 숫자로 잡는 공정성 좌표</h2>
+          <p style="margin:0 0 10px;"><strong style="color:#f8fafc;">Δvruntime ≈ Δexec × NICE_0_LOAD / weight</strong>. NICE_0_LOAD를 1024라고 단순화하자.</p>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:14px;">
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">A: weight 1024</td><td style="padding:9px;border:1px solid #29465d;">2ms 실행 → vruntime +2. A는 기준 속도로 virtual clock이 간다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">B: weight 512</td><td style="padding:9px;border:1px solid #29465d;">1ms 실행 → vruntime +2. 낮은 weight라 실제 CPU를 절반만 받아도 A와 virtual progress가 맞는다.</td></tr>
+          </table>
+          <p style="margin:10px 0 0;">따라서 둘이 계속 runnable이면 장기 actual service는 약 2:1을 향한다. vruntime의 목표는 실제 밀리초를 같게 만드는 것이 아니라 <strong style="color:#f8fafc;">weight-normalized service</strong>를 맞추는 것이다.</p>
+          <p style="margin:10px 0 0;">EEVDF snapshot에서 total service=10, weights A:B:C=2:2:1이면 ideal은 4:4:2다. actual이 5:2:3이면 lag는 A=-1, B=+2, C=-1이므로 우선 B만 eligible하다. 여러 entity가 eligible일 때 그중 VD가 가장 이른 요청이 next가 된다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. CS·kernel·hardware deep dive</h2>
+          <h3 style="margin:16px 0 8px;color:#f8fafc;font-size:17px;">5.1 CFS의 ideal multitasking CPU 근사</h3>
+          <p style="margin:0 0 9px;">이상적인 CPU가 n개 runnable task를 무한히 잘게 동시에 실행한다면 각 task는 weight 비율의 service를 받는다. 실제 CPU는 하나만 실행할 수 있으므로 CFS는 vruntime이 작은 entity를 골라 이상적 timeline과의 차이를 줄인다.</p>
+          <p style="margin:0;">ordered red-black tree의 왼쪽에는 뒤처진 entity가 있고 실행한 entity는 vruntime이 증가해 오른쪽으로 이동한다. 삽입·삭제 O(log n), cached leftmost로 next lookup을 효율화한다. granularity는 너무 잦은 preemption과 cache trashing을 막는다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.2 CFS는 고전적 fixed-quantum RR이 아니다</h3>
+          <p style="margin:0 0 9px;">CFS 문서는 nanosecond accounting과 vruntime distance를 중심으로 설명하며, 옛 scheduler의 고정 quantum array와 다르다. base slice/granularity는 batching↔latency를 조정하지만 timer tick마다 무조건 task를 교체하는 계약이 아니다.</p>
+          <p style="margin:0;">nice를 높이면 weight가 줄어 vruntime이 빨리 증가하므로 덜 실행된다. 그러나 share와 wakeup latency를 같은 weight 축만으로 조정하면 “같은 share를 유지하면서 더 짧은 응답 주기”를 표현하기 어렵다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.3 EEVDF는 fairness gate와 latency ordering을 분리한다</h3>
+          <p style="margin:0 0 9px;">lag≥0이라는 gate는 fair share를 덜 받은 entity만 후보로 만든다. 그 안에서 virtual deadline은 request size를 weight-normalized virtual distance로 반영한다. 짧은 slice는 VD가 가까워 first response를 앞당길 수 있다.</p>
+          <p style="margin:0;">하지만 짧은 slice task가 service를 앞서 받으면 lag가 음수가 되어 eligibility를 잃는다. 이 조합이 “짧은 요청 우선”과 “장기 share 보존”을 함께 노린다. 아래 실습의 VD 식은 이 원리를 보여주는 축약 model이며 kernel emulator가 아니다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.4 virtual deadline ≠ real-time deadline</h3>
+          <p style="margin:0 0 9px;">EEVDF의 VD는 fair class 내부 선택 순서 좌표다. “10ms 안에 완료” 같은 wall-clock guarantee, admission control, runtime/deadline/period contract는 SCHED_DEADLINE의 영역이다.</p>
+          <p style="margin:0;">CPU overload, higher scheduling class, IRQ, lock, affinity, cgroup throttling이 있으면 EEVDF task의 actual dispatch는 늦을 수 있다. API SLO는 application queue→completion histogram으로 별도 측정한다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.5 sleeper가 공정성 빚을 reset하는 문제</h3>
+          <p style="margin:0 0 9px;">sleeping task를 즉시 새 task처럼 취급하면 짧게 sleep/wakeup을 반복해 매번 유리한 위치를 얻는 공격이 가능하다. 반대로 과거 음수 lag를 영원히 유지하면 오래 잔 interactive task의 wakeup latency가 나빠진다.</p>
+          <p style="margin:0;">현재 kernel 문서는 sleeping task를 deferred dequeue 상태로 run queue에 남겨 virtual runtime에 따라 lag를 decay시키고, 오래 자면 결국 reset되도록 설명한다. 이 영역은 ongoing discussion이므로 운영 문서는 kernel version과 source를 함께 고정한다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.6 hierarchy와 multicore에서는 entity가 thread 하나가 아니다</h3>
+          <p style="margin:0 0 9px;">CONFIG_FAIR_GROUP_SCHED에서는 cgroup/task group도 scheduling entity가 되어 parent share를 먼저 받고 내부 child가 다시 나눈다. task nice만 봐서는 host 전체 share를 설명할 수 없다.</p>
+          <p style="margin:0;">Day 11처럼 CPU마다 cfs_rq가 있고 migration 때 virtual timeline을 보정한다. 서로 다른 CPU의 raw vruntime 숫자를 단순 비교하거나 /proc 값 하나를 global fairness score로 쓰지 않는다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.7 짧은 slice의 hardware 비용</h3>
+          <p style="margin:0 0 9px;">slice를 줄이면 latency-sensitive task가 빨리 돌아올 수 있지만 context switch, scheduler code, cache/TLB/predictor working-set 교대가 늘어난다. CPU가 같은 task를 재선택하면 switch가 없을 수도 있으므로 slice event와 switch를 동일시하지 않는다.</p>
+          <p style="margin:0;">최적값은 workload dependent다. first-response p99, completions/s, context-switches, cache miss, CPU migration, energy를 같이 sweep하고 tiny request를 무제한 허용하지 않는다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. 실무 best practice</h2>
+          <ol style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">kernel과 scheduler evidence를 먼저 고정한다.</strong> uname, distro config, policy, nice/cgroup, affinity/quota를 기록하고 “Linux면 CFS”라고 뭉뚱그리지 않는다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">share와 latency SLO를 분리한다.</strong> CPU service ratio·runqueue wait와 first-response/completion p99를 각각 정의한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">nice는 entitlement, slice는 cadence hint로 본다.</strong> 짧은 slice로 CPU share를 얻으려 하지 않고 cgroup weight·quota와 함께 설계한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">custom slice는 feature-detect한다.</strong> kernel/man-pages가 지원하는 ABI와 privilege·range를 확인하고 실패 시 default로 fallback한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">sleep/wakeup workload로 regression test한다.</strong> CPU-bound만 돌리지 말고 interactive burst, many sleepers, fork storm, cgroup throttle을 replay한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">내부 /proc field에 alert contract를 걸지 않는다.</strong> field 존재·단위·semantics를 version별 검증하고 stable application metric과 schedstat delta를 중심으로 본다.</li>
+            <li><strong style="color:#f8fafc;">scheduler tuning 전에 overload를 막는다.</strong> EEVDF도 capacity를 만들지 않는다. bounded queue, backpressure, admission, quota를 먼저 둔다.</li>
+          </ol>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. error handling과 운영 실패 대응</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:14px;">
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;width:31%;">field/API 없음</td><td style="padding:9px;border:1px solid #29465d;">older kernel·config·vendor backport를 의심한다. version string만 믿지 말고 feature probe 후 default behavior로 fallback한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">EINVAL/E2BIG</td><td style="padding:9px;border:1px solid #29465d;">sched_attr size, flags, policy별 field/range를 확인한다. kernel이 알려준 struct size로 호환 처리하고 무작정 retry하지 않는다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">EPERM</td><td style="padding:9px;border:1px solid #29465d;">권한이 필요한 policy/attribute인지 확인한다. latency tuning을 이유로 capability를 넓히지 않고 normal default로 복구한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">tiny-slice 폭주</td><td style="padding:9px;border:1px solid #29465d;">switch/cache miss/CPU overhead와 goodput을 보고 request를 clamp하거나 default slice로 rollback한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">fair한데 p99 나쁨</td><td style="padding:9px;border:1px solid #29465d;">CPU share 외에 cgroup throttling, higher class, IRQ, lock/I/O, affinity imbalance, application queue를 분해한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">/proc task race</td><td style="padding:9px;border:1px solid #29465d;">snapshot 사이 TID가 종료될 수 있다. PID/TID start time을 확인하고 ENOENT sample을 폐기한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">sleep gaming 의심</td><td style="padding:9px;border:1px solid #29465d;">wakeup rate, service/entitlement, lag 관련 trace, throughput을 비교한다. internal field 하나로 악용을 확정하지 않는다.</td></tr>
+          </table>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. 놓치기 쉬운 함정</h2>
+          <ul style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:7px;">EEVDF virtual deadline을 SCHED_DEADLINE의 wall-clock deadline과 혼동하지 않는다.</li>
+            <li style="margin-bottom:7px;">CFS를 fixed-quantum round robin이라고 설명하지 않는다.</li>
+            <li style="margin-bottom:7px;">vruntime이 실제 CPU nanoseconds와 같다고 보지 않는다. weight-normalized coordinate다.</li>
+            <li style="margin-bottom:7px;">가장 작은 raw vruntime을 CPU 전체에서 직접 비교하지 않는다. per-rq 기준과 migration 보정이 있다.</li>
+            <li style="margin-bottom:7px;">짧은 slice가 long-term CPU share까지 늘린다고 생각하지 않는다. eligibility가 과다 service를 제한한다.</li>
+            <li style="margin-bottom:7px;">kernel 6.6 이상이라는 version만으로 vendor kernel의 정확한 EEVDF behavior를 단정하지 않는다.</li>
+            <li style="margin-bottom:7px;">cfs_rq라는 이름이 남았다는 이유로 pick policy가 옛 CFS 그대로라고 결론 내리지 않는다.</li>
+            <li>평균 CPU share가 공정하다는 사실로 짧은 window starvation·p99 latency까지 증명하지 않는다.</li>
+          </ul>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. 30분 실습: CFS-like와 EEVDF-like 선택 비교</h2>
+          <p style="margin:0 0 10px;color:#a7c7da;">표준 Python으로 축약 simulator를 실행한다. A/B는 같은 weight지만 B만 짧은 request를 갖고 C는 절반 weight다. 실제 kernel emulator가 아니라 vruntime→eligibility+VD 차이를 분리하는 사고 실험이다.</p>
+          <pre style="margin:0;padding:14px;background:#06101d;border:1px solid #29465d;border-radius:10px;color:#d1fae5;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;">LAB_DIR=$(mktemp -d)
+python3 - "$LAB_DIR" &lt;&lt;'PY'
+from dataclasses import dataclass
+import copy, sys
+from typing import Optional
+
+@dataclass
+class Task:
+    name: str
+    weight: int
+    request: int
+    service: int = 0
+    vruntime: float = 0.0
+    first: Optional[int] = None
+
+base = [Task("A", 1024, 4),
+        Task("B", 1024, 1),
+        Task("C", 512, 2)]
+
+def run(mode, ticks=25):
+    tasks = copy.deepcopy(base)
+    timeline, rows = [], []
+    total_weight = sum(t.weight for t in tasks)
+    for now in range(ticks):
+        total_service = sum(t.service for t in tasks)
+        lag = {t.name: total_service * t.weight / total_weight - t.service
+               for t in tasks}
+        if mode == "CFS-like":
+            candidates = tasks
+            chosen = min(candidates, key=lambda t: (t.vruntime, t.name))
+            vd = None
+        else:
+            candidates = [t for t in tasks if lag[t.name] &gt;= -1e-9]
+            chosen = min(candidates,
+                         key=lambda t: (t.vruntime +
+                                        t.request * 1024 / t.weight,
+                                        t.name))
+            vd = chosen.vruntime + chosen.request * 1024 / chosen.weight
+        if chosen.first is None:
+            chosen.first = now
+        rows.append((now, chosen.name, lag[chosen.name], vd))
+        timeline.append(chosen.name)
+        chosen.service += 1
+        chosen.vruntime += 1024 / chosen.weight
+    return tasks, timeline, rows
+
+lines = []
+for mode in ("CFS-like", "EEVDF-like"):
+    tasks, timeline, rows = run(mode)
+    lines.append(f"{mode} timeline={' '.join(timeline)}")
+    for t in tasks:
+        lines.append(f"  {t.name}: weight={t.weight} request={t.request} "
+                     f"service={t.service} vruntime={t.vruntime:.1f} "
+                     f"first={t.first}")
+    lines.append("  first 8 decisions: " + ", ".join(
+        f"t={now}:{name}(lag={lag:+.2f}" +
+        (f",vd={vd:.2f})" if vd is not None else ")")
+        for now, name, lag, vd in rows[:8]))
+with open(sys.argv[1] + "/result.txt", "w") as f:
+    f.write("\n".join(lines) + "\n")
+PY
+
+sed -n '1,20p' "$LAB_DIR/result.txt"
+uname -r
+ps -o pid,cls,rtprio,pri,ni,psr,stat,cmd -p $$ || true
+test -r /proc/self/schedstat &amp;&amp;
+  printf 'schedstat=' &amp;&amp; sed -n '1p' /proc/self/schedstat
+test -r /proc/self/sched &amp;&amp;
+  sed -n '/se.vruntime\|se.vlag\|se.slice/p' /proc/self/sched | head -n 8 || true</pre>
+          <p style="margin:10px 0 0;"><strong style="color:#f8fafc;">관찰:</strong> CFS-like는 동일 vruntime tie에서 A를 먼저 고르지만 EEVDF-like는 같은 weight의 B가 짧은 request라 t=0에 선택된다. B가 앞서 service를 받으면 lag가 음수가 되어 연속 독점하지 못하고, 25 tick 뒤 service는 weight 2:2:1 비율에 근접한다.</p>
+          <p style="margin:8px 0 0;color:#a7c7da;font-size:14px;">확장: B request를 1→4→8로 바꿔 first-run 순서를 비교하고, tick마다 switch cost 0.05를 더해 latency 개선과 goodput 손실을 함께 계산한다. /proc/self/sched field는 없을 수 있으며 이름·단위는 안정 ABI로 간주하지 않는다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. production 실패 시나리오</h2>
+          <div style="padding:15px;background:#241528;border:1px solid #7f1d4d;border-radius:9px;">
+            <p style="margin:0 0 8px;"><strong style="color:#f9a8d4;">상황:</strong> latency service가 가능한 최소 slice를 모든 worker에 적용한다. 첫 응답 p50은 좋아졌지만 context switches와 LLC miss가 4배, throughput은 22% 감소하고 p99 completion은 악화된다.</p>
+            <p style="margin:0 0 8px;"><strong style="color:#f9a8d4;">오진:</strong> “EEVDF는 earliest deadline이므로 slice가 작을수록 무조건 좋다”고 결론 내리고 virtual deadline을 SLO deadline으로 해석했다.</p>
+            <p style="margin:0 0 8px;"><strong style="color:#f9a8d4;">증거:</strong> request class별 first/completion histogram, service share, schedstat wait/slices, context-switches, cache miss, cgroup throttling과 CPU goodput을 같은 canary에서 비교한다.</p>
+            <p style="margin:0;"><strong style="color:#f9a8d4;">대응:</strong> default slice로 rollback한 뒤 latency-critical thread만 bounded range에서 sweep한다. admission·batching·dependency bottleneck을 먼저 고치고 kernel upgrade마다 workload replay를 수행한다.</p>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. 대기업 면접 질문 3개</h2>
+          <p style="margin:0 0 10px;"><strong style="color:#f8fafc;">Q1. CFS가 fair CPU share를 만드는 원리를 설명하세요.</strong><br>답변 포인트: ideal multitasking CPU를 근사하며 actual runtime을 nice weight로 정규화한 vruntime을 증가시킨다. vruntime-ordered rbtree에서 뒤처진 entity를 골라 weight 비율 service를 맞추고 min_vruntime·granularity·group hierarchy를 언급한다.</p>
+          <p style="margin:0 0 10px;"><strong style="color:#f8fafc;">Q2. EEVDF가 CFS mental model에 추가한 두 단계는?</strong><br>답변 포인트: ideal−actual service lag가 0 이상인 entity만 eligible하게 하고, 그 안에서 earliest virtual deadline을 선택한다. 짧은 request가 latency를 앞당기되 음수 lag가 장기 share 탈취를 막는다.</p>
+          <p style="margin:0;"><strong style="color:#f8fafc;">Q3. virtual deadline이 있는데 왜 real-time guarantee가 아닙니까?</strong><br>답변 포인트: fair-class virtual order일 뿐 wall deadline/admission contract가 아니다. higher class, IRQ/lock, affinity, overload, cgroup throttle이 actual dispatch를 늦춘다. SCHED_DEADLINE의 runtime/deadline/period와 구분하고 application SLO를 직접 측정한다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 퀴즈·누적 리뷰</h2>
+          <ol style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:6px;">weight 1024 task가 4ms, weight 512 task가 2ms 실행되면 각각 Δvruntime은?</li>
+            <li style="margin-bottom:6px;">ideal service 5, actual 3인 task의 lag 부호와 의미는?</li>
+            <li style="margin-bottom:6px;">lag가 음수지만 VD가 가장 이른 task를 EEVDF가 즉시 고르지 않는 이유는?</li>
+            <li style="margin-bottom:6px;">짧은 requested slice가 latency와 hardware efficiency에 주는 반대 효과는?</li>
+            <li style="margin-bottom:6px;">EEVDF 전환 뒤에도 cfs_rq 이름과 SCHED_OTHER API가 남을 수 있는 이유는?</li>
+            <li style="margin-bottom:6px;">Day 10 복습: EEVDF preemption 후보와 실제 context switch 사이에는 무엇이 있는가?</li>
+            <li>Day 11 복습: 서로 다른 CPU의 raw vruntime을 단순 비교하면 안 되는 이유는?</li>
+          </ol>
+          <p style="margin:11px 0 0;color:#a7c7da;font-size:14px;">정답 포인트: 1번은 둘 다 +4, 2번은 +2로 service를 더 받을 빚이 있다. 나머지는 weight fairness→eligibility→VD→actual kernel 제약 순서로 설명한다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 다음 날 연결</h2>
+          <p style="margin:0;">Day 13에서는 CPU-bound와 I/O-bound task를 실제로 경쟁시키고 nice를 바꿔 schedstat CPU/runqueue wait, wakeup behavior와 service share를 관찰한다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 공식·1차 출처</h2>
+          <ul style="margin:0;padding-left:22px;color:#a7c7da;">
+            <li><a href="https://docs.kernel.org/scheduler/sched-design-CFS.html" style="color:#67e8f9;">Linux kernel docs — CFS Scheduler</a>: ideal CPU, vruntime, min_vruntime, rbtree와 granularity</li>
+            <li><a href="https://docs.kernel.org/scheduler/sched-eevdf.html" style="color:#67e8f9;">Linux kernel docs — EEVDF Scheduler</a>: 6.6 전환, lag, eligibility, VD, slice와 deferred dequeue</li>
+            <li><a href="https://citeseerx.ist.psu.edu/document?repid=rep1&amp;type=pdf&amp;doi=805acf7726282721504c8f00575d91ebfd750564" style="color:#67e8f9;">Stoica &amp; Abdel-Wahab (1995) — Earliest Eligible Virtual Deadline First</a>: EEVDF 원 논문</li>
+            <li><a href="https://man7.org/linux/man-pages/man7/sched.7.html" style="color:#67e8f9;">Linux man-pages — sched(7)</a>: normal/RT/deadline scheduling policy와 nice/group scheduling</li>
+            <li><a href="https://man7.org/linux/man-pages/man2/sched_getattr.2.html" style="color:#67e8f9;">Linux man-pages — sched_setattr(2)/sched_getattr(2)</a>: extensible sched_attr ABI, 오류와 feature 호환</li>
+            <li><a href="https://docs.kernel.org/scheduler/sched-stats.html" style="color:#67e8f9;">Linux kernel docs — Scheduler Statistics</a>: CPU time, runqueue wait, timeslice counter</li>
+            <li><a href="https://github.com/torvalds/linux/blob/master/kernel/sched/fair.c" style="color:#67e8f9;">Linux kernel source — kernel/sched/fair.c</a>: EEVDF selection, entity eligibility와 fair-class runtime accounting</li>
+            <li><a href="https://github.com/torvalds/linux/blob/master/include/linux/sched.h" style="color:#67e8f9;">Linux kernel source — include/linux/sched.h</a>: sched_entity의 deadline, vruntime, vlag와 slice fields</li>
+          </ul>
+        </td></tr>
+        <tr><td style="padding:18px 28px;background:#081522;border-top:1px solid #1e3a4c;color:#7fa4ba;font-size:12px;">Operating System 심화 커리큘럼 · 초보 용어에서 kernel/hardware와 production diagnosis까지</td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>
