@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operating System 심화 커리큘럼 Day 13 - 실패 실습: CPU-bound/IO-bound 경쟁과 nice 관찰</title>
+</head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.68;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#07111f;">
+    <tr><td align="center" style="padding:20px 10px 44px;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#0b1728;border:1px solid #1e3a4c;border-radius:18px;overflow:hidden;">
+        <tr><td style="padding:30px 28px;background:#102438;border-bottom:1px solid #1e3a4c;">
+          <div style="font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:#5eead4;font-weight:800;">Operating System · Day 13 / 63 · Failure Lab</div>
+          <h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">CPU-bound/IO-bound 경쟁과 nice 관찰</h1>
+          <p style="margin:0;color:#a5f3fc;font-size:16px;">한 줄 요약 — <strong style="color:#f8fafc;">nice는 runnable한 normal task 사이의 상대 CPU weight</strong>를 바꾼다. I/O-bound task는 자주 sleep해 경쟁 집합에서 빠지므로 CPU-bound task와 똑같은 비율로 CPU를 나누지 않으며, 성능 판단은 CPU time 하나가 아니라 run-queue wait·wakeup latency·PSI·처리량을 함께 봐야 한다.</p>
+        </td></tr>
+        <tr><td style="padding:26px 28px;">
+          <h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:14px;">
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;width:30%;">CPU-bound</td><td style="padding:9px;border:1px solid #29465d;">대부분의 시간을 계산하며 runnable 또는 running 상태로 보내는 workload. CPU capacity가 처리량의 주 병목이다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">I/O-bound</td><td style="padding:9px;border:1px solid #29465d;">짧게 계산한 뒤 disk/network/timer 같은 event를 기다리며 자주 sleep하는 workload. 이름은 “I/O만 쓴다”가 아니라 CPU burst보다 wait 비중이 크다는 뜻이다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">runnable</td><td style="padding:9px;border:1px solid #29465d;">실행할 준비는 됐지만 CPU를 사용 중이거나 run queue에서 차례를 기다리는 상태. blocked/sleeping과 다르다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">CPU burst</td><td style="padding:9px;border:1px solid #29465d;">task가 block하기 전 연속으로 계산하는 구간. interactive workload는 보통 짧은 burst와 sleep을 반복한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">nice</td><td style="padding:9px;border:1px solid #29465d;">SCHED_OTHER/BATCH의 상대 CPU share에 영향을 주는 값. Linux 범위는 -20(더 높은 weight)부터 19(더 낮은 weight), 기본은 0이다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">weight</td><td style="padding:9px;border:1px solid #29465d;">nice가 내부적으로 변환되는 상대 지분. nice 1단계 차이는 현재 Linux 설계에서 약 1.25배 비율을 만든다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">CPU time</td><td style="padding:9px;border:1px solid #29465d;">task가 실제 CPU에서 실행한 누적 시간. wall-clock 경과 시간과 다르고 sleep 시간은 포함하지 않는다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">run-queue wait</td><td style="padding:9px;border:1px solid #29465d;">runnable이 된 뒤 CPU를 얻기까지 기다린 시간. <code style="color:#fbbf24;">/proc/PID/schedstat</code> 두 번째 필드로 누적값을 관찰할 수 있다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">wakeup latency</td><td style="padding:9px;border:1px solid #29465d;">event가 완료되어 task가 runnable이 된 시점부터 실제 running까지의 지연. request latency의 일부다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">PSI</td><td style="padding:9px;border:1px solid #29465d;">Pressure Stall Information. CPU·memory·I/O 자원 부족 때문에 task들이 진전을 못 한 시간 비율을 <code style="color:#fbbf24;">/proc/pressure/*</code>로 제공한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">autogroup</td><td style="padding:9px;border:1px solid #29465d;">interactive session을 task group으로 묶어 CPU share를 먼저 group 사이에 배분하는 Linux 기능. 서로 다른 session의 nice 효과를 예상과 다르게 만들 수 있다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">cgroup weight/quota</td><td style="padding:9px;border:1px solid #29465d;">service/container 단위 상대 CPU 지분과 절대 사용 상한. process nice보다 상위 계층의 계약이므로 둘을 함께 확인해야 한다.</td></tr>
+          </table>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 계산대 앞의 손님과 호출 벨</h2>
+          <div style="padding:16px;background:#0f2035;border-left:4px solid #5eead4;border-radius:8px;">
+            <p style="margin:0 0 9px;"><strong style="color:#f8fafc;">CPU-bound 손님</strong>은 계산대에서 긴 장바구니를 계속 처리한다. 늘 줄에 있으므로 다른 runnable task와 weight 비율로 계산대 시간을 경쟁한다.</p>
+            <p style="margin:0 0 9px;"><strong style="color:#f8fafc;">I/O-bound 손님</strong>은 물건 하나를 계산하고 창고 응답을 기다리러 줄에서 빠진다. 응답이 오면 호출 벨을 누르고 다시 줄에 들어온다. sleep 중에는 CPU 지분을 소비하지 않는다.</p>
+            <p style="margin:0;"><strong style="color:#f8fafc;">nice</strong>는 계산대를 독점하는 우선권이 아니라 줄에 함께 서 있는 동안의 상대 쿠폰 weight다. 줄에 혼자 있으면 nice 19도 CPU를 거의 전부 쓰며, 줄 밖에서 I/O를 기다리는 시간은 nice가 줄여주지 않는다.</p>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture·상태 전이와 측정 지점</h2>
+          <div style="overflow:auto;padding:16px;background:#06101d;border:1px solid #29465d;border-radius:10px;">
+            <pre style="margin:0;color:#c4f1f9;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;">CPU-bound worker                     I/O-bound worker
+compute loop                         short compute
+    │                                   │
+    ▼                                   ▼
+RUNNING ──preempt──► RUNNABLE         read/sleep/timer
+   ▲                    │                │
+   └──── scheduler ◄────┘                ▼
+       fair run queue                BLOCKED/SLEEPING
+       sched_entity                      │ event/timeout/IRQ
+       nice → weight                     ▼
+       vruntime / EEVDF             wakeup → RUNNABLE
+               │                          │
+               └──────── pick next ───────┘
+                            │
+                            ▼
+                         RUNNING
+
+관찰 지점
+  actual CPU service     /proc/PID/stat, pidstat, time
+  runnable wait/slices   /proc/PID/schedstat
+  state/context switch   ps, /proc/PID/status, perf stat
+  system CPU pressure    /proc/pressure/cpu
+  group constraints      /proc/PID/cgroup, cpu.weight, cpu.max
+  app outcome            operations/s, wakeup jitter, p50/p99</pre>
+          </div>
+          <p style="margin:10px 0 0;color:#a7c7da;font-size:14px;">핵심 흐름은 <strong style="color:#f8fafc;">event 완료 → wakeup → runnable enqueue → eligibility/선택 → running</strong>이다. I/O 완료 시각과 application 재개 시각 사이가 scheduler wakeup latency이며, disk latency와 혼합해서는 안 된다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. CS·kernel·hardware deep dive</h2>
+          <h3 style="margin:16px 0 8px;color:#f8fafc;font-size:17px;">4.1 nice는 “우선순위 번호”보다 weight ratio다</h3>
+          <p style="margin:0 0 9px;">normal scheduling에서 static <code style="color:#fbbf24;">sched_priority</code>는 0이고, nice가 fair-class 내부 weight를 바꾼다. 대략 nice 0의 weight 1024와 nice 5의 weight 335가 계속 같은 CPU에서 runnable이면 예상 장기 share는 1024:(1024+335)≈75%, 335:(1024+335)≈25%다.</p>
+          <p style="margin:0;">이는 최소 CPU 보장도, 최대 상한도 아니다. 경쟁자가 sleep하면 남은 task가 idle CPU를 사용한다. 절대 상한은 cgroup CPU quota 같은 별도 제어가 필요하다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">4.2 sleep은 공정성 경쟁 집합을 바꾼다</h3>
+          <p style="margin:0 0 9px;">CPU-bound task는 거의 계속 runnable이지만 I/O-bound task는 event wait 동안 run queue에 없다. 따라서 전체 wall time에서 CPU share를 비교하면 “nice가 안 먹는다”는 잘못된 결론이 나오기 쉽다. 비교 분모는 두 task가 동시에 runnable했던 구간이어야 한다.</p>
+          <p style="margin:0;">깨어난 task가 빨리 실행되는 것은 무조건적인 I/O 우대 보너스라기보다 fair accounting과 EEVDF eligibility·virtual deadline, wakeup preemption, 현재 CPU/runqueue 상태가 결합된 결과다. 커널 버전과 group hierarchy에 따라 세부 동작은 달라진다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">4.3 nice 5 차이는 선형 5점이 아니다</h3>
+          <p style="margin:0 0 9px;">Linux nice 설계는 인접 단계마다 약 1.25배의 상대 weight 차이를 사용한다. 따라서 nice 0 대 nice 5는 1.25⁵≈3.05배 차이다. nice 값을 더해 percentage라고 읽으면 안 된다.</p>
+          <p style="margin:0;">Day 12 식처럼 <strong style="color:#f8fafc;">Δvruntime≈Δexec×NICE_0_LOAD/weight</strong>이므로 낮은 weight task는 같은 실제 실행 시간에 virtual time이 더 빨리 증가해 다음 service까지 더 오래 기다린다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">4.4 Linux에서는 nice가 thread별일 수 있다</h3>
+          <p style="margin:0 0 9px;">POSIX는 nice를 process 속성으로 보지만 Linux/NPTL 구현은 thread별 속성이다. <code style="color:#fbbf24;">renice -p PID</code>가 다중 thread application 전체를 의도대로 바꿨다고 가정하지 말고 <code style="color:#fbbf24;">ps -L</code> 또는 <code style="color:#fbbf24;">/proc/PID/task</code>에서 TID별 값을 확인한다.</p>
+          <p style="margin:0;">child는 fork 때 nice를 상속하고 exec 뒤에도 보존한다. worker launcher의 nice가 새 binary에 조용히 이어질 수 있으므로 배포 환경의 policy를 기록한다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">4.5 autogroup·cgroup이 계층을 만든다</h3>
+          <p style="margin:0 0 9px;">autogroup이 활성화되면 CPU share가 session group 사이에서 먼저 나뉘고 각 group 안에서 nice가 작동한다. 서로 다른 terminal에서 띄운 두 process를 비교하면 같은 group에서 실험한 결과와 다를 수 있다.</p>
+          <p style="margin:0;">container 환경에서는 cgroup <code style="color:#fbbf24;">cpu.weight</code>가 group 지분을, <code style="color:#fbbf24;">cpu.max</code>가 quota를 제한한다. 낮은 nice process가 높은 group weight 안에 있으면 host 전체 결과는 process nice만으로 설명되지 않는다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">4.6 PSI는 “CPU 사용률”이 아니라 stall pressure다</h3>
+          <p style="margin:0 0 9px;"><code style="color:#fbbf24;">/proc/pressure/cpu</code>의 <code style="color:#fbbf24;">some</code>은 적어도 한 task가 CPU를 기다려 실행하지 못한 시간 비율이다. CPU PSI에는 <code style="color:#fbbf24;">full</code>이 의미 있는 자원 고갈 신호로 제공되지 않는다. idle 0%와 PSI 증가는 saturation을 더 직접적으로 보여준다.</p>
+          <p style="margin:0;">PSI는 system/cgroup 집계라 특정 PID의 원인을 단독 증명하지 않는다. schedstat wait 증가와 application latency, cgroup 범위를 함께 대조해야 한다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">4.7 짧은 wakeup의 hardware trade-off</h3>
+          <p style="margin:0 0 9px;">I/O-bound task가 자주 깨어나 CPU-bound task를 preempt하면 응답성은 좋아질 수 있지만 context switch와 cache working-set 교대가 늘어난다. migration까지 발생하면 private cache와 NUMA locality 비용이 추가된다.</p>
+          <p style="margin:0;">따라서 “interactive가 즉시 실행됐다”만 최적화하지 않는다. wakeup p99, throughput, voluntary/involuntary switches, migrations, cache miss와 energy를 같이 본다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. 실무 best practice</h2>
+          <ol style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">가설을 상태로 쓴다.</strong> “느리다”가 아니라 CPU saturation→runnable wait 증가→wakeup p99 악화처럼 반증 가능한 흐름을 세운다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">baseline을 먼저 저장한다.</strong> kernel, CPU 수·topology, governor, affinity, autogroup, cgroup, policy/nice, workload seed를 기록한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">한 CPU에서 원리를 분리한다.</strong> 첫 실험은 동일 CPU affinity로 migration/load-balancing 변수를 제거하고, 이후 다중 CPU에서 재검증한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">CPU service와 app SLO를 함께 측정한다.</strong> utime+stime 비율만 보지 말고 operations/s와 wakeup/request p50·p99를 남긴다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">nice는 background degradation에 제한적으로 쓴다.</strong> capacity isolation이 필요하면 cgroup weight/quota와 admission control을 사용한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">권한을 올리지 않는다.</strong> 낮은 nice 값으로 priority를 높이려 CAP_SYS_NICE를 넓히지 말고, 실습은 기본 0과 양수 nice만 사용한다.</li>
+            <li><strong style="color:#f8fafc;">변경에는 rollback 기준을 둔다.</strong> p99, goodput, PSI, switch rate 중 하나라도 예산을 넘으면 기존 nice/cgroup 설정으로 즉시 복구한다.</li>
+          </ol>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. error handling</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:14px;">
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;width:31%;">renice: Permission denied</td><td style="padding:9px;border:1px solid #29465d;">nice 수치를 낮춰 priority를 높이려 했는지 확인한다. CAP_SYS_NICE를 추가하지 말고 원래 값 또는 더 큰 nice로 실험한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">No such process</td><td style="padding:9px;border:1px solid #29465d;">짧은 worker가 종료됐거나 PID가 재사용됐을 수 있다. start time을 확인하고 해당 sample을 폐기한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">taskset 실패</td><td style="padding:9px;border:1px solid #29465d;">허용 cpuset과 online CPU를 확인한다. container가 CPU 0을 허용하지 않을 수 있으므로 첫 allowed CPU를 선택한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">/proc·PSI 없음</td><td style="padding:9px;border:1px solid #29465d;">Linux가 아니거나 kernel config/container mount 제한이다. 기능 probe 후 해당 관찰만 건너뛰고 결과에 명시한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">결과 차이가 작음</td><td style="padding:9px;border:1px solid #29465d;">두 task가 실제로 같은 CPU에서 동시에 runnable인지, host noise·quota·autogroup이 개입했는지 확인한다. 측정 시간을 늘리고 반복 분포를 본다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">cleanup 실패</td><td style="padding:9px;border:1px solid #29465d;">trap에서 기록한 자식 PID만 TERM→짧은 wait→KILL 순서로 종료한다. 이름 기반 광역 pkill은 사용하지 않는다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">getpriority()=-1</td><td style="padding:9px;border:1px solid #29465d;">-1은 정상 nice 값일 수도 있다. 호출 전 errno=0으로 지우고 반환 뒤 errno를 확인해야 오류와 구분된다.</td></tr>
+          </table>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. 놓치기 쉬운 함정</h2>
+          <ul style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:7px;">nice -20이 “낮은 우선순위”가 아니다. 숫자가 낮을수록 weight가 높다.</li>
+            <li style="margin-bottom:7px;">nice 10이 CPU 10%를 뜻하지 않는다. share는 경쟁자의 weight 합에 따라 달라진다.</li>
+            <li style="margin-bottom:7px;">I/O-bound task의 낮은 CPU%를 scheduler 차별로 해석하지 않는다. sleep 시간이 클 수 있다.</li>
+            <li style="margin-bottom:7px;">CPU usage 100%만으로 saturation을 단정하지 않는다. runnable queue와 PSI, latency를 본다.</li>
+            <li style="margin-bottom:7px;">서로 다른 terminal/session의 process를 autogroup 확인 없이 비교하지 않는다.</li>
+            <li style="margin-bottom:7px;">renice 한 PID가 모든 thread와 child를 항상 바꾼다고 가정하지 않는다.</li>
+            <li style="margin-bottom:7px;">nice로 RT/DEADLINE task를 제어하려 하지 않는다. scheduling class가 우선한다.</li>
+            <li>짧은 benchmark 한 번의 평균으로 결론 내리지 않는다. warmup·반복·p95 분포와 host noise를 기록한다.</li>
+          </ul>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. 30분 실패 실습: 같은 CPU에서 경쟁시키기</h2>
+          <p style="margin:0 0 10px;color:#a7c7da;"><strong style="color:#f8fafc;">Linux 전용, 일반 사용자 안전 범위</strong>다. root·RT policy·음수 nice를 사용하지 않는다. 임시 디렉터리와 자신이 생성한 PID만 정리하며 20초 후 자동 종료한다.</p>
+          <pre style="margin:0;padding:14px;background:#06101d;border:1px solid #29465d;border-radius:10px;color:#d1fae5;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;">LAB_DIR=$(mktemp -d)
+PIDS=""
+cleanup() {
+  for p in $PIDS; do kill "$p" 2&gt;/dev/null || true; done
+  for p in $PIDS; do wait "$p" 2&gt;/dev/null || true; done
+  case "$LAB_DIR" in /tmp/*) rm -rf -- "$LAB_DIR";; esac
+}
+trap cleanup EXIT INT TERM
+
+test "$(uname -s)" = Linux || { echo "Linux 전용 실습"; exit 0; }
+CPU=$(awk '/Cpus_allowed_list/ {split($2,a,","); split(a[1],b,"-"); print b[1]}' /proc/self/status)
+command -v taskset &gt;/dev/null || { echo "util-linux taskset 필요"; exit 0; }
+
+cat &gt;"$LAB_DIR/worker.py" &lt;&lt;'PY'
+import os, sys, time
+mode, path = sys.argv[1:]
+end = time.monotonic() + 16
+ops, wake = 0, []
+while time.monotonic() &lt; end:
+    if mode == "cpu":
+        for i in range(20000): ops += (i * i) &amp; 7
+    else:
+        before = time.monotonic()
+        time.sleep(0.010)
+        wake.append(time.monotonic() - before - 0.010)
+        for i in range(1200): ops += (i * i) &amp; 7
+with open(path, "w") as f:
+    f.write(f"mode={mode} ops={ops} wake_p99_ms=" +
+            (f"{sorted(wake)[int(.99*(len(wake)-1))]*1000:.3f}" if wake else "NA") + "\n")
+PY
+
+# CPU worker A: nice 0, CPU worker B: nice 10, I/O worker: nice 0
+taskset -c "$CPU" nice -n 0  python3 "$LAB_DIR/worker.py" cpu "$LAB_DIR/a.txt" &amp; A=$!; PIDS="$PIDS $A"
+taskset -c "$CPU" nice -n 10 python3 "$LAB_DIR/worker.py" cpu "$LAB_DIR/b.txt" &amp; B=$!; PIDS="$PIDS $B"
+taskset -c "$CPU" nice -n 0  python3 "$LAB_DIR/worker.py" io  "$LAB_DIR/io.txt" &amp; I=$!; PIDS="$PIDS $I"
+
+printf 'pid policy nice cpu state command\n'
+ps -o pid,cls,ni,psr,stat,comm -p "$A,$B,$I"
+for p in "$A" "$B" "$I"; do
+  printf 'pid=%s schedstat_before=' "$p"
+  sed -n '1p' "/proc/$p/schedstat" || true
+done
+test -r /proc/pressure/cpu &amp;&amp; { echo 'PSI before'; sed -n '1,2p' /proc/pressure/cpu; }
+
+wait "$A"; wait "$B"; wait "$I"; PIDS=""
+cat "$LAB_DIR/a.txt" "$LAB_DIR/b.txt" "$LAB_DIR/io.txt"
+test -r /proc/pressure/cpu &amp;&amp; { echo 'PSI after'; sed -n '1,2p' /proc/pressure/cpu; }</pre>
+          <p style="margin:10px 0 0;"><strong style="color:#f8fafc;">예상:</strong> A와 B는 같은 CPU에서 계속 runnable이므로 nice 0인 A가 nice 10인 B보다 훨씬 많은 CPU service를 받는다. I/O worker는 대부분 sleep하므로 총 CPU time은 작지만 wakeup p99가 경쟁 강도에 따라 늘 수 있다.</p>
+          <p style="margin:8px 0 0;color:#a7c7da;font-size:14px;"><strong style="color:#f8fafc;">확장:</strong> B를 nice 0으로 바꾼 baseline, CPU worker를 하나 제거한 control을 각각 5회 실행한다. 결과 중앙값과 p95를 비교하고 <code style="color:#fbbf24;">schedstat</code>의 runtime/wait/slices delta를 시작·종료 전에 별도 collector로 저장한다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. 실패 시나리오와 진단</h2>
+          <div style="padding:15px;background:#241528;border:1px solid #7f1d4d;border-radius:9px;">
+            <p style="margin:0 0 8px;"><strong style="color:#f9a8d4;">상황:</strong> batch 압축 job과 API worker가 같은 container에 있다. 운영자가 batch만 nice 10으로 낮췄지만 API p99는 계속 악화되고 container CPU throttling이 증가한다.</p>
+            <p style="margin:0 0 8px;"><strong style="color:#f9a8d4;">오진:</strong> “nice 10이면 batch가 CPU 10%만 쓴다”고 믿었다. 실제로 API가 I/O wait에 들어간 동안 batch는 idle CPU를 소비했고, 두 workload는 동일 cgroup quota 상한을 공유했다.</p>
+            <p style="margin:0 0 8px;"><strong style="color:#f9a8d4;">증거:</strong> cgroup <code style="color:#f9a8d4;">cpu.stat</code>의 throttled_usec, CPU PSI, TID별 nice/policy, schedstat wait, API queue·dependency latency를 같은 timeline에 맞춘다.</p>
+            <p style="margin:0;"><strong style="color:#f9a8d4;">대응:</strong> API와 batch를 별도 cgroup으로 분리해 weight와 quota를 SLO에 맞추고 batch concurrency를 제한한다. nice는 group 내부 background hint로 유지하고 canary에서 p99·goodput·cost를 재검증한다.</p>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 대기업 면접 질문 3개</h2>
+          <p style="margin:0 0 10px;"><strong style="color:#f8fafc;">Q1. CPU-bound와 I/O-bound process가 경쟁할 때 scheduler 관점 차이는?</strong><br>답변 포인트: CPU-bound는 계속 runnable해 weight share를 소비한다. I/O-bound는 sleep 중 run queue에서 빠지고 event 후 wakeup→enqueue→dispatch를 거친다. total CPU%, concurrent-runnable window, wakeup latency를 구분한다.</p>
+          <p style="margin:0 0 10px;"><strong style="color:#f8fafc;">Q2. nice 0과 nice 5면 CPU를 50:45로 나눕니까?</strong><br>답변 포인트: 아니다. nice는 선형 percentage가 아니라 약 1.25 단계의 weight ratio다. 둘이 같은 CPU에서 계속 runnable하고 같은 hierarchy라면 약 3:1을 향하지만 sleep, autogroup, cgroup, affinity가 결과를 바꾼다.</p>
+          <p style="margin:0;"><strong style="color:#f8fafc;">Q3. nice를 바꿨는데 latency가 개선되지 않을 때 진단 순서는?</strong><br>답변 포인트: policy/TID 적용 확인→동시 runnable 여부와 affinity→autogroup/cgroup quota·weight→schedstat wait·CPU PSI→I/O/lock/dependency와 app queue를 분리한다. nice는 capacity 생성이나 deadline 보장이 아니다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. 퀴즈·누적 리뷰</h2>
+          <ol style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:6px;">nice 19 task가 CPU에 혼자 runnable이면 최대 5%만 사용할까?</li>
+            <li style="margin-bottom:6px;">I/O-bound task의 CPU time이 작아도 request p99가 나쁠 수 있는 이유 두 가지는?</li>
+            <li style="margin-bottom:6px;">nice 0과 nice 5의 weight 차이를 대략 몇 배로 기대하는가?</li>
+            <li style="margin-bottom:6px;">getpriority()가 -1을 반환했을 때 errno를 확인해야 하는 이유는?</li>
+            <li style="margin-bottom:6px;">process nice와 cgroup cpu.weight의 관계를 계층으로 설명하라.</li>
+            <li style="margin-bottom:6px;">Day 11 복습: affinity로 한 CPU에 고정하면 어떤 변수를 제거하는가?</li>
+            <li>Day 12 복습: 낮은 weight task의 vruntime은 같은 actual runtime에 더 빠르게 증가하는가?</li>
+          </ol>
+          <p style="margin:11px 0 0;color:#a7c7da;font-size:14px;">정답 포인트: 1번은 아니며 경쟁자가 없으면 idle CPU를 쓴다. 3번은 1.25⁵≈3.05배. 7번은 그렇다. 나머지는 상태→계층→측정 증거 순서로 답한다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 다음 날 연결</h2>
+          <p style="margin:0;">Day 14에서는 Week 2를 누적 리뷰한다. workload와 SLO를 받은 뒤 FCFS/RR, priority, multicore affinity, fair scheduling, nice/cgroup 중 어떤 선택을 할지 <strong style="color:#f8fafc;">latency·throughput·fairness·failure mode</strong>로 방어한다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 공식·1차 출처</h2>
+          <ul style="margin:0;padding-left:22px;color:#a7c7da;">
+            <li><a href="https://man7.org/linux/man-pages/man7/sched.7.html" style="color:#67e8f9;">Linux man-pages — sched(7)</a>: SCHED_OTHER, nice 범위·1.25 factor, autogroup과 group scheduling</li>
+            <li><a href="https://man7.org/linux/man-pages/man2/getpriority.2.html" style="color:#67e8f9;">Linux man-pages — getpriority(2)/setpriority(2)</a>: API, 권한, errno, 상속과 Linux thread별 semantics</li>
+            <li><a href="https://docs.kernel.org/scheduler/sched-nice-design.html" style="color:#67e8f9;">Linux kernel docs — Scheduler Nice Design</a>: nice level의 상대 CPU share 설계</li>
+            <li><a href="https://docs.kernel.org/scheduler/sched-design-CFS.html" style="color:#67e8f9;">Linux kernel docs — CFS Scheduler</a>: weight-normalized vruntime과 fair run queue</li>
+            <li><a href="https://docs.kernel.org/scheduler/sched-eevdf.html" style="color:#67e8f9;">Linux kernel docs — EEVDF Scheduler</a>: lag, eligibility, virtual deadline과 sleeper 처리</li>
+            <li><a href="https://docs.kernel.org/scheduler/sched-stats.html" style="color:#67e8f9;">Linux kernel docs — Scheduler Statistics</a>: runtime, runqueue wait, timeslice count</li>
+            <li><a href="https://www.kernel.org/doc/html/latest/accounting/psi.html" style="color:#67e8f9;">Linux kernel docs — Pressure Stall Information</a>: CPU pressure의 some/total과 cgroup 관찰</li>
+            <li><a href="https://docs.kernel.org/admin-guide/cgroup-v2.html" style="color:#67e8f9;">Linux kernel docs — cgroup v2</a>: cpu.weight, cpu.max와 cpu.stat</li>
+          </ul>
+        </td></tr>
+        <tr><td style="padding:18px 28px;background:#081522;border-top:1px solid #1e3a4c;color:#7fa4ba;font-size:12px;">Operating System 심화 커리큘럼 · 초보 용어에서 kernel/hardware와 production diagnosis까지</td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>

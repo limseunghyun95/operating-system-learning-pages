@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-08-12T09:00:23+09:00",
+  "updatedAt": "2026-08-14T09:09:11+09:00",
   "lessons": [
     {
       "day": 1,
@@ -113,6 +113,15 @@
       "path": "day-12.html",
       "kind": "lesson",
       "publishedAt": "2026-08-12T09:00:23+09:00"
+    },
+    {
+      "day": 13,
+      "week": 2,
+      "title": "실패 실습: CPU-bound/IO-bound 경쟁과 nice 관찰",
+      "summary": "CPU-bound와 I/O-bound task를 동일 CPU에서 경쟁시켜 nice weight가 runnable service share에 미치는 영향과 wakeup latency·schedstat·CPU PSI·cgroup 함정을 증거로 분리합니다.",
+      "path": "day-13.html",
+      "kind": "lab",
+      "publishedAt": "2026-08-14T09:09:11+09:00"
     }
   ]
 }
