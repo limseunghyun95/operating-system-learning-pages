@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operating System 심화 커리큘럼 Day 14 - 리뷰: scheduler 선택을 SLO로 방어</title>
+</head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.68;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#07111f;">
+    <tr><td align="center" style="padding:20px 10px 44px;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#0b1728;border:1px solid #1e3a4c;border-radius:18px;overflow:hidden;">
+        <tr><td style="padding:30px 28px;background:#102438;border-bottom:1px solid #1e3a4c;">
+          <div style="font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:#5eead4;font-weight:800;">Operating System · Day 14 / 63 · Week 2 Review</div>
+          <h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">리뷰: scheduler 선택을 SLO로 방어</h1>
+          <p style="margin:0;color:#a5f3fc;font-size:16px;">한 줄 요약 — 좋은 scheduler 답변은 알고리즘 이름이 아니라 <strong style="color:#f8fafc;">workload·SLO·capacity·isolation·overload policy를 먼저 고정</strong>하고, Linux scheduling class와 weight/affinity를 최소 변경한 뒤 application latency·runqueue wait·PSI로 검증하고 rollback 조건까지 제시한다.</p>
+        </td></tr>
+        <tr><td style="padding:26px 28px;">
+          <h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 리뷰용 용어 사전</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:14px;">
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;width:30%;">SLO</td><td style="padding:9px;border:1px solid #29465d;">Service Level Objective. 예: 성공 요청의 99%를 100ms 안에 완료. 평균이 아니라 대상 population·window·percentile·성공 조건까지 포함한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">arrival rate λ</td><td style="padding:9px;border:1px solid #29465d;">단위 시간당 들어오는 job/request 수. 평균뿐 아니라 burst와 동시 도착 분포가 queue를 결정한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">service time S</td><td style="padding:9px;border:1px solid #29465d;">job이 실제 자원에서 소비하는 처리 시간. CPU service와 I/O wait를 분리해야 한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">utilization ρ</td><td style="padding:9px;border:1px solid #29465d;">요구된 service/capacity의 비율. 단순 model에서 ρ=λS/m. 1에 가까우면 작은 변동도 queue latency를 크게 키운다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">response time</td><td style="padding:9px;border:1px solid #29465d;">arrival부터 완료까지. waiting time+service time이며 scheduler는 주로 runnable waiting과 preemption 순서에 영향을 준다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">tail latency</td><td style="padding:9px;border:1px solid #29465d;">p95/p99처럼 느린 꼬리 구간. 평균이 정상이어도 burst, convoy, throttling, migration 때문에 나빠질 수 있다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">fairness</td><td style="padding:9px;border:1px solid #29465d;">동일하거나 weight가 지정된 경쟁자가 장기적으로 약속한 service를 받는 성질. 짧은 window latency와 같은 뜻이 아니다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">admission control</td><td style="padding:9px;border:1px solid #29465d;">capacity를 넘는 일을 queue에 넣기 전에 제한·거절·지연하는 정책. scheduler가 만들 수 없는 capacity를 보호한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">backpressure</td><td style="padding:9px;border:1px solid #29465d;">downstream 포화 신호를 upstream에 전달해 생산 속도를 늦추는 제어. 무한 queue 대신 실패를 bounded하게 만든다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">scheduling class</td><td style="padding:9px;border:1px solid #29465d;">Linux 정책 계층. DEADLINE/RT/fair class는 의미와 위험이 다르며 nice는 normal fair class 안의 상대 weight다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">entitlement</td><td style="padding:9px;border:1px solid #29465d;">경쟁 시 받아야 할 상대 service 몫. nice·cgroup cpu.weight가 표현하지만 idle CPU 사용 상한은 아니다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">headroom</td><td style="padding:9px;border:1px solid #29465d;">평상시 사용량과 최대 capacity 사이 여유. burst·GC·failover·noisy neighbor를 흡수한다.</td></tr>
+          </table>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: scheduler는 응급실의 한 층이다</h2>
+          <div style="padding:16px;background:#0f2035;border-left:4px solid #5eead4;border-radius:8px;">
+            <p style="margin:0 0 9px;"><strong style="color:#f8fafc;">입구</strong>는 admission control이다. 병상보다 환자가 무한히 들어오면 의사 순번표만 바꿔서는 대기열 폭발을 막지 못한다.</p>
+            <p style="margin:0 0 9px;"><strong style="color:#f8fafc;">병동 분리</strong>는 cgroup·CPU isolation이다. 응급·일반·batch가 같은 quota를 놓고 싸우면 process nice 하나로 service boundary를 보장하기 어렵다.</p>
+            <p style="margin:0;"><strong style="color:#f8fafc;">진료 순번</strong>이 scheduler다. fair class는 장기 몫과 응답성을 균형 잡고, RT/DEADLINE은 더 강한 계약과 더 큰 실패 반경을 가진다. 선택은 SLO와 검증 가능한 workload model로 방어한다.</p>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: 요구사항에서 CPU dispatch까지</h2>
+          <div style="overflow:auto;padding:16px;background:#06101d;border:1px solid #29465d;border-radius:10px;">
+            <pre style="margin:0;color:#c4f1f9;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;">Business / user journey
+        │  SLO: p99, throughput, deadline, fairness
+        ▼
+Workload model
+ arrival/burst · CPU burst · I/O wait · dependencies · cores
+        │
+        ▼
+Feasibility gate
+ offered load ρ · headroom · bounded queue · admission/backpressure
+        │                       └─ infeasible → reject/shed/scale
+        ▼
+Isolation &amp; hierarchy
+ cgroup cpu.weight/cpu.max · cpuset · affinity · NUMA/SMT
+        │
+        ▼
+Linux scheduling class
+ DEADLINE > RT(FIFO/RR) > fair(OTHER/BATCH/IDLE)
+        │
+        ▼
+per-CPU run queue
+ fair: nice→weight, vruntime, EEVDF eligibility/virtual deadline
+        │
+        ▼
+preemption → context switch → CPU/cache execution
+        │
+        ▼
+Evidence loop
+ app p50/p99/goodput + schedstat wait + PSI + throttle + switches
+        │
+        ├─ SLO/guardrail 통과 → canary 확대
+        └─ 실패              → rollback + 원인 재분류</pre>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. 면접·설계 답변 프레임: W-SAFE-R</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:14px;">
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;width:17%;">W</td><td style="padding:9px;border:1px solid #29465d;"><strong style="color:#f8fafc;">Workload</strong> — arrival/burst, service distribution, CPU/I/O-bound, core와 dependency를 수치화한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">S</td><td style="padding:9px;border:1px solid #29465d;"><strong style="color:#f8fafc;">SLO</strong> — p99 response, throughput, fairness, deadline miss, window와 error budget을 정의한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">A</td><td style="padding:9px;border:1px solid #29465d;"><strong style="color:#f8fafc;">Admission</strong> — ρ와 headroom을 계산하고 queue bound, shedding, backpressure를 먼저 둔다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">F</td><td style="padding:9px;border:1px solid #29465d;"><strong style="color:#f8fafc;">Fairness/isolation</strong> — tenant/service boundary를 cgroup·cpuset으로, 내부 상대 share를 nice/weight로 표현한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">E</td><td style="padding:9px;border:1px solid #29465d;"><strong style="color:#f8fafc;">Evidence</strong> — application metric과 schedstat/PSI/throttle/switch를 같은 timeline에서 비교한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">R</td><td style="padding:9px;border:1px solid #29465d;"><strong style="color:#f8fafc;">Rollback</strong> — 변경 전 config, abort threshold, feature flag, 소유자와 복구 시간을 명시한다.</td></tr>
+          </table>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. CS·kernel·hardware deep dive</h2>
+          <h3 style="margin:16px 0 8px;color:#f8fafc;font-size:17px;">5.1 ρ가 1에 가까우면 scheduler tuning 여지가 사라진다</h3>
+          <p style="margin:0 0 9px;">단순화한 m-core CPU에서 평균 offered utilization은 <strong style="color:#f8fafc;">ρ=λ×E[S]/m</strong>이다. 평균 ρ가 0.8이어도 service variance와 burst가 크면 순간 queue가 생긴다. ρ≥1이 지속되면 들어오는 work가 처리 capacity보다 많아 queue는 안정 상태를 갖지 못한다.</p>
+          <p style="margin:0;">scheduler는 먼저 처리할 job을 바꿀 수 있지만 총 service 수요를 제거하지 않는다. 특정 class의 p99를 낮추면 다른 class의 wait나 throughput이 악화될 수 있으므로 overload policy가 선행한다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.2 FCFS·SJF·RR은 목적 함수가 다르다</h3>
+          <p style="margin:0 0 9px;"><strong style="color:#f8fafc;">FCFS</strong>는 단순하고 switch가 적지만 긴 CPU burst가 뒤의 짧은 job을 막는 convoy를 만든다. <strong style="color:#f8fafc;">SJF/SRPT</strong>는 service time을 정확히 안다면 평균 completion을 줄이지만 예측 오류와 긴 job starvation 문제가 있다.</p>
+          <p style="margin:0;"><strong style="color:#f8fafc;">RR</strong>은 time quantum으로 first response와 fairness를 개선하지만 quantum이 작으면 switch/cache 비용이 커진다. Linux fair scheduler를 fixed-quantum RR로 동일시하지 않는다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.3 normal service의 기본값은 fair class다</h3>
+          <p style="margin:0 0 9px;">SCHED_OTHER(NORMAL)는 일반 application의 표준 time-sharing 정책이다. nice→weight로 장기 entitlement를 표현하고, Linux의 fair scheduler는 weight-normalized vruntime과 EEVDF의 lag/eligibility/virtual deadline으로 share와 latency ordering을 조절한다.</p>
+          <p style="margin:0;">EEVDF virtual deadline은 wall-clock SLO deadline이 아니다. higher class, IRQ, lock, cgroup throttle, affinity imbalance와 overload가 actual dispatch를 늦출 수 있다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.4 RT/DEADLINE은 “더 빠른 옵션”이 아니다</h3>
+          <p style="margin:0 0 9px;">SCHED_FIFO는 같은/낮은 class를 time slice 없이 막을 수 있고 SCHED_RR도 normal task보다 우선한다. runaway RT loop는 system responsiveness를 잃게 할 수 있다. capability, runtime limit, watchdog, emergency CPU와 bounded critical section이 필요하다.</p>
+          <p style="margin:0;">SCHED_DEADLINE은 runtime≤deadline≤period와 admission test를 가진 sporadic task 계약이다. 일반 API p99를 빠르게 하려고 쓰는 기능이 아니며 page fault, I/O/lock dependency까지 자동 보장하지 않는다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.5 multicore에서는 topology와 hierarchy가 정책 일부다</h3>
+          <p style="margin:0 0 9px;">per-CPU run queue와 load balancing 때문에 global runnable 수만으로 local queue를 설명할 수 없다. affinity는 cache locality를 높일 수 있지만 좁게 고정하면 idle core가 있어도 hot run queue가 생긴다. SMT sibling은 완전한 독립 core가 아니고 NUMA migration은 memory latency를 바꾼다.</p>
+          <p style="margin:0;">cgroup cpu.weight는 group 사이 상대 몫, cpu.max는 bandwidth 상한이다. process nice는 group 내부 지분일 수 있다. throttle로 생긴 latency를 scheduler unfairness로 오진하지 않는다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.6 preemption은 latency와 efficiency를 교환한다</h3>
+          <p style="margin:0 0 9px;">짧은 slice와 wakeup preemption은 latency-sensitive job을 빨리 실행하지만 scheduler overhead, context switch, cache/TLB/predictor working-set 교대를 늘릴 수 있다. switch count만으로 비용을 확정하지 말고 goodput·cache miss·energy를 함께 측정한다.</p>
+          <p style="margin:0;">반대로 긴 nonpreemptive burst는 switch cost를 줄이지만 head-of-line blocking을 만든다. SLO가 first response인지 completion인지에 따라 최적점이 다르다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.7 관찰은 application→kernel 순서로 drill down한다</h3>
+          <p style="margin:0 0 9px;">먼저 p50/p99와 goodput, queue age, rejection을 본다. 다음으로 CPU utilization/PSI, cgroup throttle, per-task schedstat runtime/wait/slices, context switches와 migrations를 대조한다. kernel metric 하나만으로 user-visible SLO를 대체하지 않는다.</p>
+          <p style="margin:0;">CPU PSI <code style="color:#fbbf24;">some</code>은 적어도 한 task가 CPU를 기다린 stall을 집계하지만 특정 PID 원인을 단독 증명하지 않는다. scope와 delta, 같은 시간축이 중요하다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. 선택 matrix: 기본값과 예외</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:13px;">
+            <tr><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">상황</td><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">첫 선택</td><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">방어·guardrail</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">일반 API+batch</td><td style="padding:8px;border:1px solid #29465d;">SCHED_OTHER, 별도 cgroup, weight/quota</td><td style="padding:8px;border:1px solid #29465d;">bounded queue, API p99와 batch goodput 동시 검증</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">background maintenance</td><td style="padding:8px;border:1px solid #29465d;">양수 nice 또는 SCHED_BATCH</td><td style="padding:8px;border:1px solid #29465d;">deadline 없음 확인, starvation/완료시간 alert</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">tenant noisy neighbor</td><td style="padding:8px;border:1px solid #29465d;">cgroup cpu.weight/cpu.max</td><td style="padding:8px;border:1px solid #29465d;">throttle와 idle borrowing을 분리, per-tenant SLO</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">cache-sensitive worker</td><td style="padding:8px;border:1px solid #29465d;">넓은 cpuset/soft affinity부터</td><td style="padding:8px;border:1px solid #29465d;">imbalance·hotplug·NUMA·SMT 검증, escape CPU 유지</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">hard periodic deadline</td><td style="padding:8px;border:1px solid #29465d;">검증된 SCHED_DEADLINE 설계 검토</td><td style="padding:8px;border:1px solid #29465d;">WCET, admission, lock/I/O/page fault, watchdog</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">장시간 CPU overload</td><td style="padding:8px;border:1px solid #29465d;">shed/backpressure/scale</td><td style="padding:8px;border:1px solid #29465d;">scheduler tuning으로 숨기지 않기, retry storm 차단</td></tr>
+          </table>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. 실무 best practice</h2>
+          <ol style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">SLO를 workload class별로 분리한다.</strong> interactive, batch, control-plane의 latency·throughput·fairness 목표를 섞지 않는다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">default fair class에서 시작한다.</strong> cgroup isolation과 overload control로 해결 가능한지 먼저 검증한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">headroom을 failure mode에 맞춘다.</strong> single-node loss, failover, GC, burst 때의 effective core를 기준으로 capacity를 계산한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">canary 한 축만 바꾼다.</strong> nice·weight·quota·affinity·concurrency를 동시에 조정하지 않고 config와 kernel version을 기록한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">양방향 guardrail을 둔다.</strong> latency class 개선뿐 아니라 batch starvation, total goodput, switch/cache cost를 제한한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">RT 변경은 별도 change class로 관리한다.</strong> privilege, watchdog, runtime budget, rollback shell, emergency CPU를 사전 검증한다.</li>
+            <li><strong style="color:#f8fafc;">문서에 반증 조건을 쓴다.</strong> “scheduler 원인”이라면 schedstat wait/PSI가 어떤 방향으로 변해야 하는지 명시한다.</li>
+          </ol>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. error handling과 운영 대응</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:14px;">
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;width:31%;">ρ≥1 또는 queue 증가</td><td style="padding:9px;border:1px solid #29465d;">tuning을 중지하고 admission, shedding, retry budget, scale을 적용한다. 오래된 request는 deadline-aware하게 폐기한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">p99↑, PSI↑</td><td style="padding:9px;border:1px solid #29465d;">CPU saturation과 local runqueue/affinity imbalance를 분리한다. cgroup throttle과 higher class도 확인한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">p99↑, sched wait 정상</td><td style="padding:9px;border:1px solid #29465d;">scheduler 가설을 기각하고 I/O, lock, GC, dependency, application queue를 추적한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">throughput↓, switch↑</td><td style="padding:9px;border:1px solid #29465d;">quantum/slice·wakeup preemption·worker concurrency를 되돌리고 cache miss와 migrations를 비교한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">batch starvation</td><td style="padding:9px;border:1px solid #29465d;">aging/최소 entitlement/deadline을 추가하거나 별도 cgroup으로 분리한다. interactive p99만 성공으로 보지 않는다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">RT runaway</td><td style="padding:9px;border:1px solid #29465d;">사전 확보한 emergency CPU/shell과 watchdog으로 종료하고 정책을 SCHED_OTHER로 rollback한다. privilege 확장은 금지한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">metric 없음/버전 차이</td><td style="padding:9px;border:1px solid #29465d;">feature probe 후 unavailable로 기록한다. /proc 내부 field를 stable ABI로 가정하거나 0으로 대체하지 않는다.</td></tr>
+          </table>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. 놓치기 쉬운 함정</h2>
+          <ul style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:7px;">“latency가 중요하니 priority를 높인다”에서 답을 끝내지 않는다. 누구의 latency가 희생되는지 말한다.</li>
+            <li style="margin-bottom:7px;">평균 CPU 60%로 headroom이 충분하다고 단정하지 않는다. per-core hot spot과 burst percentile을 본다.</li>
+            <li style="margin-bottom:7px;">nice를 CPU 상한이나 deadline 보장으로 설명하지 않는다.</li>
+            <li style="margin-bottom:7px;">EEVDF virtual deadline과 SCHED_DEADLINE의 wall-clock contract를 혼동하지 않는다.</li>
+            <li style="margin-bottom:7px;">affinity를 성능 만능키로 쓰지 않는다. load imbalance와 hotplug 장애 경로를 만든다.</li>
+            <li style="margin-bottom:7px;">CPU utilization만 보고 scheduler 병목을 확정하지 않는다. runnable wait와 PSI가 필요하다.</li>
+            <li style="margin-bottom:7px;">RT benchmark를 production 권한·lock·page fault 조건 없이 일반화하지 않는다.</li>
+            <li>좋은 canary 평균이 전체 p99·starvation·failover 안전성을 증명한다고 생각하지 않는다.</li>
+          </ul>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 30분 실습: SLO defense simulator</h2>
+          <p style="margin:0 0 10px;color:#a7c7da;">표준 Python으로 interactive(I)와 batch(B) job을 한 CPU에서 실행한다. FCFS와 작은-quantum RR을 비교해 “한 지표 개선=좋은 정책”이 아님을 확인한다. 이 코드는 Linux kernel emulator가 아니라 면접용 decision lab이다.</p>
+          <pre style="margin:0;padding:14px;background:#06101d;border:1px solid #29465d;border-radius:10px;color:#d1fae5;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;">LAB_DIR=$(mktemp -d)
+python3 - "$LAB_DIR/result.txt" &lt;&lt;'PY'
+from collections import deque
+import math, sys
+
+# (arrival, service, class, id): 긴 batch 사이에 짧은 interactive burst
+jobs = [(0, 18, "B", "B0"), (1, 2, "I", "I1"),
+        (2, 1, "I", "I2"), (3, 2, "I", "I3"),
+        (4, 1, "I", "I4"), (6, 8, "B", "B1")]
+
+def percentile(values, p):
+    values = sorted(values)
+    return values[math.ceil(p * len(values)) - 1]
+
+def simulate(quantum=None, switch_cost=0.0):
+    pending = [dict(arr=a, rem=s, service=s, cls=c, id=i)
+               for a, s, c, i in jobs]
+    ready, done, first = deque(), {}, {}
+    now, switches, prev = 0.0, 0, None
+    while pending or ready:
+        for j in list(pending):
+            if j["arr"] &lt;= now:
+                ready.append(j); pending.remove(j)
+        if not ready:
+            now = min(j["arr"] for j in pending); continue
+        j = ready.popleft()
+        if prev is not None and prev != j["id"]:
+            now += switch_cost; switches += 1
+        first.setdefault(j["id"], now)
+        run = j["rem"] if quantum is None else min(quantum, j["rem"])
+        now += run; j["rem"] -= run
+        for n in list(pending):
+            if n["arr"] &lt;= now:
+                ready.append(n); pending.remove(n)
+        if j["rem"] &gt; 0: ready.append(j)
+        else: done[j["id"]] = now
+        prev = j["id"]
+    response = {c: [done[i] - a for a, s, c2, i in jobs if c2 == c]
+                for c in ("I", "B")}
+    first_wait = {c: [first[i] - a for a, s, c2, i in jobs if c2 == c]
+                  for c in ("I", "B")}
+    return dict(makespan=now, switches=switches,
+                i_p99=percentile(response["I"], .99),
+                i_first_p99=percentile(first_wait["I"], .99),
+                b_p99=percentile(response["B"], .99),
+                throughput=len(jobs)/now)
+
+rows = [("FCFS", simulate()),
+        ("RR q=2 cost=.15", simulate(2, .15)),
+        ("RR q=1 cost=.15", simulate(1, .15))]
+with open(sys.argv[1], "w") as f:
+    f.write("policy,I_first_p99,I_completion_p99,B_completion_p99,switches,throughput\n")
+    for name, r in rows:
+        f.write(f"{name},{r['i_first_p99']:.2f},{r['i_p99']:.2f},"
+                f"{r['b_p99']:.2f},{r['switches']},{r['throughput']:.4f}\n")
+PY
+sed -n '1,10p' "$LAB_DIR/result.txt"
+rm -rf -- "$LAB_DIR"</pre>
+          <p style="margin:10px 0 0;"><strong style="color:#f8fafc;">리뷰 질문:</strong> FCFS는 switch가 적지만 interactive가 B0 뒤에 막힌다. RR은 first response를 줄이지만 switch cost로 makespan/goodput을 희생하고 batch completion이 늦어진다. 어떤 정책도 모든 지표에서 지배적이지 않다.</p>
+          <p style="margin:8px 0 0;color:#a7c7da;font-size:14px;"><strong style="color:#f8fafc;">확장:</strong> SLO를 I completion p99≤8, batch completion p99≤35, throughput≥0.18로 정하면 FCFS는 I p99, RR q=2는 throughput, RR q=1은 세 guardrail을 일부 위반해 모두 탈락한다. 이때는 나쁜 정책 하나를 억지로 고르지 말고 capacity·admission·workload 분리를 바꾼다. arrival burst와 switch cost를 두 배로 바꿔 선택이 다시 달라지는지도 확인한다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. production 실패 시나리오</h2>
+          <div style="padding:15px;background:#241528;border:1px solid #7f1d4d;border-radius:9px;">
+            <p style="margin:0 0 8px;"><strong style="color:#f9a8d4;">상황:</strong> API p99를 줄이려고 모든 worker를 더 높은 priority와 좁은 CPU affinity로 배포했다. canary p50은 좋아졌지만 장애 시 트래픽이 몰리자 한 CPU runqueue만 뜨거워지고 control-plane worker가 굶어 health check와 autoscaling까지 늦어진다.</p>
+            <p style="margin:0 0 8px;"><strong style="color:#f9a8d4;">원인:</strong> 평균 steady-state만 측정했고 failover arrival burst, per-CPU imbalance, lower-priority control path와 rollback channel을 SLO에 넣지 않았다.</p>
+            <p style="margin:0 0 8px;"><strong style="color:#f9a8d4;">증거:</strong> per-CPU runqueue/PSI, TID affinity·policy, schedstat wait, context switch/migration, API p99와 health-check age, cgroup throttle을 incident timeline에 맞춘다.</p>
+            <p style="margin:0;"><strong style="color:#f9a8d4;">대응:</strong> affinity/priority 변경을 rollback하고 bounded admission으로 queue를 안정화한다. control-plane에 별도 최소 entitlement와 escape CPU를 두고 failover load canary를 release gate로 추가한다.</p>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 대기업 면접 질문 3개</h2>
+          <p style="margin:0 0 10px;"><strong style="color:#f8fafc;">Q1. latency-sensitive API와 batch가 같은 host에 있습니다. scheduler를 어떻게 선택합니까?</strong><br>답변 포인트: workload/SLO와 ρ부터 정하고 admission·headroom을 둔다. 기본 SCHED_OTHER에서 별도 cgroup weight/quota로 격리하고 batch에 양수 nice/BATCH를 검토한다. app p99·goodput과 schedstat/PSI/throttle을 canary로 검증한다.</p>
+          <p style="margin:0 0 10px;"><strong style="color:#f8fafc;">Q2. SCHED_FIFO를 쓰면 p99가 가장 좋아지지 않나요?</strong><br>답변 포인트: higher-class preemption은 가능하지만 runaway loop·lock·I/O/page fault와 normal task starvation이 있다. hard requirement와 WCET가 없으면 과도하다. runtime limit, watchdog, emergency path와 admission이 있어야 한다.</p>
+          <p style="margin:0;"><strong style="color:#f8fafc;">Q3. CPU 70%인데 p99가 나쁩니다. scheduler 문제입니까?</strong><br>답변 포인트: 평균은 증거가 부족하다. per-core/affinity hot spot, burst, PSI, schedstat wait, cgroup throttle을 본다. wait가 정상이라면 I/O·lock·GC·dependency/app queue 가설로 이동한다. 반증 가능한 지표 순서를 제시한다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. Week 2 누적 퀴즈·회상</h2>
+          <ol style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:6px;">latency=response time과 같은가? waiting/service로 분해하라.</li>
+            <li style="margin-bottom:6px;">FCFS convoy와 SJF starvation은 어떤 workload에서 나타나는가?</li>
+            <li style="margin-bottom:6px;">preemption 결정과 실제 context switch 사이 kernel 단계를 설명하라.</li>
+            <li style="margin-bottom:6px;">per-CPU run queue가 global CPU 50%와 local saturation을 동시에 만들 수 있는 이유는?</li>
+            <li style="margin-bottom:6px;">CFS vruntime과 EEVDF lag/virtual deadline의 역할 차이는?</li>
+            <li style="margin-bottom:6px;">nice 5가 CPU 5%가 아닌 이유와 cgroup hierarchy 함정은?</li>
+            <li style="margin-bottom:6px;">ρ≥1인 지속 overload에서 scheduler 교체만으로 queue를 안정화할 수 있는가?</li>
+            <li>당신의 선택이 실패했음을 알리는 application metric 2개와 kernel metric 2개는?</li>
+          </ol>
+          <p style="margin:11px 0 0;color:#a7c7da;font-size:14px;">답변은 정의→상태 흐름→trade-off→failure mode→증거→rollback 순서로 90초 안에 말해 본다. 알고리즘 이름만 나열하면 다시 W-SAFE-R 프레임으로 재구성한다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 다음 날 연결</h2>
+          <p style="margin:0;">Day 15부터 동시성으로 넘어간다. scheduler가 실행 순서를 바꾸면 공유 memory 접근 순서도 달라진다. <strong style="color:#f8fafc;">race condition, atomicity, ordering, visibility</strong>를 구분하고 “한 번 잘 됐다”가 correctness 증거가 아닌 이유를 CPU/compiler 수준에서 추적한다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">15. 공식·1차 출처</h2>
+          <ul style="margin:0;padding-left:22px;color:#a7c7da;">
+            <li><a href="https://man7.org/linux/man-pages/man7/sched.7.html" style="color:#67e8f9;">Linux man-pages — sched(7)</a>: scheduling class, nice, RT/DEADLINE contract와 privilege·runaway 위험</li>
+            <li><a href="https://docs.kernel.org/scheduler/sched-design-CFS.html" style="color:#67e8f9;">Linux kernel docs — CFS Scheduler</a>: vruntime, rbtree와 fair-class mental model</li>
+            <li><a href="https://docs.kernel.org/scheduler/sched-eevdf.html" style="color:#67e8f9;">Linux kernel docs — EEVDF Scheduler</a>: lag, eligibility, virtual deadline과 latency/fairness</li>
+            <li><a href="https://docs.kernel.org/scheduler/sched-stats.html" style="color:#67e8f9;">Linux kernel docs — Scheduler Statistics</a>: runtime, runqueue wait, timeslice counter</li>
+            <li><a href="https://www.kernel.org/doc/html/latest/accounting/psi.html" style="color:#67e8f9;">Linux kernel docs — Pressure Stall Information</a>: CPU pressure의 some/total과 cgroup 범위</li>
+            <li><a href="https://docs.kernel.org/admin-guide/cgroup-v2.html" style="color:#67e8f9;">Linux kernel docs — cgroup v2</a>: cpu.weight, cpu.max, cpu.stat과 cpuset</li>
+            <li><a href="https://sre.google/sre-book/handling-overload/" style="color:#67e8f9;">Google SRE Book — Handling Overload</a>: overload protection, client-side throttling과 graceful degradation</li>
+          </ul>
+        </td></tr>
+        <tr><td style="padding:18px 28px;background:#081522;border-top:1px solid #1e3a4c;color:#7fa4ba;font-size:12px;">Operating System 심화 커리큘럼 · Week 2 CPU Scheduling 누적 리뷰</td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>
