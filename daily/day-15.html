@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operating System 심화 커리큘럼 Day 15 - race condition, atomicity, ordering, visibility</title>
+</head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.68;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#07111f;">
+    <tr><td align="center" style="padding:20px 10px 44px;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#0b1728;border:1px solid #1e3a4c;border-radius:18px;overflow:hidden;">
+        <tr><td style="padding:30px 28px;background:#102438;border-bottom:1px solid #1e3a4c;">
+          <div style="font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:#5eead4;font-weight:800;">Operating System · Day 15 / 63 · Concurrency</div>
+          <h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">race condition, atomicity, ordering, visibility</h1>
+          <p style="margin:0;color:#a5f3fc;font-size:16px;">한 줄 요약 — 동시성 correctness는 “한 번에 실행됐는가”만의 문제가 아니다. <strong style="color:#f8fafc;">공유 상태의 invariant를 atomic하게 바꾸고, 필요한 inter-thread order를 happens-before로 만들며, 그 order를 통해 write가 다른 CPU에 visible해지도록</strong> language/runtime이 보장하는 mutex·atomic 계약을 사용해야 한다.</p>
+        </td></tr>
+        <tr><td style="padding:26px 28px;">
+          <h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:14px;">
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;width:30%;">concurrency</td><td style="padding:9px;border:1px solid #29465d;">여러 작업의 실행 구간이 시간상 겹치고 순서가 고정되지 않은 성질. 한 CPU의 interleaving도 concurrency이며, 여러 CPU의 동시 실행은 parallelism이다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">shared state</td><td style="padding:9px;border:1px solid #29465d;">둘 이상의 thread/CPU가 접근하는 memory나 resource. counter, queue, file, account row, cache entry 모두 포함한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">invariant</td><td style="padding:9px;border:1px solid #29465d;">모든 observable state에서 반드시 참이어야 하는 조건. 예: balance≥0, head와 size가 같은 queue 내용을 가리킴.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">race condition</td><td style="padding:9px;border:1px solid #29465d;">결과의 correctness가 timing/interleaving에 의존하는 넓은 논리 버그. TOCTOU처럼 memory data race 없이도 생길 수 있다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">data race</td><td style="padding:9px;border:1px solid #29465d;">서로 다른 thread의 conflicting memory access가 있고 적어도 하나가 write이며 happens-before로 정렬되지 않은 상태. C/C++에서는 일반적으로 undefined behavior다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">atomicity</td><td style="padding:9px;border:1px solid #29465d;">관찰자에게 operation이 중간 상태 없이 하나의 indivisible step처럼 보이는 성질. 단일 atomic counter가 여러 field의 invariant까지 transaction으로 만들지는 않는다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">ordering</td><td style="padding:9px;border:1px solid #29465d;">memory operation 사이에 반드시 지켜져야 하는 부분 순서. source code 줄 순서가 다른 thread가 관찰하는 순서를 자동 보장하지 않는다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">visibility</td><td style="padding:9px;border:1px solid #29465d;">한 thread의 write 결과를 다른 thread의 read가 관찰할 수 있는 성질. coherence만으로 올바른 publication order가 생기지는 않는다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">happens-before</td><td style="padding:9px;border:1px solid #29465d;">language memory model이 정의한 “A의 효과가 B보다 앞서 관찰되어야 한다”는 부분 순서. mutex unlock→lock, release→acquire 같은 synchronization으로 만든다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">critical section</td><td style="padding:9px;border:1px solid #29465d;">공유 invariant를 읽고 바꾸는 동안 동시에 한 실행 주체만 들어오게 해야 하는 코드 영역.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">memory order</td><td style="padding:9px;border:1px solid #29465d;">atomic operation이 주변 memory access에 부과하는 순서 강도. relaxed, acquire, release, acq_rel, seq_cst 등이 있다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">undefined behavior</td><td style="padding:9px;border:1px solid #29465d;">language 표준이 실행 결과를 제한하지 않는 상태. “가끔 값이 틀림”보다 심각하며 compiler가 race가 없다고 가정해 예상을 벗어난 최적화를 할 수 있다.</td></tr>
+          </table>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 공동 장부의 네 가지 계약</h2>
+          <div style="padding:16px;background:#0f2035;border-left:4px solid #5eead4;border-radius:8px;">
+            <p style="margin:0 0 9px;"><strong style="color:#f8fafc;">race condition</strong> — 두 직원이 같은 장부를 어느 순서로 보느냐에 따라 잔액이 달라진다.</p>
+            <p style="margin:0 0 9px;"><strong style="color:#f8fafc;">atomicity</strong> — “읽기→계산→쓰기”를 도중에 끊어 다른 직원이 반쪽 상태를 보지 못하게 한다.</p>
+            <p style="margin:0 0 9px;"><strong style="color:#f8fafc;">ordering</strong> — 먼저 내용을 다 적고 그다음 “완료” 도장을 찍어야 한다는 순서를 만든다.</p>
+            <p style="margin:0;"><strong style="color:#f8fafc;">visibility</strong> — 완료 도장을 본 직원은 도장 전에 적힌 내용도 최신 상태로 보게 한다. mutex나 release/acquire가 네 계약을 연결한다.</p>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: source 한 줄에서 다른 CPU의 관찰까지</h2>
+          <div style="overflow:auto;padding:16px;background:#06101d;border:1px solid #29465d;border-radius:10px;">
+            <pre style="margin:0;color:#c4f1f9;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;">Thread A source                 Thread B source
+data = 42;                     if (ready) use(data);
+ready = true;
+      │                               │
+      ▼                               ▼
+language memory model          language memory model
+ sequenced-before              synchronization?
+ atomic / mutex contract       happens-before edge?
+      │                               │
+      ▼                               ▼
+compiler optimizer ── reorder / eliminate / cache in register
+      │
+      ▼
+machine instructions
+ load · store · atomic RMW · fence · lock instruction
+      │
+      ▼
+CPU core A                    CPU core B
+ store buffer / cache   ◄──coherence protocol──► cache / speculation
+      │                               │
+      └──── release  ───────── acquire ┘
+             matched synchronization
+                       │
+                       ▼
+          data write happens-before data read
+
+계약이 없으면: stale read·reordered observation·lost update,
+C/C++ plain conflicting access라면 data race → undefined behavior</pre>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. <code style="color:#fbbf24;">counter++</code>를 분해하면 lost update가 보인다</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:14px;">
+            <tr><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">순서</td><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">Thread A</td><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">Thread B</td><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">counter</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">1</td><td style="padding:8px;border:1px solid #29465d;">load 0</td><td style="padding:8px;border:1px solid #29465d;">—</td><td style="padding:8px;border:1px solid #29465d;">0</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">2</td><td style="padding:8px;border:1px solid #29465d;">—</td><td style="padding:8px;border:1px solid #29465d;">load 0</td><td style="padding:8px;border:1px solid #29465d;">0</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">3</td><td style="padding:8px;border:1px solid #29465d;">add→1, store 1</td><td style="padding:8px;border:1px solid #29465d;">—</td><td style="padding:8px;border:1px solid #29465d;">1</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">4</td><td style="padding:8px;border:1px solid #29465d;">—</td><td style="padding:8px;border:1px solid #29465d;">add→1, store 1</td><td style="padding:8px;border:1px solid #29465d;">1</td></tr>
+          </table>
+          <p style="margin:10px 0 0;">각 load/store가 자연 정렬되어 찢어지지 않더라도 전체 read-modify-write는 atomic하지 않다. 두 번 increment했는데 최종 1인 lost update가 생긴다. 해결은 invariant 범위에 맞춘 mutex 또는 atomic fetch-add이지 <code style="color:#fbbf24;">volatile</code>이 아니다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. CS·compiler·CPU deep dive</h2>
+          <h3 style="margin:16px 0 8px;color:#f8fafc;font-size:17px;">5.1 race condition과 data race는 같은 말이 아니다</h3>
+          <p style="margin:0 0 9px;">모든 data race는 위험한 race condition이지만 모든 race condition이 data race는 아니다. 두 thread가 mutex로 안전하게 “재고 확인→lock 해제→결제→다시 lock”을 수행해도 check와 act 사이 재고가 바뀌면 TOCTOU 논리 race가 생긴다.</p>
+          <p style="margin:0;">반대로 여러 thread가 서로 다른 array element를 접근하면 실제로 동시에 실행돼도 conflicting location이 아니므로 data race가 아닐 수 있다. correctness는 공유 invariant의 경계를 기준으로 판단한다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.2 atomic은 세 층의 의미가 다르다</h3>
+          <p style="margin:0 0 9px;"><strong style="color:#f8fafc;">language atomic</strong>은 C++ memory model이 data-race-free access와 memory-order semantics를 정의한다. <strong style="color:#f8fafc;">ISA atomic RMW</strong>는 cache coherence와 exclusive ownership을 이용해 indivisible update를 구현한다. <strong style="color:#f8fafc;">business transaction</strong>은 여러 field/resource invariant를 묶는다.</p>
+          <p style="margin:0;">atomic counter 두 개는 각각 찢어지지 않지만 “debit와 credit 합계가 일정”이라는 두-variable invariant를 자동으로 보장하지 않는다. mutex/transaction 또는 검증된 lock-free protocol이 필요하다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.3 compiler와 CPU는 둘 다 reorder할 수 있다</h3>
+          <p style="margin:0 0 9px;">compiler는 single-thread observable behavior를 보존하는 범위에서 load/store를 이동·합치거나 반복 load를 register에 고정할 수 있다. CPU는 store buffer, speculative load, out-of-order execution으로 다른 core가 보는 순서를 바꿀 수 있다.</p>
+          <p style="margin:0;">따라서 source line 순서나 “x86에서는 됐다”는 portable proof가 아니다. language synchronization primitive가 compiler barrier와 필요한 machine ordering을 함께 생성하도록 해야 한다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.4 cache coherence는 visibility ordering 계약이 아니다</h3>
+          <p style="margin:0 0 9px;">coherence는 같은 cache line의 write가 core 사이에서 결국 일관된 순서로 전파되는 기반을 제공한다. 그러나 <code style="color:#fbbf24;">data</code>와 <code style="color:#fbbf24;">ready</code>가 서로 다른 location일 때 ready를 봤다고 data write까지 먼저 보았다는 cross-location order는 자동으로 생기지 않는다.</p>
+          <p style="margin:0;">producer의 release store와 consumer의 acquire load가 같은 atomic flag에서 값을 전달하면 release 이전 write가 acquire 이후 read에 happens-before한다. 이 publication pattern이 visibility와 ordering을 연결한다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.5 memory order별 최소 계약</h3>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:13px;">
+            <tr><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">relaxed</td><td style="padding:8px;border:1px solid #29465d;">해당 atomic object의 atomicity/modification order만 제공. 주변 non-atomic publication order는 만들지 않는다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">release</td><td style="padding:8px;border:1px solid #29465d;">앞선 read/write가 release 뒤로 넘어가지 않게 publication 출구를 만든다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">acquire</td><td style="padding:8px;border:1px solid #29465d;">뒤의 read/write가 acquire 앞으로 넘어가지 않게 publication 입구를 만든다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">acq_rel</td><td style="padding:8px;border:1px solid #29465d;">read-modify-write가 acquire와 release 양쪽 역할을 한다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">seq_cst</td><td style="padding:8px;border:1px solid #29465d;">sequentially consistent atomic operation에 하나의 total order를 추가한다. 이해는 쉽지만 모든 business invariant를 보장하지는 않는다.</td></tr>
+          </table>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.6 mutex는 mutual exclusion만이 아니다</h3>
+          <p style="margin:0 0 9px;">mutex unlock은 critical section의 write를 release하고, 이후 성공한 lock은 acquire해 그 write를 보게 한다. 그래서 mutex는 동시에 한 thread만 진입시키는 atomicity와 critical section 사이 ordering/visibility를 함께 제공한다.</p>
+          <p style="margin:0;">하지만 보호 대상을 문서화하지 않거나 같은 field를 다른 lock/무lock 경로로 접근하면 happens-before graph가 끊긴다. “대부분 lock을 쓴다”는 안전 계약이 아니다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.7 volatile은 thread synchronization이 아니다</h3>
+          <p style="margin:0 0 9px;">C/C++의 volatile은 주로 memory-mapped I/O나 signal 같은 특별한 access 최적화 제어에 쓰이며 일반 shared-memory atomicity나 inter-thread happens-before를 제공하지 않는다. volatile counter++도 lost update다.</p>
+          <p style="margin:0;">Linux kernel의 READ_ONCE/WRITE_ONCE도 compiler의 특정 변형과 tearing을 제한하는 도구이지, 그 자체가 일반적인 full ordering 또는 복합 invariant protection은 아니다. 필요한 barrier pairing과 protocol을 함께 써야 한다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. 실무 best practice</h2>
+          <ol style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">invariant부터 문장으로 쓴다.</strong> 변수 목록이 아니라 함께 바뀌어야 할 상태와 허용 가능한 중간 상태를 정의한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">ownership을 우선한다.</strong> 가능하면 shared mutable state를 한 thread/actor가 소유하고 message passing으로 변경 요청을 전달한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">mutex를 기본값으로 둔다.</strong> 측정된 contention과 lock-free 전문성이 없으면 acquire/release를 직접 조합하지 않는다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">lock scope와 order를 문서화한다.</strong> 어떤 field를 보호하는지, callback/I/O를 lock 안에서 호출 가능한지, 여러 lock의 전역 순서를 명시한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">atomic은 protocol로 review한다.</strong> 각 operation의 memory order와 짝, lifetime, ABA/reclamation까지 happens-before graph로 설명한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">TSan+stress+model test를 병행한다.</strong> detector 한 번 통과를 proof로 여기지 않고 race-heavy schedule, invariant assertion, production telemetry를 둔다.</li>
+            <li><strong style="color:#f8fafc;">실패는 fail closed한다.</strong> invariant violation 감지 시 손상된 state를 계속 서비스하지 말고 fencing, retry idempotency, repair/reconciliation 경로를 사용한다.</li>
+          </ol>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. error handling과 운영 대응</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:14px;">
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;width:31%;">TSan race report</td><td style="padding:9px;border:1px solid #29465d;">두 stack과 allocation/lifetime을 보존한다. 단순 suppress 전에 동일 memory가 의도적으로 공유되는지, 보호 lock/atomic edge가 무엇인지 review한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">재현 안 됨</td><td style="padding:9px;border:1px solid #29465d;">정상으로 결론 내리지 않는다. CPU 수, optimization, seed, load, affinity를 바꾸고 schedule point와 invariant log를 추가한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">counter mismatch</td><td style="padding:9px;border:1px solid #29465d;">중복/유실 operation ID를 대조하고 write를 fencing한다. retry가 손상을 키우지 않도록 idempotency key를 확인한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">mutex EDEADLK</td><td style="padding:9px;border:1px solid #29465d;">error-checking mutex에서 self-deadlock을 탐지한 것일 수 있다. 무시하고 진행하지 말고 ownership/recursive design을 수정한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">robust mutex EOWNERDEAD</td><td style="padding:9px;border:1px solid #29465d;">이전 owner가 state 변경 중 죽었다. invariant를 복구한 뒤 pthread_mutex_consistent를 호출하거나 unrecoverable로 표시한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">atomic spin 무한 대기</td><td style="padding:9px;border:1px solid #29465d;">timeout/cancellation/owner lifetime을 확인한다. ordering 강화만으로 liveness가 해결되지 않으며 blocking primitive나 backoff로 전환한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">partial publication</td><td style="padding:9px;border:1px solid #29465d;">reader를 차단하고 version/generation을 확인한다. immutable object를 완성한 뒤 release로 pointer를 publish하는 패턴으로 교체한다.</td></tr>
+          </table>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. 놓치기 쉬운 함정</h2>
+          <ul style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:7px;">single-core에서 테스트가 통과했다고 data-race-free인 것은 아니다. compiler reorder와 preemption은 남는다.</li>
+            <li style="margin-bottom:7px;">정렬된 64-bit load/store가 atomic하더라도 <code style="color:#fbbf24;">x++</code> 전체가 atomic이라고 결론 내리지 않는다.</li>
+            <li style="margin-bottom:7px;">volatile을 mutex/atomic 대용으로 사용하지 않는다.</li>
+            <li style="margin-bottom:7px;">atomic flag가 있다고 payload publication까지 자동 안전하다고 생각하지 않는다. release/acquire 짝을 확인한다.</li>
+            <li style="margin-bottom:7px;">모든 operation을 seq_cst로 바꾸면 복합 invariant와 lifetime bug도 해결된다고 믿지 않는다.</li>
+            <li style="margin-bottom:7px;">TSan이 report하지 않았다는 사실을 race 부재의 수학적 proof로 사용하지 않는다.</li>
+            <li style="margin-bottom:7px;">lock-free를 wait-free로 오해하지 않는다. system 전체 progress와 각 thread progress 보장은 다르다.</li>
+            <li>race fix 뒤 performance만 보고 끝내지 않는다. deadlock, starvation, priority inversion이라는 새 failure mode를 검증한다.</li>
+          </ul>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. 30분 실습: 모든 interleaving을 탐색해 lost update 증명</h2>
+          <p style="margin:0 0 10px;color:#a7c7da;">실행 운에 기대지 않고 두 thread의 <code style="color:#fbbf24;">load→add→store</code> 가능한 순서를 모두 탐색한다. 그다음 atomic fetch-add를 한 단계로 모델링해 invariant 차이를 비교한다.</p>
+          <pre style="margin:0;padding:14px;background:#06101d;border:1px solid #29465d;border-radius:10px;color:#d1fae5;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;">LAB_DIR=$(mktemp -d)
+python3 - "$LAB_DIR/result.txt" &lt;&lt;'PY'
+from collections import defaultdict
+import sys
+
+ops = ("load", "add", "store")
+results, examples = defaultdict(int), {}
+
+def walk(pc, local, counter, trace):
+    if pc == [3, 3]:
+        results[counter] += 1
+        examples.setdefault(counter, trace)
+        return
+    for tid in (0, 1):
+        if pc[tid] == 3:
+            continue
+        n_pc, n_local = pc[:], local[:]
+        op = ops[pc[tid]]
+        n_pc[tid] += 1
+        n_counter = counter
+        if op == "load": n_local[tid] = counter
+        elif op == "add": n_local[tid] += 1
+        else: n_counter = n_local[tid]
+        walk(n_pc, n_local, n_counter, trace + [f"T{tid}.{op}"])
+
+walk([0, 0], [None, None], 0, [])
+with open(sys.argv[1], "w") as f:
+    f.write("plain read-modify-write outcomes\n")
+    for value in sorted(results):
+        f.write(f"counter={value} schedules={results[value]} "
+                f"example={' -> '.join(examples[value])}\n")
+    f.write("atomic fetch_add outcomes\n")
+    # 각 increment가 한 step이면 가능한 두 순서 모두 최종 2
+    f.write("counter=2 schedules=2 examples=T0.fetch_add->T1.fetch_add | "
+            "T1.fetch_add->T0.fetch_add\n")
+PY
+sed -n '1,10p' "$LAB_DIR/result.txt"
+rm -rf -- "$LAB_DIR"</pre>
+          <p style="margin:10px 0 0;"><strong style="color:#f8fafc;">관찰:</strong> plain RMW는 최종 1과 2가 모두 가능하다. atomic fetch-add 모델은 실행 순서는 두 개여도 최종 counter=2 invariant를 지킨다. atomicity가 nondeterminism 자체를 없애는 것이 아니라 허용 결과를 제한한다.</p>
+          <p style="margin:8px 0 0;color:#a7c7da;font-size:14px;"><strong style="color:#f8fafc;">확장:</strong> producer의 <code style="color:#fbbf24;">data=42→ready=true</code>와 consumer의 <code style="color:#fbbf24;">ready→data</code>를 state machine에 추가한다. ready를 atomic relaxed로만 바꾼 경우와 release/acquire edge를 둔 경우의 허용 state를 구분해 그린다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. production 실패 시나리오</h2>
+          <div style="padding:15px;background:#241528;border:1px solid #7f1d4d;border-radius:9px;">
+            <p style="margin:0 0 8px;"><strong style="color:#f9a8d4;">상황:</strong> config object를 채운 뒤 global <code style="color:#f9a8d4;">ready</code> boolean을 true로 바꾼다. 개발 환경에서는 정상인데 ARM production에서 드물게 reader가 ready=true와 빈 endpoint를 함께 본다.</p>
+            <p style="margin:0 0 8px;"><strong style="color:#f9a8d4;">오진:</strong> ready에 volatile을 붙이면 cache에서 즉시 보일 것이라 생각했다. atomicity와 cross-location ordering/happens-before가 없었다.</p>
+            <p style="margin:0 0 8px;"><strong style="color:#f9a8d4;">증거:</strong> TSan report, publish/read stack, object generation, architecture·compiler flags와 impossible-state counter를 수집한다. data race가 있는 C++ 실행의 값만 사후 추론하지 않는다.</p>
+            <p style="margin:0;"><strong style="color:#f9a8d4;">대응:</strong> immutable config를 완성한 뒤 mutex로 pointer를 교체하거나 release store/acquire load로 lifetime까지 보장된 pointer를 publish한다. bad generation을 격리하고 canary에서 stress+TSan을 release gate로 둔다.</p>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. 대기업 면접 질문 3개</h2>
+          <p style="margin:0 0 10px;"><strong style="color:#f8fafc;">Q1. race condition과 data race 차이를 설명하세요.</strong><br>답변 포인트: race condition은 timing-dependent logical correctness bug의 상위 개념이다. data race는 conflicting memory access, 하나 이상 write, happens-before 부재라는 memory-model 조건이며 C/C++에서는 UB다. mutex를 써도 check-then-act TOCTOU race는 남을 수 있다.</p>
+          <p style="margin:0 0 10px;"><strong style="color:#f8fafc;">Q2. cache coherence가 있는데 왜 memory barrier가 필요합니까?</strong><br>답변 포인트: coherence는 같은 location의 일관성 기반이지 서로 다른 location 사이 publication order가 아니다. compiler/CPU reorder와 store buffer가 있다. release/acquire가 data write→flag→reader의 happens-before를 만든다.</p>
+          <p style="margin:0;"><strong style="color:#f8fafc;">Q3. atomic counter로 바꾸면 thread-safe해집니까?</strong><br>답변 포인트: 해당 counter RMW의 atomicity/data race는 해결한다. 그러나 여러 field invariant, check-then-act, object lifetime, ordering은 별도다. invariant 범위, memory order, progress/reclamation과 실패 모드를 설명해야 한다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 퀴즈·누적 리뷰</h2>
+          <ol style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:6px;"><code style="color:#fbbf24;">x++</code>를 세 단계로 분해하고 lost update interleaving을 말하라.</li>
+            <li style="margin-bottom:6px;">mutex가 atomicity 외에 ordering/visibility를 제공하는 이유는?</li>
+            <li style="margin-bottom:6px;">atomic relaxed가 적합한 예와 publication에 부족한 이유는?</li>
+            <li style="margin-bottom:6px;">coherence와 happens-before는 무엇이 다른가?</li>
+            <li style="margin-bottom:6px;">data race가 없는 TOCTOU race 예를 하나 들어라.</li>
+            <li style="margin-bottom:6px;">Day 10 복습: preemption이 interleaving 가능성을 늘리지만 data race의 근본 원인은 scheduler인가?</li>
+            <li>Day 11 복습: multicore가 visibility/order 문제를 더 잘 드러내는 hardware 이유는?</li>
+          </ol>
+          <p style="margin:11px 0 0;color:#a7c7da;font-size:14px;">정답 핵심: scheduler는 bug를 드러내는 schedule을 고를 뿐, synchronization 계약 부재가 근본 원인이다. correctness는 “이 실행에서 맞았다”가 아니라 모든 허용 실행에서 invariant가 유지됨을 보여야 한다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 다음 날 연결</h2>
+          <p style="margin:0;">Day 16에서는 mutex, semaphore, condition variable을 비교한다. 각각 <strong style="color:#f8fafc;">ownership·permit count·state predicate 대기</strong> 중 무엇을 표현하는지, spurious wakeup과 while-loop predicate, timeout/error handling까지 이어간다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 공식·1차 출처</h2>
+          <ul style="margin:0;padding-left:22px;color:#a7c7da;">
+            <li><a href="https://eel.is/c++draft/intro.races" style="color:#67e8f9;">C++ working draft — [intro.races]</a>: conflicting actions, data race, happens-before와 undefined behavior</li>
+            <li><a href="https://eel.is/c++draft/atomics.order" style="color:#67e8f9;">C++ working draft — [atomics.order]</a>: relaxed/acquire/release/seq_cst ordering</li>
+            <li><a href="https://docs.kernel.org/core-api/wrappers/memory-barriers.html" style="color:#67e8f9;">Linux kernel docs — Memory Barriers</a>: compiler/CPU reorder, cache, acquire/release와 barrier pairing</li>
+            <li><a href="https://docs.kernel.org/core-api/wrappers/atomic_t.html" style="color:#67e8f9;">Linux kernel docs — Atomic Types</a>: atomic RMW API와 ordering variants</li>
+            <li><a href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/pthread_mutex_lock.html" style="color:#67e8f9;">POSIX.1-2024 — pthread_mutex_lock/unlock</a>: mutex ownership, error-checking/robust mutex 오류</li>
+            <li><a href="https://gcc.gnu.org/onlinedocs/gcc/Instrumentation-Options.html" style="color:#67e8f9;">GCC docs — Instrumentation Options</a>: <code style="color:#fbbf24;">-fsanitize=thread</code>와 제한사항</li>
+          </ul>
+        </td></tr>
+        <tr><td style="padding:18px 28px;background:#081522;border-top:1px solid #1e3a4c;color:#7fa4ba;font-size:12px;">Operating System 심화 커리큘럼 · Week 3 Concurrency and Synchronization</td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>

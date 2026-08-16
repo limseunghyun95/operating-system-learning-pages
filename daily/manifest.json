@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-08-15T09:00:17+09:00",
+  "updatedAt": "2026-08-16T09:00:24+09:00",
   "lessons": [
     {
       "day": 1,
@@ -131,6 +131,15 @@
       "path": "day-14.html",
       "kind": "review",
       "publishedAt": "2026-08-15T09:00:17+09:00"
+    },
+    {
+      "day": 15,
+      "week": 3,
+      "title": "race condition, atomicity, ordering, visibility",
+      "summary": "race condition과 data race를 구분하고 x++ lost update에서 compiler·CPU reorder, cache coherence, happens-before, mutex와 atomic memory order까지 invariant 중심으로 연결합니다.",
+      "path": "day-15.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-16T09:00:24+09:00"
     }
   ]
 }
