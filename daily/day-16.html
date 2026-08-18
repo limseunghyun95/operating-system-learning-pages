@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operating System 심화 커리큘럼 Day 16 - mutex, semaphore, condition variable</title>
+</head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.68;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#07111f;">
+    <tr><td align="center" style="padding:20px 10px 44px;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#0b1728;border:1px solid #1e3a4c;border-radius:18px;overflow:hidden;">
+        <tr><td style="padding:30px 28px;background:#102438;border-bottom:1px solid #1e3a4c;">
+          <div style="font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:#5eead4;font-weight:800;">Operating System · Day 16 / 63 · Concurrency</div>
+          <h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">mutex, semaphore, condition variable</h1>
+          <p style="margin:0;color:#a5f3fc;font-size:16px;">한 줄 요약 — <strong style="color:#f8fafc;">mutex는 한 소유자의 임계 구역, semaphore는 N개의 permit, condition variable은 mutex로 보호된 predicate가 참이 될 때까지의 대기</strong>를 표현한다. 정확한 선택은 API 이름이 아니라 보호할 invariant와 wakeup 뒤 재검사 계약에서 시작한다.</p>
+        </td></tr>
+        <tr><td style="padding:26px 28px;">
+          <h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:14px;">
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;width:31%;">synchronization</td><td style="padding:9px;border:1px solid #29465d;">여러 thread가 공유 상태를 안전한 순서로 관찰·변경하도록 만드는 규칙과 도구.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">mutex</td><td style="padding:9px;border:1px solid #29465d;">mutual exclusion lock. 성공적으로 잠근 한 thread가 소유자가 되고 그 소유자가 해제한다. 임계 구역의 invariant와 memory visibility를 보호한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">semaphore</td><td style="padding:9px;border:1px solid #29465d;">0 이상의 permit 개수를 관리하는 동기화 객체. wait는 하나를 얻어 감소시키고, post는 반환해 증가시킨다. mutex와 달리 소유자 개념이 없다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">condition variable</td><td style="padding:9px;border:1px solid #29465d;">공유 상태의 어떤 조건(predicate)이 참이 되기를 기다리는 rendezvous 지점. 상태 자체를 저장하지 않으며 반드시 mutex와 predicate를 함께 쓴다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">permit</td><td style="padding:9px;border:1px solid #29465d;">semaphore가 표현하는 사용 가능 수량. 예: DB connection 20개라면 초기 permit 20.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">predicate</td><td style="padding:9px;border:1px solid #29465d;">mutex 아래서 평가하는 참/거짓 상태식. 예: <code style="color:#fbbf24;">queue_size &gt; 0 || closed</code>.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">critical section</td><td style="padding:9px;border:1px solid #29465d;">공유 invariant를 읽고 바꾸는 동안 다른 실행자가 동시에 들어오면 안 되는 코드 영역.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">spurious wakeup</td><td style="padding:9px;border:1px solid #29465d;">기다리던 predicate가 참이라는 보장 없이 condition wait가 돌아올 수 있는 현상. 경쟁자가 먼저 상태를 소비한 경우까지 포함해 실무에서는 항상 재검사한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">lost wakeup</td><td style="padding:9px;border:1px solid #29465d;">대기 시작과 상태 변경 사이의 틈 때문에 wake signal을 놓치고 영원히 자는 버그. 같은 mutex 아래 predicate 변경과 atomic unlock-and-wait로 막는다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">futex</td><td style="padding:9px;border:1px solid #29465d;">fast userspace mutex의 기반이 되는 Linux 저수준 인터페이스. 평상시 user-space atomic으로 해결하고 실제로 재워야 할 때 kernel에 wait/wake를 요청한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">priority inversion</td><td style="padding:9px;border:1px solid #29465d;">높은 priority thread가 lock을 가진 낮은 priority thread 때문에 막히고, 중간 priority가 낮은 thread의 실행까지 빼앗는 역전 현상.</td></tr>
+          </table>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 열쇠, 입장권, 초인종</h2>
+          <div style="padding:16px;background:#0f2035;border-left:4px solid #5eead4;border-radius:8px;">
+            <p style="margin:0 0 9px;"><strong style="color:#f8fafc;">mutex = 한 명에게 귀속되는 열쇠.</strong> 장부 invariant를 수정하는 동안 소유자가 열쇠를 가진다. 다른 사람이 대신 unlock하면 계약 위반이다.</p>
+            <p style="margin:0 0 9px;"><strong style="color:#f8fafc;">semaphore = 수량이 남는 입장권.</strong> 누가 반납하는지는 중요하지 않고 전체 수량이 중요하다. API 호출이 한 번 빠지거나 중복되면 실제 resource 수와 permit가 어긋난다.</p>
+            <p style="margin:0;"><strong style="color:#f8fafc;">condition variable = 기억하지 않는 초인종.</strong> 초인종 소리가 상태가 아니다. 문을 열고 “queue가 비지 않았는가?”라는 predicate를 다시 봐야 한다.</p>
+          </div>
+          <p style="margin:12px 0 0;">면접에서 가장 강한 답은 “binary semaphore와 mutex가 둘 다 0/1처럼 보인다”가 아니라 <strong style="color:#f8fafc;">ownership, protected invariant, stored count, wait predicate가 서로 다른 추상화</strong>임을 설명하는 것이다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. 선택 표: 무엇을 모델링하는가</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:13px;">
+            <tr><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">도구</td><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">저장하는 의미</td><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">전형적 용도</td><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">핵심 함정</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;color:#5eead4;font-weight:700;">mutex</td><td style="padding:8px;border:1px solid #29465d;">locked + owner</td><td style="padding:8px;border:1px solid #29465d;">복합 shared invariant</td><td style="padding:8px;border:1px solid #29465d;">긴 I/O·callback 동안 보유</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;color:#5eead4;font-weight:700;">semaphore</td><td style="padding:8px;border:1px solid #29465d;">permit count</td><td style="padding:8px;border:1px solid #29465d;">N개 resource·backpressure</td><td style="padding:8px;border:1px solid #29465d;">누락/중복 post로 count drift</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;color:#5eead4;font-weight:700;">condition</td><td style="padding:8px;border:1px solid #29465d;">상태 저장 안 함</td><td style="padding:8px;border:1px solid #29465d;">복잡한 predicate 대기</td><td style="padding:8px;border:1px solid #29465d;"><code style="color:#fbbf24;">if</code> 대기·mutex 불일치</td></tr>
+          </table>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. architecture: predicate에서 kernel sleep까지</h2>
+          <div style="overflow:auto;padding:16px;background:#06101d;border:1px solid #29465d;border-radius:10px;">
+            <pre style="margin:0;color:#c4f1f9;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;">Application invariant
+ queue_empty? / permits==0? / lock busy?
+          │
+          ▼
+pthread / semaphore abstraction
+ mutex · condvar · sem_wait
+          │
+          ▼
+user-space atomic fast path ──success──► critical section
+ load / CAS / counter decrement             │
+          │ contention                      └─ release + wake if needed
+          ▼
+futex WAIT(expected value) / WAKE       [Linux implementation]
+ compare-and-block is atomic relative to same futex word
+          │
+          ▼
+kernel futex hash bucket → wait queue → scheduler blocks task
+          ▲                                      │
+          └──────── wake / timeout / signal ─────┘
+          │
+          ▼
+reacquire mutex / retry atomic / recheck predicate in while
+
+API 계약과 구현 경계:
+POSIX가 ownership·wait semantics를 정의하고,
+futex는 glibc 등이 그 계약을 효율적으로 구현하는 Linux mechanism이다.</pre>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. condition variable 상태 전이: 왜 <code style="color:#fbbf24;">while</code>인가</h2>
+          <div style="overflow:auto;padding:16px;background:#06101d;border:1px solid #29465d;border-radius:10px;">
+            <pre style="margin:0;color:#c4f1f9;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;">Consumer                                  Producer
+lock(m)
+while (!predicate) {
+  cond_wait(cv, m)
+  ├─ atomically: unlock(m) + enqueue sleep
+  └────────────── BLOCKED                 lock(m)
+                                         mutate state
+                                         predicate = true
+                                         signal(cv)
+                                         unlock(m)
+  ◄────────────── WOKEN / RUNNABLE
+  reacquire(m) ── may compete with other consumers
+  recheck predicate
+}
+consume state while holding m
+unlock(m)
+
+WAITING → RUNNABLE은 “조건 참”이 아니라 “다시 확인할 기회”다.
+signal은 상태를 저장하지 않고, Mesa-style waiter는 mutex를 다시 경쟁한다.</pre>
+          </div>
+          <p style="margin:11px 0 0;"><code style="color:#fbbf24;">if</code>를 쓰면 깨어난 consumer보다 다른 consumer가 먼저 item을 가져간 뒤 빈 queue를 소비할 수 있다. <code style="color:#fbbf24;">while</code>은 spurious wakeup, broadcast, 경쟁자 선점, timeout을 한 규칙으로 안전하게 처리한다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. CS·kernel·hardware deep dive</h2>
+          <h3 style="margin:16px 0 8px;color:#f8fafc;font-size:17px;">6.1 mutex는 exclusion과 happens-before를 함께 준다</h3>
+          <p style="margin:0 0 9px;">성공한 lock은 acquire, unlock은 release 성격을 가져 이전 소유자의 critical-section write를 다음 소유자가 보게 한다. 따라서 mutex는 단지 동시에 한 명만 통과시키는 문이 아니라 memory-ordering 계약이다.</p>
+          <p style="margin:0;">보호 단위는 변수 하나가 아니라 invariant다. <code style="color:#fbbf24;">head</code>, <code style="color:#fbbf24;">tail</code>, <code style="color:#fbbf24;">size</code>가 함께 queue 상태를 구성한다면 동일 mutex 아래 함께 바뀌어야 한다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">6.2 semaphore는 ownership 없는 accounting이다</h3>
+          <p style="margin:0 0 9px;"><code style="color:#fbbf24;">sem_wait</code>는 count가 양수면 하나 감소하고 즉시 성공하며, 0이면 permit가 생길 때까지 막힌다. <code style="color:#fbbf24;">sem_post</code>는 count를 늘리고 waiter를 깨울 수 있다. producer가 post하고 consumer가 wait하는 것이 정상이라 소유자 일치가 없다.</p>
+          <p style="margin:0;">초기값 1인 binary semaphore도 mutual exclusion처럼 보이지만 owner validation, priority inheritance, robust-owner-death 같은 mutex semantics를 자동으로 갖지 않는다. resource pool과 bounded concurrency에는 semaphore, 구조체 invariant에는 보통 mutex가 명확하다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">6.3 condition variable의 원자적 unlock-and-wait</h3>
+          <p style="margin:0 0 9px;">naive하게 “mutex unlock → sleep 등록”을 두 단계로 하면 그 사이 producer가 상태를 바꾸고 signal한 뒤 지나갈 수 있다. consumer는 이미 온 signal을 놓치고 영원히 잔다.</p>
+          <p style="margin:0;">POSIX condition wait는 caller가 mutex를 가진 상태에서 mutex 해제와 대기 진입을 다른 mutex 사용자에 대해 원자적으로 보이게 하고, 반환 전 mutex를 다시 획득한다. producer도 같은 mutex 아래 predicate를 변경하면 상태 확인과 변경 사이의 gap이 닫힌다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">6.4 futex fast path와 compare-and-block</h3>
+          <p style="margin:0 0 9px;">uncontended mutex는 cache line의 atomic compare-and-swap만으로 끝날 수 있어 syscall이 없다. 실패해 실제 sleep이 필요할 때 library가 futex word의 예상값과 함께 <code style="color:#fbbf24;">FUTEX_WAIT</code>를 호출한다.</p>
+          <p style="margin:0;">kernel은 값이 여전히 예상값일 때만 wait queue에 넣는다. load·compare·block이 같은 futex word의 동시 operation과 원자적으로 정렬되므로, 값이 이미 바뀌었다면 sleep하지 않고 재시도한다. 이 compare-and-block이 lost wake 방지의 저수준 연결 고리다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">6.5 contention은 cache와 scheduler 비용을 함께 만든다</h3>
+          <p style="margin:0 0 9px;">짧은 경쟁은 lock cache line ownership의 core 간 이동과 atomic RMW 비용을 만든다. 긴 경쟁은 futex syscall, task enqueue/dequeue, context switch, cache working-set 손실까지 이어진다. 그래서 평균 lock hold time만 보고 충분하지 않다.</p>
+          <p style="margin:0;">지표는 wait time p95/p99, hold time, contention ratio, waiter 수, timeout, CPU와 run-queue pressure를 함께 본다. lock을 잘게 쪼개면 parallelism은 늘지만 invariant와 deadlock graph가 복잡해지는 trade-off가 있다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">6.6 priority inversion, PI, robust mutex</h3>
+          <p style="margin:0 0 9px;">deadline/real-time 경로는 priority inheritance(PI) mutex를 검토한다. 높은 priority waiter가 막히면 lock owner의 effective priority를 잠시 올려 critical section을 마치게 한다. 일반 mutex의 fairness나 깨우는 순서는 portable하게 가정하지 않는다.</p>
+          <p style="margin:0;">robust mutex에서 owner가 죽으면 다음 locker가 <code style="color:#fbbf24;">EOWNERDEAD</code>와 함께 mutex를 획득할 수 있다. 이는 성공이 아니라 “보호 상태가 불일치할 수 있으니 repair 후 <code style="color:#fbbf24;">pthread_mutex_consistent</code>를 호출하라”는 복구 트랜잭션이다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. 실무 best practice</h2>
+          <ol style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">primitive보다 invariant를 먼저 쓴다.</strong> 보호 상태, owner, permit 단위, predicate, 종료 조건을 코드 옆 문서와 assertion으로 남긴다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">condition wait는 항상 while(predicate false).</strong> wait 반환값을 처리한 뒤에도 mutex를 가진 채 predicate를 다시 평가한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">predicate 변경은 같은 mutex 아래서 한다.</strong> signal 자체보다 state transition이 진짜 사건이다. 일관된 규칙은 lost wake와 memory visibility 논쟁을 줄인다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">signal과 broadcast를 의도로 선택한다.</strong> item 하나면 보통 signal, global shutdown이나 여러 predicate가 모두 바뀌면 broadcast. broadcast의 thundering herd 비용을 측정한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">lock 안에서 blocking I/O와 외부 callback을 피한다.</strong> 필요한 snapshot만 복사하고 unlock한 뒤 호출한다. callback 재진입과 lock-order inversion을 차단한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">timeout은 하나의 absolute deadline으로 전파한다.</strong> 단계마다 새 timeout을 주면 총 대기 시간이 증폭된다. condition clock 설정과 wall-clock jump도 확인한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">semaphore permit를 resource lifecycle에 묶는다.</strong> acquire 성공 뒤 모든 return/error/cancel 경로에서 정확히 한 번 release하도록 scope guard/cleanup handler를 둔다.</li>
+            <li><strong style="color:#f8fafc;">shutdown을 predicate에 포함한다.</strong> <code style="color:#fbbf24;">queue_nonempty || closed</code>처럼 wait가 종료될 조건을 만들고 close 때 broadcast한 뒤 waiter가 빠진 것을 확인하고 destroy한다.</li>
+          </ol>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. error handling 매트릭스</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:13px;">
+            <tr><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;width:25%;">오류/상황</td><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">해석과 대응</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;"><code style="color:#fbbf24;">EDEADLK</code></td><td style="padding:8px;border:1px solid #29465d;">error-check mutex의 self-lock 또는 검출된 deadlock. retry하지 말고 lock graph와 recursive 필요성을 수정한다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;"><code style="color:#fbbf24;">EPERM</code></td><td style="padding:8px;border:1px solid #29465d;">소유하지 않은 mutex unlock 등 ownership 위반. programming error로 fail fast하고 호출 stack을 보존한다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;"><code style="color:#fbbf24;">EOWNERDEAD</code></td><td style="padding:8px;border:1px solid #29465d;">robust owner 사망. mutex는 획득했지만 state를 검증·복구하고 consistent 처리한다. 복구 불가면 서비스 격리.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;"><code style="color:#fbbf24;">ENOTRECOVERABLE</code></td><td style="padding:8px;border:1px solid #29465d;">이전 복구자가 일관성을 회복하지 못했다. 객체 재초기화가 안전한 lifecycle인지 확인하고 상위 state를 복원한다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;"><code style="color:#fbbf24;">EAGAIN</code></td><td style="padding:8px;border:1px solid #29465d;"><code style="color:#fbbf24;">sem_trywait</code>에 permit 없음. busy loop 대신 queue/backoff/drop 정책을 적용한다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;"><code style="color:#fbbf24;">EINTR</code></td><td style="padding:8px;border:1px solid #29465d;"><code style="color:#fbbf24;">sem_wait</code>가 signal에 중단될 수 있다. 같은 deadline과 cancellation 정책 아래 재시도한다. pthread mutex/condition API를 무조건 같은 방식으로 취급하지 않는다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;"><code style="color:#fbbf24;">ETIMEDOUT</code></td><td style="padding:8px;border:1px solid #29465d;">deadline 만료. condition wait는 mutex를 다시 획득한 상태로 돌아오므로 predicate를 재검사하고 timeout/cancel/success 경쟁을 결정한다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;"><code style="color:#fbbf24;">EOVERFLOW</code></td><td style="padding:8px;border:1px solid #29465d;"><code style="color:#fbbf24;">sem_post</code>가 최대값을 넘음. 중복 release나 accounting corruption으로 보고 즉시 조사한다.</td></tr>
+          </table>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. 놓치기 쉬운 함정</h2>
+          <ul style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:7px;">binary semaphore를 mutex처럼 쓰며 다른 thread가 unlock해도 된다고 착각한다.</li>
+            <li style="margin-bottom:7px;">condition variable에 event가 저장된다고 생각해 predicate 없이 wait/signal만 사용한다.</li>
+            <li style="margin-bottom:7px;"><code style="color:#fbbf24;">if</code>로 wait해 spurious wake나 다른 consumer의 선점 뒤 invalid state를 소비한다.</li>
+            <li style="margin-bottom:7px;">predicate를 mutex 밖에서 바꾸거나 서로 다른 mutex로 같은 condition variable을 동시에 기다린다.</li>
+            <li style="margin-bottom:7px;">return code를 무시하고 timeout을 success처럼, owner death를 정상 lock처럼 처리한다.</li>
+            <li style="margin-bottom:7px;">모든 waiter가 빠지기 전에 mutex, semaphore, condition variable을 destroy한다.</li>
+            <li style="margin-bottom:7px;">realtime clock과 monotonic clock을 혼동하거나 단계별 timeout을 더해 SLO를 초과한다.</li>
+            <li style="margin-bottom:7px;">broadcast로 정확성을 덮고 thundering herd와 lock convoy를 만든다.</li>
+            <li>특정 wake 순서나 fairness를 API 계약 없이 믿는다. correctness는 어느 waiter가 먼저 깨도 유지되어야 한다.</li>
+          </ul>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 30분 실습: noisy wakeup에도 안전한 bounded queue</h2>
+          <p style="margin:0 0 10px;">목표: capacity 4 queue에 1..1000을 생산·소비한다. 별도 noise thread가 의미 없이 두 condition을 broadcast해도 <code style="color:#fbbf24;">while</code> predicate 덕분에 정확한 합계 500500을 유지하는지 확인한다.</p>
+          <pre style="margin:0;padding:14px;background:#06101d;border:1px solid #29465d;border-radius:10px;color:#d1fae5;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word;">LAB_DIR=$(mktemp -d)
+trap 'rm -rf "$LAB_DIR"' EXIT
+cat &gt;"$LAB_DIR/lab.c" &lt;&lt;'C'
+#define _POSIX_C_SOURCE 200809L
+#include &lt;pthread.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;time.h&gt;
+
+enum { CAP = 4, N = 1000 };
+typedef struct {
+  int buf[CAP], head, tail, size, closed;
+  long produced, consumed, sum;
+  pthread_mutex_t mu;
+  pthread_cond_t not_empty, not_full;
+} queue_t;
+
+static queue_t q = {
+  .mu = PTHREAD_MUTEX_INITIALIZER,
+  .not_empty = PTHREAD_COND_INITIALIZER,
+  .not_full = PTHREAD_COND_INITIALIZER
+};
+
+static void check(int rc, const char *what) {
+  if (rc != 0) { fprintf(stderr, "%s: %d\n", what, rc); exit(2); }
+}
+
+static void *producer(void *unused) {
+  (void)unused;
+  for (int value = 1; value &lt;= N; value++) {
+    check(pthread_mutex_lock(&amp;q.mu), "producer lock");
+    while (q.size == CAP)
+      check(pthread_cond_wait(&amp;q.not_full, &amp;q.mu), "wait not_full");
+    q.buf[q.tail] = value;
+    q.tail = (q.tail + 1) % CAP;
+    q.size++;
+    q.produced++;
+    check(pthread_cond_signal(&amp;q.not_empty), "signal not_empty");
+    check(pthread_mutex_unlock(&amp;q.mu), "producer unlock");
+  }
+  check(pthread_mutex_lock(&amp;q.mu), "close lock");
+  q.closed = 1;
+  check(pthread_cond_broadcast(&amp;q.not_empty), "close broadcast");
+  check(pthread_mutex_unlock(&amp;q.mu), "close unlock");
+  return NULL;
+}
+
+static void *consumer(void *unused) {
+  (void)unused;
+  for (;;) {
+    check(pthread_mutex_lock(&amp;q.mu), "consumer lock");
+    while (q.size == 0 &amp;&amp; !q.closed)
+      check(pthread_cond_wait(&amp;q.not_empty, &amp;q.mu), "wait not_empty");
+    if (q.size == 0 &amp;&amp; q.closed) {
+      check(pthread_mutex_unlock(&amp;q.mu), "final unlock");
+      return NULL;
+    }
+    int value = q.buf[q.head];
+    q.head = (q.head + 1) % CAP;
+    q.size--;
+    q.consumed++;
+    q.sum += value;
+    check(pthread_cond_signal(&amp;q.not_full), "signal not_full");
+    check(pthread_mutex_unlock(&amp;q.mu), "consumer unlock");
+  }
+}
+
+static void *noise(void *unused) {
+  (void)unused;
+  const struct timespec pause = { .tv_sec = 0, .tv_nsec = 100000 };
+  for (int i = 0; i &lt; 200; i++) {
+    check(pthread_mutex_lock(&amp;q.mu), "noise lock");
+    check(pthread_cond_broadcast(&amp;q.not_empty), "noise empty");
+    check(pthread_cond_broadcast(&amp;q.not_full), "noise full");
+    check(pthread_mutex_unlock(&amp;q.mu), "noise unlock");
+    nanosleep(&amp;pause, NULL);
+  }
+  return NULL;
+}
+
+int main(void) {
+  pthread_t p, c, n;
+  check(pthread_create(&amp;p, NULL, producer, NULL), "create producer");
+  check(pthread_create(&amp;c, NULL, consumer, NULL), "create consumer");
+  check(pthread_create(&amp;n, NULL, noise, NULL), "create noise");
+  check(pthread_join(p, NULL), "join producer");
+  check(pthread_join(c, NULL), "join consumer");
+  check(pthread_join(n, NULL), "join noise");
+  printf("produced=%ld consumed=%ld sum=%ld\n",
+         q.produced, q.consumed, q.sum);
+  return !(q.produced == N &amp;&amp; q.consumed == N &amp;&amp; q.sum == 500500);
+}
+C
+cc -std=c11 -O2 -Wall -Wextra -pthread "$LAB_DIR/lab.c" -o "$LAB_DIR/lab"
+"$LAB_DIR/lab"
+# expected: produced=1000 consumed=1000 sum=500500</pre>
+          <ol style="margin:12px 0 0;padding-left:22px;">
+            <li style="margin-bottom:6px;">10분: 그림과 코드를 대조해 queue invariant(<code style="color:#fbbf24;">0≤size≤CAP</code>)와 각 condition의 predicate를 적는다.</li>
+            <li style="margin-bottom:6px;">10분: 20회 실행해 결과가 항상 같은지 확인한다. noise broadcast가 correctness를 바꾸지 않아야 한다.</li>
+            <li>10분: 두 <code style="color:#fbbf24;">while</code> 중 하나를 <code style="color:#fbbf24;">if</code>로 바꾸고 CAP/N/noise 횟수를 늘려 실패를 관찰한 뒤 원복한다. 재현되지 않아도 잘못된 계약임을 상태 전이로 설명한다.</li>
+          </ol>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. 실패 시나리오: 새벽에 worker가 모두 멈췄다</h2>
+          <div style="padding:16px;background:#261423;border:1px solid #7f1d4e;border-radius:10px;">
+            <p style="margin:0 0 9px;"><strong style="color:#fbcfe8;">증상:</strong> CPU는 낮고 request queue만 증가한다. thread dump에서 worker는 condition wait, producer는 full queue를 기다리고 있다.</p>
+            <p style="margin:0 0 9px;"><strong style="color:#fbcfe8;">잘못된 구현:</strong> consumer가 <code style="color:#fbbf24;">if (empty) wait</code>를 사용하고 cancellation 경로에서 semaphore permit를 반환하지 않았다. shutdown은 flag만 바꾸고 broadcast하지 않았다.</p>
+            <p style="margin:0 0 9px;"><strong style="color:#fbcfe8;">증거 수집:</strong> queue size/permit gauge, acquire·hold·wait histogram, waiter 수, timeout·cancel counter, thread stacks, futex wait 위치, 최근 state transition ID를 같은 timestamp로 묶는다.</p>
+            <p style="margin:0 0 9px;"><strong style="color:#fbcfe8;">즉시 완화:</strong> 신규 유입을 제한하고 안전한 restart로 leaked in-memory state를 재구축한다. live process의 semaphore 값을 임의로 올려 invariant corruption을 숨기지 않는다.</p>
+            <p style="margin:0;"><strong style="color:#fbcfe8;">영구 수정:</strong> predicate while-loop, close+broadcast protocol, scope-bound permit release, absolute deadline, invariant assertion과 cancellation stress test를 추가한다.</p>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 대기업 면접 질문 3개</h2>
+          <ol style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:12px;"><strong style="color:#f8fafc;">“mutex와 binary semaphore는 언제 같고 왜 대체재가 아닌가요?”</strong><br>답변 포인트: 둘 다 동시 진입을 1로 제한할 수 있지만 mutex에는 owner와 unlock discipline, acquire/release, 구현에 따라 PI·robust semantics가 있다. semaphore는 ownership 없는 permit accounting이라 다른 execution context가 post할 수 있다. protected invariant이면 mutex, resource count/event handoff이면 semaphore를 우선한다.</li>
+            <li style="margin-bottom:12px;"><strong style="color:#f8fafc;">“condition wait를 왜 if가 아니라 while로 감싸나요?”</strong><br>답변 포인트: wake는 predicate true의 소유권 이전이 아니다. spurious wake, broadcast, Mesa semantics에서 먼저 실행한 경쟁자의 상태 소비, timeout 때문에 mutex 재획득 후 predicate가 false일 수 있다. 같은 mutex 아래 state 변경과 atomic unlock-wait-relock이 lost wake를 막는다.</li>
+            <li><strong style="color:#f8fafc;">“uncontended pthread mutex lock마다 syscall이 발생하나요?”</strong><br>답변 포인트: 일반적인 Linux 구현은 user-space atomic fast path로 끝내고 contention 시 futex wait/wake를 쓴다. FUTEX_WAIT는 futex word가 expected와 같은지 확인하고 compare-and-block해 race를 닫는다. 단, futex는 구현 mechanism이며 POSIX API 계약과 동일시하거나 특정 glibc 내부 값을 애플리케이션이 의존하면 안 된다.</li>
+          </ol>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 퀴즈·누적 리뷰</h2>
+          <ol style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:6px;">DB connection 20개와 shared LRU map을 각각 어떤 primitive로 보호할 것인가? 이유는 ownership/count/invariant로 답하라.</li>
+            <li style="margin-bottom:6px;">condition signal을 mutex 밖에서 호출하는 코드가 항상 틀렸다고 단정할 수는 없더라도, predicate 변경을 같은 mutex 아래 두는 규칙이 왜 안전한가?</li>
+            <li style="margin-bottom:6px;"><code style="color:#fbbf24;">sem_wait</code>가 EINTR이면 무조건 처음부터 새 5초 timeout으로 재시도해도 되는가?</li>
+            <li style="margin-bottom:6px;">Day 15 복습: mutex unlock→다음 lock의 happens-before가 atomicity 외에 visibility를 어떻게 제공하는가?</li>
+            <li>Day 10 복습: priority inversion의 세 역할(low owner, medium runner, high waiter)을 그리고 PI가 어느 edge를 바꾸는가?</li>
+          </ol>
+          <p style="margin:11px 0 0;color:#a7c7da;font-size:14px;">정답 핵심: connection은 semaphore, LRU 복합 invariant는 mutex가 자연스럽다. timeout은 최초 absolute deadline을 유지한다. condition의 signal은 힌트이고 state가 truth source다. PI는 lock owner가 critical section을 마칠 수 있도록 effective priority를 올린다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 다음 날 연결</h2>
+          <p style="margin:0;">Day 17에서는 <strong style="color:#f8fafc;">spinlock, blocking lock, futex의 역할 경계</strong>를 다룬다. 기다리며 CPU를 태울지 scheduler에 양보할지, critical-section 길이·preemption·interrupt context·contention을 근거로 선택하고 adaptive spinning이 왜 만능이 아닌지 연결한다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">15. 공식·1차 출처</h2>
+          <ul style="margin:0;padding-left:22px;color:#a7c7da;">
+            <li><a href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/pthread_mutex_lock.html" style="color:#67e8f9;">POSIX.1-2024 — pthread_mutex_lock/unlock</a>: ownership, mutex type, robust mutex 오류 계약</li>
+            <li><a href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/pthread_cond_clockwait.html" style="color:#67e8f9;">POSIX.1-2024 — pthread_cond_wait/timedwait/clockwait</a>: atomic release-and-wait, predicate 재평가, timeout</li>
+            <li><a href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/sem_wait.html" style="color:#67e8f9;">POSIX.1-2024 — sem_wait/trywait/timedwait</a>: permit 획득, EAGAIN·EINTR·ETIMEDOUT</li>
+            <li><a href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/sem_post.html" style="color:#67e8f9;">POSIX.1-2024 — sem_post</a>: permit 반환과 overflow</li>
+            <li><a href="https://man7.org/linux/man-pages/man3/pthread_cond_wait.3p.html" style="color:#67e8f9;">Linux man-pages POSIX — pthread_cond_wait(3p)</a>: spurious wakeup, dynamic mutex binding, cancellation</li>
+            <li><a href="https://man7.org/linux/man-pages/man2/futex.2.html" style="color:#67e8f9;">Linux man-pages — futex(2)</a>: user-space fast path, 32-bit futex word와 atomic compare-and-block</li>
+            <li><a href="https://docs.kernel.org/userspace-api/futex2.html" style="color:#67e8f9;">Linux kernel docs — futex2</a>: wait/wake userspace ABI와 futex vector semantics</li>
+          </ul>
+        </td></tr>
+        <tr><td style="padding:18px 28px;background:#081522;border-top:1px solid #1e3a4c;color:#7fa4ba;font-size:12px;">Operating System 심화 커리큘럼 · Week 3 Concurrency and Synchronization</td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>

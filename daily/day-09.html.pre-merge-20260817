@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operating System 심화 커리큘럼 Day 09 - FCFS, SJF, Round Robin과 starvation</title>
+</head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.68;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#07111f;">
+    <tr><td align="center" style="padding:20px 10px 44px;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#0b1728;border:1px solid #1e3a4c;border-radius:18px;overflow:hidden;">
+        <tr><td style="padding:30px 28px;background:#102438;border-bottom:1px solid #1e3a4c;">
+          <div style="font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:#5eead4;font-weight:800;">Operating System · Day 09 / 63 · CPU Scheduling</div>
+          <h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">FCFS, SJF, Round Robin과 starvation</h1>
+          <p style="margin:0;color:#a5f3fc;font-size:16px;">한 줄 요약 — FCFS는 도착 순서, SJF는 예상 CPU burst, Round Robin은 quantum 단위 순환으로 CPU를 배분한다. <strong style="color:#f8fafc;">평균 waiting time, 첫 response, context-switch 비용, starvation을 동시에 최소화하는 만능 정책은 없으므로 workload와 SLO에 맞춰 선택하고 보호 장치를 둬야 한다.</strong></p>
+        </td></tr>
+        <tr><td style="padding:26px 28px;">
+          <h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 선수 용어 사전</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:14px;">
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;width:31%;">ready queue</td><td style="padding:9px;border:1px solid #29465d;">CPU에서 실행할 수 있는 runnable task를 기다리게 하는 논리적 대기열. 실제 kernel 구현은 단일 FIFO가 아닐 수 있다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">FCFS / FIFO</td><td style="padding:9px;border:1px solid #29465d;">First-Come, First-Served. 먼저 도착한 job을 먼저 실행하는 비선점 모델. FIFO는 먼저 들어온 항목을 먼저 꺼내는 queue 규칙이다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">SJF / SRTF</td><td style="padding:9px;border:1px solid #29465d;">Shortest Job First는 예상 CPU burst가 가장 짧은 job을 끝까지 실행한다. SRTF는 remaining time이 더 짧은 job이 오면 선점하는 변형이다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">Round Robin</td><td style="padding:9px;border:1px solid #29465d;">ready queue의 각 task에 최대 quantum만큼 CPU를 주고, 미완료 task를 queue 뒤로 보내 순환시키는 선점 모델.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">quantum / time slice</td><td style="padding:9px;border:1px solid #29465d;">한 차례에 연속 실행할 수 있는 최대 CPU 시간. 정책·kernel class에 따라 의미와 결정 방식이 다르다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">preemption</td><td style="padding:9px;border:1px solid #29465d;">현재 task가 자발적으로 block/exit하기 전에 scheduler가 CPU를 회수하는 것.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">waiting time</td><td style="padding:9px;border:1px solid #29465d;">ready queue에서 CPU service를 기다린 총시간. 단순 single-CPU model에서는 turnaround−CPU service다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">response / turnaround</td><td style="padding:9px;border:1px solid #29465d;">여기서 response는 arrival부터 첫 실행까지, turnaround는 arrival부터 완료까지다. 실무 API의 response time이 완료 시간 전체를 뜻하는 관례와 구분한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">convoy effect</td><td style="padding:9px;border:1px solid #29465d;">긴 CPU-bound job 뒤에 짧은 job들이 줄지어 기다려 전체 지연과 device 유휴 구간이 커지는 현상.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">starvation / aging</td><td style="padding:9px;border:1px solid #29465d;">starvation은 runnable job이 계속 밀려 service를 사실상 못 받는 상태다. aging은 기다린 시간에 따라 priority를 높이는 완화 기법이다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">slowdown</td><td style="padding:9px;border:1px solid #29465d;">turnaround/service. 1초 job이 10초 걸린 것과 100초 job이 109초 걸린 것을 상대적 피해로 비교한다.</td></tr>
+          </table>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 계산대 세 가지 운영 규칙</h2>
+          <div style="padding:16px;background:#0f2035;border-left:4px solid #5eead4;border-radius:8px;">
+            <p style="margin:0 0 9px;"><strong style="color:#f8fafc;">FCFS</strong>는 도착 줄을 지킨다. 설명과 구현은 단순하지만 큰 장바구니 하나가 작은 장바구니 모두를 막는다.</p>
+            <p style="margin:0 0 9px;"><strong style="color:#f8fafc;">SJF</strong>는 상품 수가 가장 적어 보이는 손님부터 처리한다. 평균 대기는 줄지만 상품 수를 미리 알아야 하고 큰 장바구니는 계속 밀릴 수 있다.</p>
+            <p style="margin:0;"><strong style="color:#f8fafc;">Round Robin</strong>은 모두에게 2분씩 계산대를 주고 미완료면 뒤로 보낸다. 첫 응답은 빨라지지만 너무 자주 교대하면 인수인계 비용이 계산보다 커진다.</p>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture·상태 전이: 정책이 개입하는 한 지점</h2>
+          <div style="overflow:auto;padding:16px;background:#06101d;border:1px solid #29465d;border-radius:10px;">
+            <pre style="margin:0;color:#c4f1f9;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;">arrival / I/O wakeup
+          │
+          ▼ enqueue
+   ┌────────────────── READY / RUNNABLE ──────────────────┐
+   │ FCFS: oldest arrival                                 │
+   │ SJF : minimum predicted burst   SRTF: min remaining  │
+   │ RR  : queue head, run ≤ quantum, then tail           │
+   └──────────────────────┬───────────────────────────────┘
+                          │ pick_next
+                          ▼
+                    RUNNING on CPU
+             ┌────────────┼───────────────┐
+             │ block      │ preempt       │ finish
+             ▼            ▼               ▼
+        SLEEPING      READY tail/key     DONE
+             │ wakeup
+             └────────────→ READY
+
+policy input  : arrival, estimated/remaining burst, quantum, priority
+observability : first-run, completion, CPU service, runqueue wait, switches
+safety        : aging/deadline, service floor, tenant quota, RT runtime cap</pre>
+          </div>
+          <p style="margin:10px 0 0;color:#a7c7da;font-size:14px;">정책은 같은 상태 전이에서 “다음 누구인가”를 바꾼다. multicore에서는 CPU별 run queue, affinity, load balancing, migration까지 추가되므로 이 그림은 single-CPU 기본 모델이다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. 같은 workload를 숫자로 비교하기</h2>
+          <p style="margin:0 0 10px;">A=8, B=4, C=1 CPU time이고 모두 t=0에 도착한다고 하자. context-switch 비용과 I/O는 우선 0으로 둔다.</p>
+          <div style="overflow:auto;padding:14px;background:#06101d;border:1px solid #29465d;border-radius:10px;">
+            <pre style="margin:0;color:#d1fae5;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;">FCFS    0 ├──── A(8) ────┤ 8 ├── B(4) ──┤ 12 ├ C(1) ┤ 13
+        평균 waiting=6.67, first response=6.67, turnaround=11.00
+
+SJF     0 ├ C(1) ┤ 1 ├── B(4) ──┤ 5 ├──── A(8) ────┤ 13
+        평균 waiting=2.00, first response=2.00, turnaround=6.33
+
+RR q=2  0 ├A2┤ 2 ├B2┤ 4 ├C1┤ 5 ├A2┤ 7 ├B2┤ 9 ├── A4 ──┤ 13
+        평균 waiting=4.67, first response=2.00, turnaround=9.00
+        task가 달라진 경계=5 (실제 context switch 수는 구현·idle에 따라 다름)</pre>
+          </div>
+          <p style="margin:10px 0 0;">SJF가 이 예의 평균을 이기지만 C가 먼저 끝나고 A는 늦어진다. RR은 모든 job을 빨리 한 번 실행하지만 completion 평균은 SJF보다 나쁘다. 어떤 열을 최적화할지 먼저 정해야 한다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. CS·kernel·hardware deep dive</h2>
+          <h3 style="margin:16px 0 8px;color:#f8fafc;font-size:17px;">5.1 SJF의 평균 waiting 최적성은 조건부다</h3>
+          <p style="margin:0 0 9px;">모든 job이 준비되어 있고 burst를 정확히 알며, 단일 CPU·비선점·동일 중요도·switch 비용 0인 경우 긴 job X가 짧은 job Y 앞에 있으면 둘을 교환할 때 Y의 대기는 X−Y만큼 줄고 X의 대기는 Y만큼 늘어 총 대기가 줄어든다. 이 교환을 반복하면 오름차순 SJF가 된다.</p>
+          <p style="margin:0;">arrival이 다르고 deadline·priority·I/O·multicore·cache affinity가 있거나 size estimate가 틀리면 이 증명은 그대로 적용되지 않는다. “SJF는 항상 최적”은 면접에서 반드시 가정을 붙여야 하는 문장이다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.2 미래 CPU burst는 예측값이다</h3>
+          <p style="margin:0 0 9px;">일반적인 teaching model은 <strong style="color:#f8fafc;">τ(next)=α·t(actual)+(1−α)·τ(previous)</strong>로 최근 burst와 과거 예측을 섞는다. α가 크면 workload 변화에 빨리 반응하지만 noise에 흔들리고, 작으면 안정적이지만 phase change를 늦게 따라간다.</p>
+          <p style="margin:0;">실무에서는 request class, historical percentile, remaining bytes 같은 hint를 쓰되 0·음수·비정상 estimate를 clamp하고, 새 job 기본값과 최대 priority boost를 둔다. 클라이언트가 size를 직접 신고한다면 과소 신고로 우선권을 얻는 gaming도 위협 모델에 넣는다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.3 SRTF와 starvation</h3>
+          <p style="margin:0 0 9px;">SRTF는 짧은 새 job이 오면 긴 job을 선점해 short-job response를 더 줄인다. 그러나 긴 L이 남은 시간 20일 때 1짜리 job이 계속 도착하면 매번 short job이 선택되어 L의 대기는 유한하게 제한되지 않는다.</p>
+          <p style="margin:0;">완화책은 waiting time에 따른 aging, 최대 대기 deadline, 최소 service floor, attained-service 기반 priority, tenant별 queue/quota다. 평균 개선만 보지 말고 max queue age, p99 slowdown, service lag를 alert로 둔다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.4 Round Robin quantum의 양쪽 절벽</h3>
+          <p style="margin:0 0 9px;">q가 매우 커지면 task가 완료/차단되기 전까지 거의 교대하지 않아 FCFS에 가까워진다. q가 너무 작으면 runnable task는 빨리 첫 차례를 받지만 scheduler 진입, register·address-space 전환, run-queue 조작, cache/TLB/branch-predictor 간접 비용이 늘어난다.</p>
+          <p style="margin:0;">단순 모델에서 앞에 n개 runnable task가 있으면 첫 차례까지 약 n·q지만, 실제 Linux에서는 interrupt, wakeup preemption, CPU migration, policy class, cgroup 때문에 고정식이 아니다. quantum은 평균값이 아니라 burst 분포와 p99 response SLO, switch-overhead budget으로 검증한다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.5 context switch 비용은 clock 몇 μs로 끝나지 않는다</h3>
+          <p style="margin:0 0 9px;">직접 비용은 kernel scheduler code, register 저장·복원, 필요 시 page-table 전환이다. 간접 비용은 새 task working set이 L1/L2/LLC cache를 밀어내고 TLB와 predictor history의 유용성이 낮아지는 것이다. cache-hot task를 다른 CPU로 migrate하면 비용이 더 커질 수 있다.</p>
+          <p style="margin:0;">따라서 작은 q 실험은 switches/s뿐 아니라 instructions, cycles, cache misses, migrations, useful completions/s와 tail latency를 같이 본다. 같은 task가 다시 선택되거나 runnable peer가 없으면 tick/quantum 경계가 곧 context switch를 뜻하지 않는다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.6 Linux 이름을 textbook 정책과 혼동하지 말 것</h3>
+          <div style="padding:15px;background:#241528;border:1px solid #7f1d4d;border-radius:9px;">
+            <p style="margin:0 0 8px;"><strong style="color:#f9a8d4;">일반 task:</strong> 현대 Linux fair scheduling은 pure FCFS/SJF/RR이 아니다. kernel 문서는 6.6부터 CFS에서 EEVDF로 전환 중이며 lag와 virtual deadline을 사용한다고 설명한다.</p>
+            <p style="margin:0 0 8px;"><strong style="color:#f9a8d4;">SCHED_FIFO:</strong> textbook FCFS의 다른 이름이 아니다. 고정 priority real-time class이고 같은 priority에서 FIFO queue를 쓰며 time slice 없이 block·yield·더 높은 priority 선점까지 실행한다.</p>
+            <p style="margin:0;"><strong style="color:#f9a8d4;">SCHED_RR:</strong> SCHED_FIFO에 같은 real-time priority peer 사이의 quantum을 더한 정책이다. 일반 application latency를 위한 보편적 RR이 아니며 잘못 쓰면 normal task를 굶길 수 있다.</p>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. 실무 best practice</h2>
+          <ol style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">목표함수를 먼저 쓴다.</strong> interactive first response, batch completion, deadline miss, throughput, slowdown, tenant share 중 우선순위와 SLO를 명시한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">실제 trace를 deterministic replay한다.</strong> arrival·CPU/I/O burst 분포와 tie-breaker·seed·kernel/cgroup/affinity 조건을 versioning하고 평균뿐 아니라 p50/p99/max를 비교한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">size는 hint로 취급한다.</strong> prediction error histogram을 남기고 default·clamp·aging을 두며 과소 신고가 다른 tenant를 해치지 못하게 priority boost를 제한한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">starvation을 명시적으로 제한한다.</strong> max queue age, minimum service, deadline/aging, per-tenant quota와 bounded queue를 정책 contract에 포함한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">quantum은 측정으로 정한다.</strong> burst percentile, first-response p99, switches/s, cache miss, useful throughput을 sweep하고 workload 변화 시 재검증한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">overload는 admission에서 막는다.</strong> scheduler가 capacity를 만들지는 않는다. backpressure, concurrency cap, load shedding, retry budget으로 무한 queue를 막는다.</li>
+            <li><strong style="color:#f8fafc;">ordinary service에 RT class를 쓰지 않는다.</strong> 꼭 필요하면 capability 최소화, RT runtime reservation, watchdog, recovery console, staging load test와 rollback을 준비한다.</li>
+          </ol>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. error handling과 운영 실패 대응</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:14px;">
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;width:31%;">burst 미상/누락</td><td style="padding:9px;border:1px solid #29465d;">safe default class로 보내고 완료된 CPU burst만으로 estimate를 갱신한다. 무한·NaN·음수·0은 검증하고 범위를 제한한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">동률과 비결정성</td><td style="padding:9px;border:1px solid #29465d;">arrival sequence/PID가 아닌 명시적 sequence number 같은 안정적 secondary key를 정해 재현 가능한 결과를 만든다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">queue가 비었음</td><td style="padding:9px;border:1px solid #29465d;">busy loop하지 말고 다음 arrival까지 idle 상태로 clock을 전진한다. simulator가 idle interval을 누락하면 metric이 왜곡된다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">time overflow/jump</td><td style="padding:9px;border:1px solid #29465d;">duration은 monotonic clock과 충분한 폭의 integer로 계산한다. completion&lt;arrival invariant 위반 시 sample을 격리한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">EPERM / EINVAL</td><td style="padding:9px;border:1px solid #29465d;">sched_setscheduler 권한·priority 범위·policy를 확인한다. 권한을 무작정 올리거나 실패 후 RT 정책이라고 가정하지 않는다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">ESRCH race</td><td style="padding:9px;border:1px solid #29465d;">대상 thread가 조회와 변경 사이 종료될 수 있다. PID/TID identity를 재검증하고 종료를 정상 race로 처리한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">RT runaway</td><td style="padding:9px;border:1px solid #29465d;">Linux의 RT runtime limit·RLIMIT_RTTIME, watchdog과 out-of-band recovery를 둔다. 이 실습에서는 RT policy를 설정하지 않는다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">schedstat 없음</td><td style="padding:9px;border:1px solid #29465d;">kernel config/version/container visibility를 기록하고 application timestamp나 승인된 profiler로 대체한다. counter는 두 snapshot delta로 읽는다.</td></tr>
+          </table>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. 놓치기 쉬운 함정</h2>
+          <ul style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:7px;">Linux <code style="color:#fbbf24;">SCHED_FIFO</code>를 textbook FCFS와 동일시하지 않는다.</li>
+            <li style="margin-bottom:7px;">SJF 최적성에 single CPU, exact size, 동시 준비, 동일 목적함수라는 가정을 붙인다.</li>
+            <li style="margin-bottom:7px;">첫 response와 완료까지의 response/turnaround를 metric 이름만 보고 섞지 않는다.</li>
+            <li style="margin-bottom:7px;">RR이 CPU 차례를 공평하게 줘도 job completion·slowdown·tenant 결과가 공평하다는 뜻은 아니다.</li>
+            <li style="margin-bottom:7px;"><code style="color:#fbbf24;">/proc/sys/kernel/sched_rr_timeslice_ms</code>의 Linux 기본값을 모든 scheduler의 보편 quantum으로 쓰지 않는다. 이는 real-time RR용이다.</li>
+            <li style="margin-bottom:7px;">quantum 만료 횟수를 context-switch 횟수로 그대로 세지 않는다. 같은 task 재선택이 가능하다.</li>
+            <li style="margin-bottom:7px;">waiting=turnaround−service는 이 단순 단일-resource model의 식이다. I/O·parallelism·off-CPU wait가 섞인 production trace에는 정의를 다시 세운다.</li>
+            <li>multicore에서는 global 평균만 보지 말고 per-CPU imbalance, affinity, migration, NUMA locality를 함께 본다.</li>
+          </ul>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. 30분 실습: 세 정책 Gantt simulator</h2>
+          <p style="margin:0 0 10px;color:#a7c7da;">Python 표준 라이브러리만 사용한다. 실제 scheduling policy는 바꾸지 않고 동일 input의 metric과 starvation counterexample을 계산한 뒤 Linux라면 현재 shell 정책과 schedstat을 읽기만 한다.</p>
+          <pre style="margin:0;padding:14px;background:#06101d;border:1px solid #29465d;border-radius:10px;color:#d1fae5;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;">LAB_DIR=$(mktemp -d)
+python3 - "$LAB_DIR" &lt;&lt;'PY'
+from collections import deque
+import sys
+
+out = sys.argv[1] + "/result.txt"
+jobs = [("A", 0, 8), ("B", 0, 4), ("C", 0, 1)]
+
+def add(timeline, name, start, end):
+    if timeline and timeline[-1][0] == name and timeline[-1][2] == start:
+        timeline[-1] = (name, timeline[-1][1], end)
+    else:
+        timeline.append((name, start, end))
+
+def metrics(timeline):
+    arrival = {n:a for n,a,b in jobs}
+    service = {n:b for n,a,b in jobs}
+    first, done = {}, {}
+    for n, start, end in timeline:
+        first.setdefault(n, start)
+        done[n] = end
+    response = {n:first[n]-arrival[n] for n in arrival}
+    turnaround = {n:done[n]-arrival[n] for n in arrival}
+    waiting = {n:turnaround[n]-service[n] for n in arrival}
+    avg = lambda xs: sum(xs.values()) / len(xs)
+    switches = sum(timeline[i-1][0] != timeline[i][0]
+                   for i in range(1, len(timeline)))
+    return avg(waiting), avg(response), avg(turnaround), switches
+
+def run_order(order):
+    now, timeline = 0, []
+    for n, arrival, burst in order:
+        now = max(now, arrival)
+        add(timeline, n, now, now + burst)
+        now += burst
+    return timeline
+
+def rr(quantum):
+    q = deque([{"name":n, "arrival":a, "left":b} for n,a,b in jobs])
+    now, timeline = 0, []
+    while q:
+        job = q.popleft()
+        used = min(quantum, job["left"])
+        add(timeline, job["name"], now, now + used)
+        now += used
+        job["left"] -= used
+        if job["left"]:
+            q.append(job)
+    return timeline
+
+def render(name, timeline):
+    w, r, t, sw = metrics(timeline)
+    gantt = " | ".join(f"{s}-{n}-{e}" for n,s,e in timeline)
+    return (f"{name}: {gantt}\n"
+            f"  avg waiting={w:.2f} first_response={r:.2f} "
+            f"turnaround={t:.2f} task_changes={sw}")
+
+fcfs = run_order(jobs)
+sjf = run_order(sorted(jobs, key=lambda x: (x[2], x[1], x[0])))
+round_robin = rr(2)
+lines = [render("FCFS", fcfs), render("SJF", sjf),
+         render("RR(q=2)", round_robin)]
+lines.append("STARVATION: L arrives t=1 with 20 left; if 1-unit jobs "
+             "keep arriving before every choice, SRTF can postpone L forever.")
+with open(out, "w") as f:
+    f.write("\n".join(lines) + "\n")
+PY
+
+sed -n '1,20p' "$LAB_DIR/result.txt"
+command -v chrt &gt;/dev/null 2&gt;&amp;1 &amp;&amp; chrt -p $$ || true
+ps -o pid,cls,rtprio,pri,ni,psr,stat,cmd -p $$
+test -r /proc/self/schedstat &amp;&amp; sed -n '1p' /proc/self/schedstat || true</pre>
+          <p style="margin:10px 0 0;"><strong style="color:#f8fafc;">예상:</strong> FCFS 6.67/6.67/11.00, SJF 2.00/2.00/6.33, RR 4.67/2.00/9.00 순으로 waiting/first response/turnaround가 나온다. RR의 task_changes=5는 이 model의 task 경계이지 실제 kernel context-switch 계측값이 아니다.</p>
+          <p style="margin:8px 0 0;color:#a7c7da;font-size:14px;">확장: q=1,2,4,100을 sweep하고 각 task 경계마다 가상 switch cost 0.05를 더해 completion이 어떻게 바뀌는지 계산하라. 이어 arrival이 다른 SRTF heap을 구현하고 L의 max wait를 aging 유무로 비교한다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. production 실패 시나리오</h2>
+          <div style="padding:15px;background:#241528;border:1px solid #7f1d4d;border-radius:9px;">
+            <p style="margin:0 0 8px;"><strong style="color:#f9a8d4;">상황:</strong> batch worker가 estimated-size가 작은 요청을 먼저 처리한다. 평균 latency는 35% 줄었지만 새 short job이 계속 들어오며 한 대형 tenant의 job이 40분째 시작되지 않는다.</p>
+            <p style="margin:0 0 8px;"><strong style="color:#f9a8d4;">증거:</strong> arrival·estimate·actual CPU·first-run·completion을 job/tenant별로 남기고 max queue age, slowdown, estimate error, received service/entitlement를 본다. 평균만 보지 않는다.</p>
+            <p style="margin:0 0 8px;"><strong style="color:#f9a8d4;">완화:</strong> 2분 aging deadline과 tenant별 minimum service를 두고 size boost를 cap한다. admission queue를 bounded로 만들고 overload 때 낮은 우선순위 job은 명시적으로 defer/reject한다.</p>
+            <p style="margin:0;"><strong style="color:#f9a8d4;">검증:</strong> worst-case short-job stream, 잘못된 estimate, tenant burst를 replay해 max wait upper bound와 p99 slowdown을 회귀 test한다. 처리량 저하도 함께 승인받는다.</p>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. 대기업 면접 질문 3개</h2>
+          <p style="margin:0 0 10px;"><strong style="color:#f8fafc;">Q1. FCFS, SJF, RR을 같은 workload에서 비교해 보세요.</strong><br>답변 포인트: arrival/burst와 preemption·switch-cost 가정을 먼저 둔다. FCFS의 단순성/convoy, 조건부 평균 waiting 최적인 SJF/size prediction과 starvation, RR의 빠른 first response/quantum overhead를 waiting·response·turnaround·fairness로 비교한다.</p>
+          <p style="margin:0 0 10px;"><strong style="color:#f8fafc;">Q2. SJF가 평균 waiting time 최적이라는데 production 기본값이 아닌 이유는?</strong><br>답변 포인트: exact future burst를 모르고 dynamic arrival, deadline, priority, multicore/cache, gaming과 긴 job starvation이 있다. estimate를 hint로 쓰고 aging·service floor·tenant isolation과 tail metric을 둔다.</p>
+          <p style="margin:0;"><strong style="color:#f8fafc;">Q3. Round Robin quantum을 어떻게 정하고 Linux와 어떻게 연결합니까?</strong><br>답변 포인트: q→∞는 FCFS-like, q가 작으면 first response와 switch/cache 비용 trade-off다. burst 분포·p99·switches/cache miss/goodput sweep으로 정한다. Linux SCHED_RR은 fixed-priority RT class이며 normal fair scheduler와 다르고 RT starvation 보호가 필요함을 말한다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 퀴즈·누적 리뷰</h2>
+          <ol style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:6px;">모두 t=0 도착인 A=6, B=2, C=4에서 FCFS A→B→C와 SJF의 평균 waiting을 계산하라.</li>
+            <li style="margin-bottom:6px;">RR q가 무한대로 커지거나 0에 가까워질 때 각각 어떤 정책·비용에 가까워지는가?</li>
+            <li style="margin-bottom:6px;">SRTF에서 긴 job starvation을 만드는 arrival sequence와 두 가지 완화책을 말하라.</li>
+            <li style="margin-bottom:6px;">SJF 평균 waiting 최적성 증명이 깨지는 production 조건 세 가지는?</li>
+            <li style="margin-bottom:6px;">Linux SCHED_FIFO가 textbook FCFS와 다른 핵심은 무엇인가?</li>
+            <li style="margin-bottom:6px;">Day 05 복습: q를 줄일 때 direct·indirect context-switch 비용을 구분하라.</li>
+            <li>Day 08 복습: 평균 waiting이 줄어도 scheduler가 좋아졌다고 단정할 수 없는 이유는?</li>
+          </ol>
+          <p style="margin:11px 0 0;color:#a7c7da;font-size:14px;">정답 포인트: 1번 FCFS=(0+6+8)/3=4.67, SJF B→C→A=(0+2+6)/3=2.67. 나머지는 가정→metric→실패 mode→보호 장치 순서로 소리 내어 설명한다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 다음 날 연결</h2>
+          <p style="margin:0;">Day 10에서는 priority, preemption, time slice를 분해한다. 누가 누구를 선점할 수 있는지, priority inversion과 real-time starvation을 어떤 kernel knob·lock protocol·관측값으로 진단하는지 연결한다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 공식·1차 출처</h2>
+          <ul style="margin:0;padding-left:22px;color:#a7c7da;">
+            <li><a href="https://man7.org/linux/man-pages/man7/sched.7.html" style="color:#67e8f9;">Linux man-pages — sched(7)</a>: runnable thread 선택, SCHED_FIFO·SCHED_RR, priority와 RT runtime 보호</li>
+            <li><a href="https://man7.org/linux/man-pages/man2/sched_rr_get_interval.2.html" style="color:#67e8f9;">Linux man-pages — sched_rr_get_interval(2)</a>: SCHED_RR quantum 조회와 Linux 설정 interface</li>
+            <li><a href="https://man7.org/linux/man-pages/man2/sched_setscheduler.2.html" style="color:#67e8f9;">Linux man-pages — sched_setscheduler(2)</a>: policy 설정, EPERM·EINVAL·ESRCH 오류 계약</li>
+            <li><a href="https://docs.kernel.org/scheduler/sched-eevdf.html" style="color:#67e8f9;">Linux kernel docs — EEVDF Scheduler</a>: modern fair scheduler의 lag·virtual deadline과 CFS 이후 방향</li>
+            <li><a href="https://docs.kernel.org/scheduler/sched-stats.html" style="color:#67e8f9;">Linux kernel docs — Scheduler Statistics</a>: CPU execution, run-queue wait, timeslice counter와 version 주의</li>
+            <li><a href="https://github.com/torvalds/linux/blob/master/kernel/sched/rt.c" style="color:#67e8f9;">Linux kernel source — kernel/sched/rt.c</a>: real-time scheduling class 구현</li>
+            <li><a href="https://github.com/torvalds/linux/blob/master/kernel/sched/fair.c" style="color:#67e8f9;">Linux kernel source — kernel/sched/fair.c</a>: fair scheduling class 구현</li>
+            <li><a href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/V2_chap02.html" style="color:#67e8f9;">The Open Group — POSIX System Interfaces, General Information</a>: process scheduling option의 표준 semantics</li>
+          </ul>
+        </td></tr>
+        <tr><td style="padding:18px 28px;background:#081522;border-top:1px solid #1e3a4c;color:#7fa4ba;font-size:12px;">Operating System 심화 커리큘럼 · 초보 용어에서 kernel/hardware와 production diagnosis까지</td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>

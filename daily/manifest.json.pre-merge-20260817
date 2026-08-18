@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-08-18T09:20:06+09:00",
+  "updatedAt": "2026-08-11T09:24:36+09:00",
   "lessons": [
     {
       "day": 1,
@@ -104,51 +104,6 @@
       "path": "day-11.html",
       "kind": "lesson",
       "publishedAt": "2026-08-11T09:24:36+09:00"
-    },
-    {
-      "day": 12,
-      "week": 2,
-      "title": "Linux CFS에서 EEVDF로 이어지는 mental model",
-      "summary": "CFS의 weight-normalized vruntime과 rbtree에서 출발해 EEVDF의 lag·eligibility·virtual deadline이 fairness와 latency를 분리하는 원리를 simulator와 Linux 증거로 연결합니다.",
-      "path": "day-12.html",
-      "kind": "lesson",
-      "publishedAt": "2026-08-12T09:00:23+09:00"
-    },
-    {
-      "day": 13,
-      "week": 2,
-      "title": "실패 실습: CPU-bound/IO-bound 경쟁과 nice 관찰",
-      "summary": "CPU-bound와 I/O-bound task를 동일 CPU에서 경쟁시켜 nice weight가 runnable service share에 미치는 영향과 wakeup latency·schedstat·CPU PSI·cgroup 함정을 증거로 분리합니다.",
-      "path": "day-13.html",
-      "kind": "lab",
-      "publishedAt": "2026-08-14T09:09:11+09:00"
-    },
-    {
-      "day": 14,
-      "week": 2,
-      "title": "리뷰: scheduler 선택을 SLO로 방어",
-      "summary": "Week 2의 workload·queueing·priority·multicore·EEVDF·nice를 W-SAFE-R 의사결정 흐름으로 통합해 scheduler 선택을 SLO, overload guardrail, Linux 증거와 rollback으로 방어합니다.",
-      "path": "day-14.html",
-      "kind": "review",
-      "publishedAt": "2026-08-15T09:00:17+09:00"
-    },
-    {
-      "day": 15,
-      "week": 3,
-      "title": "race condition, atomicity, ordering, visibility",
-      "summary": "race condition과 data race를 구분하고 x++ lost update에서 compiler·CPU reorder, cache coherence, happens-before, mutex와 atomic memory order까지 invariant 중심으로 연결합니다.",
-      "path": "day-15.html",
-      "kind": "lesson",
-      "publishedAt": "2026-08-16T09:00:24+09:00"
-    },
-    {
-      "day": 16,
-      "week": 3,
-      "title": "mutex, semaphore, condition variable",
-      "summary": "mutex의 ownership, semaphore의 permit count, condition variable의 predicate wait를 구분하고 POSIX atomic unlock-wait-relock, spurious wakeup, timeout/error handling과 Linux futex fast/slow path까지 연결합니다.",
-      "path": "day-16.html",
-      "kind": "lesson",
-      "publishedAt": "2026-08-18T09:20:06+09:00"
     }
   ]
 }
