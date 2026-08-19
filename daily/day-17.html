@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operating System 심화 커리큘럼 Day 17 - spinlock, blocking lock, futex의 역할 경계</title>
+</head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.68;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#07111f;">
+    <tr><td align="center" style="padding:20px 10px 44px;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#0b1728;border:1px solid #1e3a4c;border-radius:18px;overflow:hidden;">
+        <tr><td style="padding:30px 28px;background:#102438;border-bottom:1px solid #1e3a4c;">
+          <div style="font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:#5eead4;font-weight:800;">Operating System · Day 17 / 63 · Concurrency</div>
+          <h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">spinlock, blocking lock, futex의 역할 경계</h1>
+          <p style="margin:0;color:#a5f3fc;font-size:16px;">한 줄 요약 — <strong style="color:#f8fafc;">spin은 남은 대기가 park·wake·schedule보다 짧고 lock holder가 곧 실행될 때만 이득이며, blocking lock은 CPU를 scheduler에 돌려준다.</strong> futex는 둘 중 하나의 lock이 아니라 user-space atomic 상태와 kernel sleep/wake를 연결하는 저수준 mechanism이다.</p>
+        </td></tr>
+        <tr><td style="padding:26px 28px;">
+          <h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:14px;">
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;width:31%;">busy waiting</td><td style="padding:9px;border:1px solid #29465d;">기다리는 동안 sleep하지 않고 조건을 반복 확인해 CPU instruction을 계속 실행하는 방식.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">spinlock</td><td style="padding:9px;border:1px solid #29465d;">lock이 풀릴 때까지 CPU에서 spinning하는 lock. sleep할 수 없는 kernel context나 매우 짧고 예측 가능한 임계 구역에서 사용한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">blocking lock</td><td style="padding:9px;border:1px solid #29465d;">획득할 수 없으면 waiter를 sleep/blocked 상태로 보내 CPU를 다른 task에 양보할 수 있는 lock. pthread mutex와 Linux kernel mutex가 대표적이다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">futex</td><td style="padding:9px;border:1px solid #29465d;">fast userspace mutex. Linux에서 32-bit user-space word를 기준으로 wait/wake를 요청하는 syscall 인터페이스이며, 보통 pthread library 같은 구현자가 사용한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">contention</td><td style="padding:9px;border:1px solid #29465d;">여러 execution context가 같은 lock/resource를 동시에 원해 경쟁하는 상태.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">critical section</td><td style="padding:9px;border:1px solid #29465d;">공유 invariant를 보호하기 위해 lock을 가진 동안 실행하는 코드 구간.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">park / unpark</td><td style="padding:9px;border:1px solid #29465d;">thread를 runnable queue에서 빼 재우고, 사건이 생기면 다시 runnable로 만드는 runtime/kernel 동작.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">oversubscription</td><td style="padding:9px;border:1px solid #29465d;">runnable thread 수가 실제 CPU 수보다 많은 상태. spinner가 CPU를 점유해 lock owner 실행을 늦출 수 있다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">cache-line bouncing</td><td style="padding:9px;border:1px solid #29465d;">여러 core가 같은 cache line을 write/RMW하려 해 exclusive ownership이 core 사이를 계속 이동하는 현상.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">adaptive spinning</td><td style="padding:9px;border:1px solid #29465d;">항상 spin 또는 항상 sleep하지 않고 owner 실행 여부·과거 hold time·대기열 등을 보고 잠깐 spin한 뒤 block하는 hybrid 전략.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">lock convoy</td><td style="padding:9px;border:1px solid #29465d;">긴 lock holder 뒤에 waiter가 줄을 서며 wake·획득·다시 sleep이 연쇄되어 throughput과 tail latency가 무너지는 현상.</td></tr>
+          </table>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 계산대 앞에서 서 있을까, 호출표를 받을까</h2>
+          <div style="padding:16px;background:#0f2035;border-left:4px solid #5eead4;border-radius:8px;">
+            <p style="margin:0 0 9px;"><strong style="color:#f8fafc;">spin:</strong> 앞사람이 카드 한 번만 찍으면 끝난다고 확실할 때 계산대 앞에서 기다린다. 자리를 떠났다 돌아오는 비용은 없지만 기다리는 동안 통로와 CPU를 점유한다.</p>
+            <p style="margin:0 0 9px;"><strong style="color:#f8fafc;">block:</strong> 앞사람 일이 길 수 있으면 호출표를 받고 앉는다. park/wake 비용은 들지만 CPU는 다른 유용한 일을 한다.</p>
+            <p style="margin:0;"><strong style="color:#f8fafc;">futex:</strong> 계산대가 비었는지는 매장 안의 atomic 표지판으로 먼저 본다. 실제로 기다려야 할 때만 안내 데스크인 kernel에 “표지판이 아직 이 값이면 재워 달라”고 요청한다.</p>
+          </div>
+          <p style="margin:12px 0 0;">핵심 질문은 lock 이름이 아니라 <strong style="color:#f8fafc;">“owner가 현재 실행 중인가, 남은 hold time은 얼마인가, CPU가 남는가, 이 context는 sleep 가능한가?”</strong>다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: atomic fast path에서 scheduler까지</h2>
+          <div style="overflow:auto;padding:16px;background:#06101d;border:1px solid #29465d;border-radius:10px;">
+            <pre style="margin:0;color:#c4f1f9;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;">Application / runtime lock()
+          │
+          ▼
+user-space lock word: atomic load / CAS
+          │
+     ┌────┴───────────────┐
+     │ CAS success         │ contention
+     ▼                     ▼
+critical section       adaptive decision
+     │                 ┌───────┴────────┐
+release store          │ short spin      │ park
+     │                 │ PAUSE/backoff   ▼
+     │                 │ retry CAS    futex(WAIT, expected)
+     │                 │                │ compare-and-block
+     │                 └──────────────┐  ▼
+     │                             kernel futex hash/wait queue
+     │                                      │ task BLOCKED
+     └─ unlock + futex(WAKE if waiters) ────┘
+                                            ▼
+                               scheduler RUNNABLE → RUNNING
+                                            │
+                                            └─ retry lock state
+
+uncontended path: user mode only, syscall 0일 수 있음
+contended slow path: kernel은 lock invariant가 아니라 sleep/wake를 중개</pre>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. 상태 전이: spin과 block의 비용은 어디서 생기는가</h2>
+          <div style="overflow:auto;padding:16px;background:#06101d;border:1px solid #29465d;border-radius:10px;">
+            <pre style="margin:0;color:#c4f1f9;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;">Spin waiter
+RUNNING ── failed CAS ──► RUNNING(spin/retry) ── success ──► OWNER
+   │ CPU cycles + coherence traffic + possible owner starvation
+   └─ preempted면 RUNNABLE/blocked by scheduler, lock은 여전히 없음
+
+Blocking waiter
+RUNNING ── contention ──► futex wait ──► BLOCKED
+   ▲                                      │
+   └─ scheduled ◄── RUNNABLE ◄── wake/timeout/signal
+        context switch + cache warm-up + reacquire competition
+
+break-even mental equation:
+expected remaining hold time
+  &lt; park syscall + schedule-out + wake + schedule-in + cache recovery
+일 때만 제한된 spin이 유리할 가능성이 있다.</pre>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. CS·kernel·hardware deep dive</h2>
+          <h3 style="margin:16px 0 8px;color:#f8fafc;font-size:17px;">5.1 spinlock은 “context switch가 없는 빠른 mutex”가 아니다</h3>
+          <p style="margin:0 0 9px;">spinlock은 wait를 CPU cycle로 지불한다. owner가 다른 core에서 곧 unlock하면 park/wake를 피할 수 있지만, owner가 preempt되거나 page fault·I/O를 만나면 waiter는 진전 없이 CPU를 태운다. 단일 CPU에서 owner를 실행시키지 못하는 spinner는 특히 치명적이다.</p>
+          <p style="margin:0;">그래서 kernel spinlock critical section은 매우 짧고 bounded해야 하며 sleep 가능한 operation을 넣지 않는다. user-space application은 scheduler와 runtime 정보를 제한적으로만 알아 대개 검증된 pthread mutex를 기본값으로 삼는다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.2 Linux kernel context가 lock 종류를 제한한다</h3>
+          <p style="margin:0 0 9px;">sleeping lock은 preemptible task context에서 사용한다. interrupt/atomic context는 schedule할 수 없으므로 blocking mutex를 잡을 수 없다. non-PREEMPT_RT의 spinning lock은 preemption을 암묵적으로 disable하며, interrupt handler와 공유하면 <code style="color:#fbbf24;">spin_lock_irqsave</code> 같은 올바른 variant가 필요하다.</p>
+          <p style="margin:0;">같은 CPU에서 lock을 가진 code가 interrupt되고 handler가 같은 lock을 spin하면 owner code가 재개되지 못해 self-deadlock이다. 단, PREEMPT_RT에서는 <code style="color:#fbbf24;">spinlock_t</code> semantics가 sleeping rtmutex 기반으로 달라질 수 있고 <code style="color:#fbbf24;">raw_spinlock_t</code>가 실제 spinning semantics를 유지하므로 kernel configuration까지 답해야 한다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.3 atomic RMW와 cache coherence 비용</h3>
+          <p style="margin:0 0 9px;">test-and-set spinner가 매 loop마다 atomic write/RMW를 하면 lock cache line의 exclusive ownership이 core 사이를 왕복한다. core 수가 늘수록 useful work가 아니라 coherence invalidation에 interconnect bandwidth를 쓴다.</p>
+          <p style="margin:0;">test-test-and-set은 먼저 read로 관찰하고 풀릴 때만 RMW하며, exponential backoff와 CPU의 pause/yield hint는 pressure를 줄인다. MCS 같은 queue lock은 각 waiter가 local node를 spin해 cache-line bouncing과 unfairness를 낮춘다. 하지만 어느 기법도 긴 hold time이나 descheduled owner를 해결하지는 않는다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.4 memory ordering도 lock 계약의 일부다</h3>
+          <p style="margin:0 0 9px;">lock 획득은 acquire, 해제는 release ordering을 제공해야 이전 owner의 critical-section write를 다음 owner가 관찰한다. 단순히 atomic flag 값만 바뀐다고 protected data의 publication이 자동 보장되지는 않는다.</p>
+          <p style="margin:0;">직접 spinlock을 구현할 때 C11 <code style="color:#fbbf24;">atomic_flag_test_and_set(..., memory_order_acquire)</code>와 <code style="color:#fbbf24;">atomic_flag_clear(..., memory_order_release)</code> 같은 language memory-model 계약이 필요한 이유다. 실무에서는 검증된 library primitive를 우선한다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.5 Linux mutex는 이미 hybrid다</h3>
+          <p style="margin:0 0 9px;">kernel mutex 공식 설계는 세 경로를 설명한다. <strong style="color:#f8fafc;">fastpath</strong>는 owner를 atomic cmpxchg해 uncontended lock을 얻고, <strong style="color:#f8fafc;">midpath</strong>는 owner가 실행 중이고 reschedule 조건이 없을 때 optimistic spinning하며, <strong style="color:#f8fafc;">slowpath</strong>는 wait queue에 들어가 sleep한다.</p>
+          <p style="margin:0;">즉 “spinlock 대 mutex”를 이분법으로만 보면 실제 구현을 놓친다. 좋은 blocking lock도 짧은 경쟁은 user space 또는 optimistic spin으로 흡수하고, 길어지면 scheduler에 넘긴다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.6 futex는 lock도, 자동 fairness 보장도 아니다</h3>
+          <p style="margin:0 0 9px;">futex word는 모든 64-bit platform에서도 32-bit이며 실제 lock state는 user space가 정의한다. kernel은 특정 address의 word가 expected value와 같을 때만 atomic하게 waiter를 재우고, wake 요청으로 일부 waiter를 runnable하게 만든다.</p>
+          <p style="margin:0;">kernel이 application의 owner, recursion, predicate, fairness를 일반적으로 관리하는 것이 아니다. pthread mutex 구현이 owner bits와 waiter state를 설계하고 futex를 slow-path primitive로 사용한다. PI futex처럼 user/kernel value policy가 추가된 별도 operation은 예외적으로 더 강한 계약을 가진다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.7 compare-and-block이 lost wake를 닫는다</h3>
+          <p style="margin:0 0 9px;">waiter가 user-space에서 “locked”를 본 뒤 syscall에 들어가기 전에 unlock이 일어날 수 있다. kernel이 무조건 sleep시키면 이미 지나간 wake를 놓친다.</p>
+          <p style="margin:0;">FUTEX_WAIT는 word load, expected 비교, sleep 시작을 같은 futex word의 다른 operation과 원자적으로 정렬한다. 값이 이미 바뀌면 <code style="color:#fbbf24;">EAGAIN</code>으로 즉시 돌아와 user-space protocol을 재검사한다. 0으로 정상 wake돼도 spurious wake일 수 있어 상태 loop가 필요하다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. 선택 기준: latency 하나로 결정하지 않는다</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:13px;">
+            <tr><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">질문</td><td style="padding:8px;border:1px solid #29465d;color:#5eead4;font-weight:700;">spin 쪽 신호</td><td style="padding:8px;border:1px solid #29465d;color:#5eead4;font-weight:700;">block 쪽 신호</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">sleep 가능한 context?</td><td style="padding:8px;border:1px solid #29465d;">kernel atomic/interrupt context</td><td style="padding:8px;border:1px solid #29465d;">일반 task/user thread</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">남은 hold time</td><td style="padding:8px;border:1px solid #29465d;">수십~수백 ns처럼 짧고 bounded</td><td style="padding:8px;border:1px solid #29465d;">불명확·µs 이상·I/O 가능</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">CPU 여유</td><td style="padding:8px;border:1px solid #29465d;">owner 전용 CPU가 실제 실행 중</td><td style="padding:8px;border:1px solid #29465d;">oversubscribed·quota throttling</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">contention</td><td style="padding:8px;border:1px solid #29465d;">낮고 waiter 적음</td><td style="padding:8px;border:1px solid #29465d;">burst·waiter 많음·NUMA</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">SLO</td><td style="padding:8px;border:1px solid #29465d;">park overhead도 허용 불가</td><td style="padding:8px;border:1px solid #29465d;">CPU budget·fairness·tail 보호</td></tr>
+          </table>
+          <p style="margin:10px 0 0;color:#a7c7da;font-size:14px;">숫자는 hardware·kernel·topology에 따라 달라지는 출발점일 뿐이다. production workload의 wait/hold distribution과 CPU saturation에서 결정한다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. 실무 best practice</h2>
+          <ol style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">일반 user-space는 pthread mutex부터 시작한다.</strong> 직접 futex/spinlock 구현은 owner death, cancellation, fairness, timeout, memory ordering을 모두 책임질 때만 한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">critical section에서 allocation·I/O·logging·callback을 빼낸다.</strong> unpredictable stall이 spin budget과 tail latency를 동시에 무너뜨린다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">평균이 아니라 분포를 계측한다.</strong> lock hold/wait p50·p95·p99·max, contention ratio, waiter count, timeout, CPU와 context switch를 함께 본다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">adaptive spin에 상한과 탈출 조건을 둔다.</strong> owner가 not-running, need_resched, CPU quota/throttling, spin budget 소진이면 즉시 park한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">sharding과 ownership으로 공유를 줄인다.</strong> lock 알고리즘 최적화보다 per-CPU/per-shard state, message passing, immutable snapshot이 더 큰 효과를 낼 수 있다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">wake-one을 기본으로 검토한다.</strong> 한 resource에 모든 waiter를 깨우면 thundering herd와 cache-line storm이 생긴다. correctness상 모두 깨워야 하는 사건만 broadcast한다.</li>
+            <li><strong style="color:#f8fafc;">benchmark에 oversubscription과 NUMA를 포함한다.</strong> idle 2-core microbenchmark 승자를 production 기본값으로 일반화하지 않는다.</li>
+          </ol>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. error handling과 운영 대응</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:13px;">
+            <tr><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;width:27%;">오류/증거</td><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">해석과 대응</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;"><code style="color:#fbbf24;">EAGAIN</code></td><td style="padding:8px;border:1px solid #29465d;">FUTEX_WAIT 직전 word가 expected와 달라졌다. 오류 로그 폭탄 대신 정상 race로 보고 user-space state loop를 재평가한다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;"><code style="color:#fbbf24;">EINTR</code></td><td style="padding:8px;border:1px solid #29465d;">signal로 wait 중단. cancellation/absolute deadline 정책을 확인하고 상태를 다시 읽은 뒤 재시도 여부를 결정한다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;"><code style="color:#fbbf24;">ETIMEDOUT</code></td><td style="padding:8px;border:1px solid #29465d;">timeout이 먼저 끝남. 같은 absolute deadline을 유지하고 timeout과 unlock의 경합에서 state를 최종 확인한다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;"><code style="color:#fbbf24;">EFAULT/EINVAL</code></td><td style="padding:8px;border:1px solid #29465d;">futex address, alignment, timeout 또는 operation 계약 위반 가능성. retry로 숨기지 말고 programming/configuration error로 격리한다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">CPU 100%, throughput 0</td><td style="padding:8px;border:1px solid #29465d;">descheduled owner, recursive spin, oversubscription을 의심한다. thread stack, on/off-CPU profile, lock owner와 run-queue 상태를 함께 캡처한다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">futex wait 급증</td><td style="padding:8px;border:1px solid #29465d;">futex 자체를 원인으로 단정하지 않는다. 어떤 상위 mutex/condition이 address를 쓰는지 symbol·stack과 연결하고 hold time의 root cause를 찾는다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">waiter starvation</td><td style="padding:8px;border:1px solid #29465d;">wake order/fairness를 가정했는지 검토한다. bounded queue/fair lock/priority protocol 또는 admission control을 SLO와 함께 선택한다.</td></tr>
+          </table>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. 놓치기 쉬운 함정</h2>
+          <ul style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:7px;">“임계 구역 코드가 세 줄”이라는 이유만으로 실제 hold time도 짧다고 가정한다. cache miss, page fault, allocator가 숨어 있다.</li>
+            <li style="margin-bottom:7px;">spinner와 owner가 같은 CPU quota 또는 single core를 경쟁해 owner가 unlock할 시간을 빼앗는다.</li>
+            <li style="margin-bottom:7px;">test-and-set loop가 lock cache line에 write storm을 일으키는데 thread 수만 늘려 benchmark한다.</li>
+            <li style="margin-bottom:7px;">futex syscall 횟수가 적다는 이유로 contention이 없다고 결론 낸다. user-space spinning 비용은 syscall trace에 안 보인다.</li>
+            <li style="margin-bottom:7px;">futex wake가 ownership을 넘긴다고 생각한다. 깨어난 waiter는 다른 thread와 lock word를 다시 경쟁한다.</li>
+            <li style="margin-bottom:7px;">0 return을 predicate 성립으로 믿는다. FUTEX_WAIT는 spurious wake가 가능하다.</li>
+            <li style="margin-bottom:7px;">kernel <code style="color:#fbbf24;">spinlock_t</code> 의미를 PREEMPT_RT와 일반 kernel에서 같다고 설명한다.</li>
+            <li>microbenchmark의 평균 throughput만 비교하고 CPU time, tail wait, fairness, context switch를 측정하지 않는다.</li>
+          </ul>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 30분 실습: 짧은 임계 구역과 긴 임계 구역 비교</h2>
+          <p style="margin:0 0 10px;">교육용 C11 atomic spinlock과 pthread mutex를 같은 counter workload로 비교한다. 정확성은 모두 같아야 하며 성능 순위는 machine마다 달라질 수 있다. 특히 lock 안에 100µs stall을 넣었을 때 spin 횟수와 CPU 낭비를 관찰한다.</p>
+          <pre style="margin:0;padding:14px;background:#06101d;border:1px solid #29465d;border-radius:10px;color:#d1fae5;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word;">LAB_DIR=$(mktemp -d)
+trap 'rm -rf "$LAB_DIR"' EXIT
+cat &gt;"$LAB_DIR/lock_lab.c" &lt;&lt;'C'
+#define _POSIX_C_SOURCE 200809L
+#include &lt;errno.h&gt;
+#include &lt;pthread.h&gt;
+#include &lt;sched.h&gt;
+#include &lt;stdatomic.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;time.h&gt;
+
+enum { THREADS = 4 };
+static atomic_flag spin = ATOMIC_FLAG_INIT;
+static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+static atomic_ulong total_spins;
+static long counter;
+static int use_spin, hold_us, iterations;
+
+static void die(const char *what, int rc) {
+  fprintf(stderr, "%s: %d\n", what, rc);
+  exit(2);
+}
+
+static unsigned long spin_lock(void) {
+  unsigned long tries = 0;
+  while (atomic_flag_test_and_set_explicit(&amp;spin, memory_order_acquire)) {
+    tries++;
+    if ((tries &amp; 1023UL) == 0) sched_yield();
+  }
+  return tries;
+}
+
+static void spin_unlock(void) {
+  atomic_flag_clear_explicit(&amp;spin, memory_order_release);
+}
+
+static void hold_if_requested(void) {
+  if (hold_us == 0) return;
+  struct timespec ts = { .tv_sec = 0, .tv_nsec = hold_us * 1000L };
+  while (nanosleep(&amp;ts, &amp;ts) != 0) {
+    if (errno != EINTR) { perror("nanosleep"); exit(2); }
+  }
+}
+
+static void *worker(void *unused) {
+  (void)unused;
+  unsigned long local_spins = 0;
+  for (int i = 0; i &lt; iterations; i++) {
+    if (use_spin) {
+      local_spins += spin_lock();
+      counter++;
+      hold_if_requested();
+      spin_unlock();
+    } else {
+      int rc = pthread_mutex_lock(&amp;mutex);
+      if (rc != 0) die("mutex lock", rc);
+      counter++;
+      hold_if_requested();
+      rc = pthread_mutex_unlock(&amp;mutex);
+      if (rc != 0) die("mutex unlock", rc);
+    }
+  }
+  atomic_fetch_add_explicit(&amp;total_spins, local_spins, memory_order_relaxed);
+  return NULL;
+}
+
+static double seconds(struct timespec a, struct timespec b) {
+  return (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) / 1e9;
+}
+
+int main(int argc, char **argv) {
+  if (argc != 3 || (strcmp(argv[1], "spin") &amp;&amp; strcmp(argv[1], "mutex"))) {
+    fprintf(stderr, "usage: %s spin|mutex HOLD_US\n", argv[0]);
+    return 2;
+  }
+  use_spin = !strcmp(argv[1], "spin");
+  hold_us = atoi(argv[2]);
+  iterations = hold_us ? 1000 : 50000;
+  pthread_t threads[THREADS];
+  struct timespec start, end;
+  clock_gettime(CLOCK_MONOTONIC, &amp;start);
+  for (int i = 0; i &lt; THREADS; i++) {
+    int rc = pthread_create(&amp;threads[i], NULL, worker, NULL);
+    if (rc != 0) die("pthread_create", rc);
+  }
+  for (int i = 0; i &lt; THREADS; i++) {
+    int rc = pthread_join(threads[i], NULL);
+    if (rc != 0) die("pthread_join", rc);
+  }
+  clock_gettime(CLOCK_MONOTONIC, &amp;end);
+  long expected = (long)THREADS * iterations;
+  printf("mode=%s hold_us=%d counter=%ld expected=%ld seconds=%.3f spins=%lu\n",
+         argv[1], hold_us, counter, expected, seconds(start, end),
+         atomic_load_explicit(&amp;total_spins, memory_order_relaxed));
+  return counter == expected ? 0 : 1;
+}
+C
+cc -std=c11 -O2 -Wall -Wextra -pthread "$LAB_DIR/lock_lab.c" -o "$LAB_DIR/lock_lab"
+for hold in 0 100; do
+  for mode in mutex spin; do
+    /usr/bin/time -p "$LAB_DIR/lock_lab" "$mode" "$hold"
+  done
+done
+
+# Linux에서만: blocking slow path가 보이는지 확인
+if command -v strace &gt;/dev/null 2&gt;&amp;1; then
+  strace -f -e futex -c "$LAB_DIR/lock_lab" mutex 100
+fi</pre>
+          <ol style="margin:12px 0 0;padding-left:22px;">
+            <li style="margin-bottom:6px;">10분: 네 실행에서 <code style="color:#fbbf24;">counter==expected</code>를 먼저 확인한다. 성능보다 correctness가 선행한다.</li>
+            <li style="margin-bottom:6px;">10분: <code style="color:#fbbf24;">hold_us=0</code>과 100에서 wall/user time과 spin 횟수를 표로 만든다. 장시간 spin이 CPU budget을 어떻게 쓰는지 설명한다.</li>
+            <li>10분: THREADS를 CPU 수의 2배로 바꾸어 oversubscription을 재측정한다. Linux라면 strace의 futex call은 상위 mutex slow path의 증거이지 전체 contention cost가 아님을 기록한다.</li>
+          </ol>
+          <p style="margin:10px 0 0;color:#fca5a5;font-size:13px;">주의: 이 atomic_flag lock은 학습용이다. bounded backoff, cancellation, owner validation, fairness, robust recovery가 없어 production에 복사하지 않는다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. 실패 시나리오: latency 개선 spin이 장애를 키웠다</h2>
+          <div style="padding:16px;background:#261423;border:1px solid #7f1d4e;border-radius:10px;">
+            <p style="margin:0 0 9px;"><strong style="color:#fbcfe8;">변경:</strong> queue lock의 99% 획득이 짧다는 microbenchmark를 보고 waiter가 최대 1ms spin하도록 배포했다.</p>
+            <p style="margin:0 0 9px;"><strong style="color:#fbcfe8;">사건:</strong> CPU quota가 걸린 container에서 lock owner가 deschedule됐다. 수십 spinner가 quota를 먼저 소진해 owner 실행과 unlock을 늦췄고, throughput은 0에 가까워지며 p99가 폭증했다.</p>
+            <p style="margin:0 0 9px;"><strong style="color:#fbcfe8;">증거:</strong> runnable thread와 CPU throttling 증가, off-CPU owner stack, on-CPU atomic retry hotspot, lock wait/hold max, context switch와 futex call 변화를 같은 배포 시점에 맞춘다.</p>
+            <p style="margin:0 0 9px;"><strong style="color:#fbcfe8;">즉시 완화:</strong> adaptive spin budget을 0 또는 이전값으로 rollback하고 admission control로 waiter 수를 제한한다. process 전체 restart 전에 thread dump와 profile을 보존한다.</p>
+            <p style="margin:0;"><strong style="color:#fbcfe8;">영구 수정:</strong> owner-running/need-resched 탈출, CPU quota 환경 benchmark, hold-time max 경보, critical-section I/O 제거와 sharding을 적용한다.</p>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 대기업 면접 질문 3개</h2>
+          <ol style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:12px;"><strong style="color:#f8fafc;">“spinlock과 mutex 중 무엇이 더 빠른가요?”</strong><br>답변 포인트: 절대 순위가 없다. remaining hold time과 park/wake/schedule 비용, owner 실행 여부, CPU 여유, contention과 topology를 비교한다. spin은 context switch를 피하지만 CPU·coherence를 쓰고, block은 scheduling 비용 대신 CPU를 양보한다. 실제 mutex는 adaptive hybrid일 수 있다.</li>
+            <li style="margin-bottom:12px;"><strong style="color:#f8fafc;">“futex는 mutex와 무엇이 다른가요?”</strong><br>답변 포인트: mutex는 ownership과 mutual-exclusion API/contract이고 futex는 Linux wait/wake mechanism이다. lock word와 fast path는 user space가 관리하며 kernel은 expected-value compare-and-block와 wake를 제공한다. uncontended mutex는 futex syscall 없이 끝날 수 있다.</li>
+            <li><strong style="color:#f8fafc;">“kernel spinlock을 잡은 채 sleep하면 왜 안 되나요?”</strong><br>답변 포인트: non-RT spinning lock은 preemption/interrupt context와 결합되고 waiter는 owner가 곧 실행해 unlock한다고 가정한다. owner가 schedule-out되면 progress와 latency가 깨지며 atomic context에서 sleeping 자체가 불법이다. IRQ 공유라면 same-CPU interrupt self-deadlock 방지 variant가 필요하고 PREEMPT_RT의 spinlock_t 차이도 언급한다.</li>
+          </ol>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 퀴즈·누적 리뷰</h2>
+          <ol style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:6px;">lock holder가 다른 core에서 RUNNING인 경우와 같은 single CPU에서 preempt된 경우, spin의 기대 이득은 왜 반대인가?</li>
+            <li style="margin-bottom:6px;">FUTEX_WAIT가 expected와 달라 EAGAIN을 반환하는 것이 lost wake를 어떻게 막는가?</li>
+            <li style="margin-bottom:6px;">futex syscall이 0건이어도 lock contention 또는 synchronization 비용이 존재할 수 있는 이유는?</li>
+            <li style="margin-bottom:6px;">Day 16 복습: condition variable wait의 atomic unlock-and-wait와 futex compare-and-block은 어느 race를 닫는가?</li>
+            <li>Day 11 복습: NUMA와 CPU affinity가 spinlock cache-line bouncing과 owner progress에 어떤 영향을 주는가?</li>
+          </ol>
+          <p style="margin:11px 0 0;color:#a7c7da;font-size:14px;">정답 핵심: spin은 owner가 실제 실행돼야 progress한다. EAGAIN은 이미 바뀐 상태에서 sleep 진입을 거부한다. user-space atomic retry는 syscall trace 밖에 있다. 두 atomic transition은 “확인 후 sleep 전”의 lost-wakeup window를 닫는다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 다음 날 연결</h2>
+          <p style="margin:0;">Day 18에서는 <strong style="color:#f8fafc;">deadlock 네 조건과 예방·회피·탐지</strong>를 다룬다. spin과 block 어느 쪽도 잘못된 lock dependency cycle을 해결하지 못한다. resource graph, global lock order, try-lock rollback, timeout과 production detector로 이어간다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">15. 공식·1차 출처</h2>
+          <ul style="margin:0;padding-left:22px;color:#a7c7da;">
+            <li><a href="https://docs.kernel.org/locking/spinlocks.html" style="color:#67e8f9;">Linux kernel docs — Lesson 1: Spin locks</a>: IRQ variant, same-CPU interrupt deadlock과 memory barrier</li>
+            <li><a href="https://docs.kernel.org/locking/locktypes.html" style="color:#67e8f9;">Linux kernel docs — Lock types and their rules</a>: sleeping/spinning context와 PREEMPT_RT semantics</li>
+            <li><a href="https://docs.kernel.org/locking/mutex-design.html" style="color:#67e8f9;">Linux kernel docs — Generic Mutex Subsystem</a>: fastpath, optimistic-spinning midpath, sleeping slowpath</li>
+            <li><a href="https://man7.org/linux/man-pages/man2/futex.2.html" style="color:#67e8f9;">Linux man-pages — futex(2)</a>: 32-bit word, user-space fast path와 atomic compare-and-block</li>
+            <li><a href="https://man7.org/linux/man-pages/man2/FUTEX_WAIT.2const.html" style="color:#67e8f9;">Linux man-pages — FUTEX_WAIT(2const)</a>: expected-value 검사, spurious wake, EAGAIN·EINTR·ETIMEDOUT</li>
+            <li><a href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/pthread_mutex_lock.html" style="color:#67e8f9;">POSIX.1-2024 — pthread_mutex_lock/unlock</a>: user-facing mutex ownership과 오류 계약</li>
+            <li><a href="https://docs.kernel.org/core-api/wrappers/memory-barriers.html" style="color:#67e8f9;">Linux kernel docs — Memory Barriers</a>: lock acquire/release와 CPU/compiler ordering</li>
+          </ul>
+        </td></tr>
+        <tr><td style="padding:18px 28px;background:#081522;border-top:1px solid #1e3a4c;color:#7fa4ba;font-size:12px;">Operating System 심화 커리큘럼 · Week 3 Concurrency and Synchronization</td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>

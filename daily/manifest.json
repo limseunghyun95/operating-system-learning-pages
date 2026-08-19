@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-08-18T09:20:06+09:00",
+  "updatedAt": "2026-08-19T09:00:16+09:00",
   "lessons": [
     {
       "day": 1,
@@ -149,6 +149,15 @@
       "path": "day-16.html",
       "kind": "lesson",
       "publishedAt": "2026-08-18T09:20:06+09:00"
+    },
+    {
+      "day": 17,
+      "week": 3,
+      "title": "spinlock, blocking lock, futex의 역할 경계",
+      "summary": "spin과 blocking의 break-even을 owner progress·hold time·scheduler 비용·oversubscription으로 판단하고 Linux mutex의 hybrid 경로와 futex compare-and-block, kernel context 규칙까지 연결합니다.",
+      "path": "day-17.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-19T09:00:16+09:00"
     }
   ]
 }
