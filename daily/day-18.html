@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operating System 심화 커리큘럼 Day 18 - deadlock 네 조건과 예방·회피·탐지</title>
+</head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.68;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#07111f;">
+    <tr><td align="center" style="padding:20px 10px 44px;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#0b1728;border:1px solid #1e3a4c;border-radius:18px;overflow:hidden;">
+        <tr><td style="padding:30px 28px;background:#102438;border-bottom:1px solid #1e3a4c;">
+          <div style="font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:#5eead4;font-weight:800;">Operating System · Day 18 / 63 · Concurrency</div>
+          <h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">deadlock 네 조건과 예방·회피·탐지</h1>
+          <p style="margin:0;color:#a5f3fc;font-size:16px;">한 줄 요약 — deadlock은 <strong style="color:#f8fafc;">상호 배제·점유 대기·비선점·순환 대기</strong>가 동시에 성립해 모두가 다른 resource를 기다리며 진전하지 못하는 상태다. 실무 해법은 global lock order로 cycle을 설계 단계에서 끊고, lock graph와 thread dump로 탐지하며, timeout 뒤에는 안전한 rollback·retry·fencing을 수행하는 것이다.</p>
+        </td></tr>
+        <tr><td style="padding:26px 28px;">
+          <h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:14px;">
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;width:31%;">deadlock</td><td style="padding:9px;border:1px solid #29465d;">여러 실행 주체가 서로 가진 resource를 기다려 누구도 다음 단계로 갈 수 없는 영구 대기 상태.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">resource</td><td style="padding:9px;border:1px solid #29465d;">동시에 제한된 수만 사용할 수 있는 대상. mutex, DB row lock, connection, file lock, device 등이 포함된다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">mutual exclusion</td><td style="padding:9px;border:1px solid #29465d;">한 resource instance를 한 실행 주체만 독점 사용하는 조건. 상호 배제.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">hold and wait</td><td style="padding:9px;border:1px solid #29465d;">이미 resource를 가진 채 다른 resource를 추가로 기다리는 조건. 점유 대기.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">no preemption</td><td style="padding:9px;border:1px solid #29465d;">OS나 다른 thread가 owner의 resource를 강제로 안전하게 회수할 수 없고 owner가 직접 놓아야 하는 조건. 비선점.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">circular wait</td><td style="padding:9px;border:1px solid #29465d;">T1이 T2를, T2가 T3를, 마지막이 다시 T1을 기다리는 cycle. 순환 대기.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">resource-allocation graph</td><td style="padding:9px;border:1px solid #29465d;">thread/process와 resource를 node로, 보유·요청 관계를 방향 edge로 표현한 graph.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">wait-for graph</td><td style="padding:9px;border:1px solid #29465d;">resource node를 접어 “T1이 T2를 기다림”만 표현한 graph. cycle detection에 쓴다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">safe state</td><td style="padding:9px;border:1px solid #29465d;">모든 participant가 최대 요구량까지 요청해도 어떤 완료 순서가 존재하는 resource allocation 상태.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">lock order</td><td style="padding:9px;border:1px solid #29465d;">모든 code path가 여러 lock을 얻을 때 지키는 하나의 total/partial ordering 규칙.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">victim</td><td style="padding:9px;border:1px solid #29465d;">deadlock cycle을 끊기 위해 abort/rollback하도록 선택된 transaction이나 task.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">livelock</td><td style="padding:9px;border:1px solid #29465d;">실행 주체들이 계속 상태를 바꾸지만 서로 양보·재시도만 하며 useful progress가 없는 상태.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">starvation</td><td style="padding:9px;border:1px solid #29465d;">전체 시스템은 진전하지만 특정 participant가 계속 선택되지 못해 resource를 얻지 못하는 상태.</td></tr>
+          </table>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 서로 다른 열쇠를 쥔 두 사람</h2>
+          <div style="padding:16px;background:#0f2035;border-left:4px solid #5eead4;border-radius:8px;">
+            <p style="margin:0 0 9px;">Alice는 금고 A 열쇠를 가진 채 B 열쇠를 기다리고, Bob은 B 열쇠를 가진 채 A 열쇠를 기다린다. 열쇠는 한 명만 쓸 수 있고, 빼앗을 수 없으며, 둘 다 먼저 가진 열쇠를 놓지 않는다.</p>
+            <p style="margin:0;">“조금 더 기다리면 풀린다”는 가정이 틀렸다. 기다림 자체가 상대가 unlock할 code에 도달하는 것을 막기 때문이다. 네 조건 중 하나를 설계로 제거하거나, cycle을 찾아 한 작업을 안전하게 rollback해야 한다.</p>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: resource-allocation graph에서 wait-for cycle까지</h2>
+          <div style="overflow:auto;padding:16px;background:#06101d;border:1px solid #29465d;border-radius:10px;">
+            <pre style="margin:0;color:#c4f1f9;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;">Resource-allocation graph
+
+ Thread T1 ──request──► Lock B ──allocated──► Thread T2
+    ▲                                               │
+    │                                               │ request
+    │                                               ▼
+ Lock A ◄──request── Thread T2 ◄──allocated───── Lock B
+    │
+    └──allocated──► Thread T1
+
+Resource node를 접으면:
+        T1 ──waits for B owner──► T2
+        T2 ──waits for A owner──► T1
+          └──────── cycle ────────┘
+
+Application: lock(A) → lock(B) / lock(B) → lock(A)
+      │
+libc/runtime: mutex state + owner + futex wait
+      │
+kernel: waiter BLOCKED, scheduler는 깨울 event가 오기만 기다림
+      │
+hardware: CPU가 낮아도 progress 0일 수 있음
+
+단일-instance resource: cycle ⇔ deadlock
+다중-instance resource: cycle은 필요 조건일 수 있지만 그것만으로 확정 불가</pre>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. 상태 전이: 정상 대기와 deadlock의 갈림길</h2>
+          <div style="overflow:auto;padding:16px;background:#06101d;border:1px solid #29465d;border-radius:10px;">
+            <pre style="margin:0;color:#c4f1f9;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;">정상 경로
+RUNNING → acquire A → acquire B → mutate → release B → release A
+                         ▲
+waiter: BLOCKED ──wake───┘                 progress 존재
+
+ABBA 경로
+T1: acquire A → wait B ───────────────┐
+                                      │ no unlock reachable
+T2: acquire B → wait A ───────────────┘
+states: T1 BLOCKED + T2 BLOCKED, cycle 유지
+
+탐지·복구 경로
+timeout / graph detector / lockdep warning / thread dump
+  → evidence 보존
+  → victim 선택
+  → transaction rollback 또는 process restart
+  → idempotent bounded retry + jitter
+  → lock order 수정과 regression test</pre>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. CS·kernel·hardware deep dive</h2>
+          <h3 style="margin:16px 0 8px;color:#f8fafc;font-size:17px;">5.1 Coffman 네 조건은 동시에 봐야 한다</h3>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:13px;">
+            <tr><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;width:25%;">조건</td><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">ABBA에서의 증거</td><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">깨는 전략</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">상호 배제</td><td style="padding:8px;border:1px solid #29465d;">A/B mutex는 owner 한 명</td><td style="padding:8px;border:1px solid #29465d;">immutable snapshot, ownership 분리, lock-free</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">점유 대기</td><td style="padding:8px;border:1px solid #29465d;">A를 가진 채 B wait</td><td style="padding:8px;border:1px solid #29465d;">all-or-none 획득, try-lock 실패 시 전부 release</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">비선점</td><td style="padding:8px;border:1px solid #29465d;">다른 thread의 mutex를 강제 unlock 불가</td><td style="padding:8px;border:1px solid #29465d;">transaction abort/rollback 가능한 resource 설계</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">순환 대기</td><td style="padding:8px;border:1px solid #29465d;">T1→T2→T1 cycle</td><td style="padding:8px;border:1px solid #29465d;">global lock hierarchy A&lt;B</td></tr>
+          </table>
+          <p style="margin:10px 0 0;">deadlock 상태에서는 네 조건이 함께 성립한다. 네 조건이 가능한 설계라고 해서 매 실행이 deadlock인 것은 아니지만, 하나를 구조적으로 불가능하게 만들면 해당 종류의 deadlock을 예방할 수 있다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.2 cycle 의미는 resource instance 수에 따라 다르다</h3>
+          <p style="margin:0 0 9px;">각 resource type에 instance가 하나뿐이면 wait-for cycle은 deadlock의 필요충분 신호다. semaphore permit나 connection pool처럼 instance가 여러 개면 cycle이 있어도 cycle 밖 participant가 resource를 반환해 풀릴 수 있다.</p>
+          <p style="margin:0;">그래서 detector는 node만 보지 않고 allocation 수, outstanding request, owner, reclaim 가능성을 함께 모델링한다. 단순 timeout 한 번은 cycle proof가 아니라 overload·slow I/O·scheduler delay도 포함한 증상이다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.3 예방, 회피, 탐지는 서로 다른 전략이다</h3>
+          <p style="margin:0 0 9px;"><strong style="color:#f8fafc;">예방</strong>은 lock order처럼 네 조건 하나를 항상 깨는 설계다. <strong style="color:#f8fafc;">회피</strong>는 Banker algorithm처럼 각 participant의 최대 요구량을 알고 allocation 후에도 safe completion sequence가 남을 때만 허용한다.</p>
+          <p style="margin:0;"><strong style="color:#f8fafc;">탐지·복구</strong>는 allocation을 허용하되 wait-for cycle을 주기적으로 찾고 victim을 abort한다. 일반 service code는 최대 resource claim을 미리 알기 어려워 order 예방을 주로 쓰고, DB engine은 transaction rollback이 가능해 detection/victim 전략을 자주 쓴다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.4 Linux lockdep는 실제 정지 전에 dependency를 학습한다</h3>
+          <p style="margin:0 0 9px;">kernel lockdep는 개별 lock address만이 아니라 논리적으로 같은 <strong style="color:#f8fafc;">lock class</strong>를 추적한다. task가 L1을 가진 채 L2를 획득하면 <code style="color:#fbbf24;">L1 → L2</code> dependency edge를 기록한다.</p>
+          <p style="margin:0;">다른 경로에서 <code style="color:#fbbf24;">L2 → L1</code>이 관찰되면 그 실행이 아직 동시에 막히지 않았어도 future cycle 가능성을 warning한다. IRQ-safe/unsafe usage까지 검증한다. 다만 실행 중 관찰한 경로에 기반하므로 test coverage가 proof의 범위를 제한한다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.5 scheduler와 futex는 dependency를 해결하지 않는다</h3>
+          <p style="margin:0 0 9px;">blocking mutex waiter는 futex wait queue에서 BLOCKED가 되고 CPU는 다른 task에 배정된다. scheduler는 wake event가 없다는 사실만 알 뿐 application의 A→B→A invariant를 자동으로 rollback하지 않는다.</p>
+          <p style="margin:0;">그래서 user-space blocking deadlock은 CPU 사용률이 낮고 load average나 queue만 오르는 형태가 흔하다. 반대로 spinlock cycle은 waiter가 RUNNING하며 CPU를 태울 수 있다. “CPU가 100%가 아니므로 lock 문제 아님”은 잘못된 진단이다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.6 timeout은 안전한 preemption이 아니다</h3>
+          <p style="margin:0 0 9px;"><code style="color:#fbbf24;">pthread_mutex_timedlock</code>의 ETIMEDOUT은 caller가 mutex를 얻지 못하고 deadline을 넘겼다는 뜻이다. 이미 다른 mutex나 외부 side effect를 가진 caller가 그냥 return하면 invariant나 permit가 leak될 수 있다.</p>
+          <p style="margin:0;">timeout 경로는 “획득한 resource를 역순 release → partial state rollback → idempotent retry 여부 결정”이라는 transaction이어야 한다. 각 단계에서 새 timeout을 시작하지 않고 하나의 absolute deadline을 전파한다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.7 deadlock, livelock, starvation을 구분한다</h3>
+          <p style="margin:0 0 9px;">deadlock은 상태가 고정되고 cycle participant 모두 progress가 없다. livelock은 try-lock 실패 때 둘 다 동시에 release·retry해 CPU와 상태 변화는 있지만 계속 충돌한다. starvation은 다른 thread들은 진행하지만 특정 waiter만 선택되지 않는다.</p>
+          <p style="margin:0;">해법도 다르다. deadlock에는 order/cycle break, livelock에는 randomized backoff·winner rule, starvation에는 fairness·queueing·aging이 필요하다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. 전략 선택표</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:13px;">
+            <tr><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">전략</td><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">장점</td><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">비용/전제</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;color:#5eead4;font-weight:700;">global order</td><td style="padding:8px;border:1px solid #29465d;">cycle을 construction으로 차단</td><td style="padding:8px;border:1px solid #29465d;">모든 path·callback·동적 객체에 일관 적용</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;color:#5eead4;font-weight:700;">all-or-none</td><td style="padding:8px;border:1px solid #29465d;">hold-and-wait 제거</td><td style="padding:8px;border:1px solid #29465d;">동시성 저하, resource set을 미리 알아야 함</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;color:#5eead4;font-weight:700;">try + rollback</td><td style="padding:8px;border:1px solid #29465d;">영구 block 방지</td><td style="padding:8px;border:1px solid #29465d;">완전한 cleanup, bounded retry와 jitter 필요</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;color:#5eead4;font-weight:700;">avoidance</td><td style="padding:8px;border:1px solid #29465d;">safe state만 허용</td><td style="padding:8px;border:1px solid #29465d;">maximum claim 정보와 계산 비용</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;color:#5eead4;font-weight:700;">detect + victim</td><td style="padding:8px;border:1px solid #29465d;">resource utilization 높음</td><td style="padding:8px;border:1px solid #29465d;">rollback 가능한 transaction과 victim 정책</td></tr>
+          </table>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. 실무 best practice</h2>
+          <ol style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">lock hierarchy를 code와 문서에 같이 둔다.</strong> 예: shard → account → entry. code review와 debug assertion이 동일 규칙을 검사하게 한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">동적 객체는 stable key로 정렬한다.</strong> business ID나 monotonic rank를 쓰고 같은 rank의 tie-breaker를 정의한다. lifetime이 바뀌는 raw address order를 함부로 protocol로 삼지 않는다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">open call을 lock 밖으로 뺀다.</strong> user callback, plugin, RPC, logging handler가 어떤 lock을 재진입할지 알 수 없다. 필요한 snapshot만 복사하고 unlock 후 호출한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">timeout budget과 cleanup을 API 계약으로 만든다.</strong> 획득한 resource list를 추적해 실패 시 역순 release하고 retryable/non-retryable을 분리한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">debug detector를 CI·staging에 켠다.</strong> Linux kernel lockdep, language runtime thread detector, DB deadlock log를 stress test와 조합한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">production에는 blocked-time telemetry를 둔다.</strong> lock wait p99/max, waiter·owner ID, transaction age, pool availability, deadlock victim count와 deployment marker를 수집한다.</li>
+            <li><strong style="color:#f8fafc;">recovery를 idempotent하게 만든다.</strong> DB victim retry, worker restart, lease expiry 뒤에도 중복 side effect가 없도록 operation ID와 fencing token을 사용한다.</li>
+          </ol>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. error handling과 incident runbook</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:13px;">
+            <tr><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;width:28%;">오류/증거</td><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">정확한 대응</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;"><code style="color:#fbbf24;">EDEADLK</code></td><td style="padding:8px;border:1px solid #29465d;">ERRORCHECK self-lock 등 제한적 검출. 모든 mutex cycle이 이 오류로 돌아온다고 기대하지 말고 programming error로 조사한다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;"><code style="color:#fbbf24;">EBUSY</code></td><td style="padding:8px;border:1px solid #29465d;">trylock 경쟁. 정상 backpressure일 수 있다. 가진 lock을 release하고 bounded jitter retry 또는 상위 queue로 반환한다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;"><code style="color:#fbbf24;">ETIMEDOUT</code></td><td style="padding:8px;border:1px solid #29465d;">deadline 초과. deadlock 확정이 아니라 증상이다. partial acquisition을 rollback하고 stacks/graph를 보존한 뒤 정책대로 실패한다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;"><code style="color:#fbbf24;">EOWNERDEAD</code></td><td style="padding:8px;border:1px solid #29465d;">robust mutex owner 사망. mutex를 획득했지만 state는 inconsistent할 수 있으므로 검증·복구 후 consistent 처리한다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;"><code style="color:#fbbf24;">ENOTRECOVERABLE</code></td><td style="padding:8px;border:1px solid #29465d;">보호 상태 복구 실패. 재시도로 숨기지 말고 객체/worker를 격리하고 durable source에서 재구축한다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">서비스 정지</td><td style="padding:8px;border:1px solid #29465d;">서로 다른 시점의 thread dump 2~3개, owner/waiter stack, lock address/class, request ID, DB lock graph, CPU·queue를 먼저 보존한다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">Linux kernel wait</td><td style="padding:8px;border:1px solid #29465d;"><code style="color:#fbbf24;">/proc/PID/stack</code>은 CONFIG_STACKTRACE와 ptrace 권한이 필요하다. hung-task/lockdep warning 전체를 잘리지 않게 수집한다.</td></tr>
+          </table>
+          <p style="margin:10px 0 0;color:#fca5a5;font-size:13px;">막힌 thread 하나를 임의로 강제 종료하거나 다른 owner의 mutex를 unlock하면 protected invariant가 손상될 수 있다. process/transaction 단위의 검증된 rollback 경계를 사용한다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. 놓치기 쉬운 함정</h2>
+          <ul style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:7px;">각 함수 내부 lock order는 맞지만 callback·destructor·error path에서 반대 순서로 재진입한다.</li>
+            <li style="margin-bottom:7px;">recursive mutex로 self-deadlock만 숨기고 공유 invariant와 lock hierarchy를 더 복잡하게 만든다.</li>
+            <li style="margin-bottom:7px;">read lock을 가진 채 write lock으로 upgrade해 다른 upgrader와 서로 기다린다.</li>
+            <li style="margin-bottom:7px;">condition wait가 전달한 mutex 하나만 release한다는 사실을 잊고 다른 lock을 가진 채 sleep한다.</li>
+            <li style="margin-bottom:7px;">trylock 실패 시 일부 resource·permit·side effect를 rollback하지 않아 다음 cycle의 씨앗을 남긴다.</li>
+            <li style="margin-bottom:7px;">양쪽 thread가 같은 고정 backoff로 release/retry해 deadlock을 livelock으로 바꾼다.</li>
+            <li style="margin-bottom:7px;">timeout마다 새 deadline을 시작해 end-to-end SLO를 초과하고 retry storm을 만든다.</li>
+            <li style="margin-bottom:7px;">thread dump 한 장에서 같은 lock address만 찾고 실제 owner가 DB·RPC·pool 같은 외부 resource를 기다리는 cross-system cycle을 놓친다.</li>
+            <li>lockdep warning을 “이번 실행은 안 멈췄다”며 무시한다. warning은 서로 다른 path의 dependency를 합쳐 future cycle을 보여줄 수 있다.</li>
+          </ul>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 30분 실패 실습: ABBA를 보장해서 만들고 order로 제거</h2>
+          <p style="margin:0 0 10px;">두 thread가 A/B를 반대로 잡도록 atomic gate로 동기화한다. watchdog이 400ms 뒤 wait-for cycle 증거를 출력하고 process를 안전하게 끝내므로 실습이 무한히 멈추지 않는다. 이어 두 thread 모두 A→B 순서를 지켜 완료되는지 비교한다.</p>
+          <pre style="margin:0;padding:14px;background:#06101d;border:1px solid #29465d;border-radius:10px;color:#d1fae5;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word;">LAB_DIR=$(mktemp -d)
+trap 'rm -rf "$LAB_DIR"' EXIT
+cat &gt;"$LAB_DIR/deadlock_lab.c" &lt;&lt;'C'
+#define _POSIX_C_SOURCE 200809L
+#include &lt;pthread.h&gt;
+#include &lt;sched.h&gt;
+#include &lt;stdatomic.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;time.h&gt;
+#include &lt;unistd.h&gt;
+
+static pthread_mutex_t a = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t b = PTHREAD_MUTEX_INITIALIZER;
+static atomic_int ready, completed;
+
+static void check(int rc, const char *what) {
+  if (rc != 0) { fprintf(stderr, "%s: %d\n", what, rc); exit(2); }
+}
+
+static void gate(void) {
+  atomic_fetch_add_explicit(&amp;ready, 1, memory_order_release);
+  while (atomic_load_explicit(&amp;ready, memory_order_acquire) != 2)
+    sched_yield();
+}
+
+static void *take_a_then_b(void *unused) {
+  (void)unused;
+  check(pthread_mutex_lock(&amp;a), "T1 lock A");
+  gate();
+  check(pthread_mutex_lock(&amp;b), "T1 wait B");
+  atomic_fetch_add(&amp;completed, 1);
+  check(pthread_mutex_unlock(&amp;b), "T1 unlock B");
+  check(pthread_mutex_unlock(&amp;a), "T1 unlock A");
+  return NULL;
+}
+
+static void *take_b_then_a(void *unused) {
+  (void)unused;
+  check(pthread_mutex_lock(&amp;b), "T2 lock B");
+  gate();
+  check(pthread_mutex_lock(&amp;a), "T2 wait A");
+  atomic_fetch_add(&amp;completed, 1);
+  check(pthread_mutex_unlock(&amp;a), "T2 unlock A");
+  check(pthread_mutex_unlock(&amp;b), "T2 unlock B");
+  return NULL;
+}
+
+static void *watchdog(void *unused) {
+  (void)unused;
+  struct timespec delay = { .tv_sec = 0, .tv_nsec = 400000000L };
+  nanosleep(&amp;delay, NULL);
+  int r = atomic_load(&amp;ready), c = atomic_load(&amp;completed);
+  printf("deadlock-observed ready=%d completed=%d ", r, c);
+  printf("wait-for=T1-&gt;B-&gt;T2-&gt;A-&gt;T1\n");
+  fflush(stdout);
+  _Exit(r == 2 &amp;&amp; c == 0 ? 0 : 3);
+}
+
+static void *ordered(void *unused) {
+  (void)unused;
+  check(pthread_mutex_lock(&amp;a), "ordered lock A");
+  check(pthread_mutex_lock(&amp;b), "ordered lock B");
+  atomic_fetch_add(&amp;completed, 1);
+  check(pthread_mutex_unlock(&amp;b), "ordered unlock B");
+  check(pthread_mutex_unlock(&amp;a), "ordered unlock A");
+  return NULL;
+}
+
+int main(int argc, char **argv) {
+  setvbuf(stdout, NULL, _IONBF, 0);
+  if (argc != 2) return 2;
+  pthread_t t1, t2, wd;
+  if (!strcmp(argv[1], "deadlock")) {
+    check(pthread_create(&amp;t1, NULL, take_a_then_b, NULL), "create T1");
+    check(pthread_create(&amp;t2, NULL, take_b_then_a, NULL), "create T2");
+    check(pthread_create(&amp;wd, NULL, watchdog, NULL), "create watchdog");
+    check(pthread_join(wd, NULL), "join watchdog");
+  } else if (!strcmp(argv[1], "ordered")) {
+    check(pthread_create(&amp;t1, NULL, ordered, NULL), "create O1");
+    check(pthread_create(&amp;t2, NULL, ordered, NULL), "create O2");
+    check(pthread_join(t1, NULL), "join O1");
+    check(pthread_join(t2, NULL), "join O2");
+    printf("ordered completed=%d lock-order=A-&gt;B\n", atomic_load(&amp;completed));
+  } else return 2;
+  return 0;
+}
+C
+cc -std=c11 -O2 -Wall -Wextra -pthread "$LAB_DIR/deadlock_lab.c" -o "$LAB_DIR/deadlock_lab"
+"$LAB_DIR/deadlock_lab" deadlock
+"$LAB_DIR/deadlock_lab" ordered
+
+# expected:
+# deadlock-observed ready=2 completed=0 wait-for=T1-&gt;B-&gt;T2-&gt;A-&gt;T1
+# ordered completed=2 lock-order=A-&gt;B</pre>
+          <ol style="margin:12px 0 0;padding-left:22px;">
+            <li style="margin-bottom:6px;">10분: ABBA 출력에서 allocation edge(A→T1, B→T2)와 request edge(T1→B, T2→A)를 직접 그린다.</li>
+            <li style="margin-bottom:6px;">10분: ordered mode가 어느 Coffman 조건을 깨는지 설명한다. 상호 배제는 남지만 circular wait가 불가능하다.</li>
+            <li>10분: trylock+rollback 방식으로 바꾼다면 필요한 cleanup list, retry cap, jitter, end-to-end deadline을 pseudo-code로 적는다. 무제한 retry는 livelock이 될 수 있다.</li>
+          </ol>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. 실패 시나리오: 배포 후 요청이 멈췄지만 CPU는 15%</h2>
+          <div style="padding:16px;background:#261423;border:1px solid #7f1d4e;border-radius:10px;">
+            <p style="margin:0 0 9px;"><strong style="color:#fbcfe8;">증상:</strong> latency와 queue depth가 상승하고 worker 대부분은 futex wait, CPU는 낮다. DB connection pool도 고갈된다.</p>
+            <p style="margin:0 0 9px;"><strong style="color:#fbcfe8;">cycle:</strong> request T1은 account mutex를 가진 채 DB connection을 기다리고, pool-maintainer T2는 connection을 가진 채 metrics callback에서 account mutex를 기다린다.</p>
+            <p style="margin:0 0 9px;"><strong style="color:#fbcfe8;">evidence:</strong> thread dump 3회에서 같은 owner/waiter stack, pool checkout age, request ID와 deployment diff를 보존한다. mutex address만이 아니라 external resource edge까지 graph에 넣는다.</p>
+            <p style="margin:0 0 9px;"><strong style="color:#fbcfe8;">완화:</strong> 새 유입을 차단하고 이전 버전으로 rollback한 뒤 process 단위로 안전하게 restart한다. blocked thread만 강제 종료하지 않는다.</p>
+            <p style="margin:0;"><strong style="color:#fbcfe8;">영구 수정:</strong> account lock 안에서 connection checkout/callback을 금지하고, snapshot 후 unlock, bounded pool deadline, transaction rollback과 lock-order test를 추가한다.</p>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 대기업 면접 질문 3개</h2>
+          <ol style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:12px;"><strong style="color:#f8fafc;">“deadlock의 네 조건과 가장 실용적인 예방책은?”</strong><br>답변 포인트: mutual exclusion, hold-and-wait, no preemption, circular wait를 정의하고 모두 동시에 성립해야 함을 말한다. mutex를 없애기 어려우므로 global lock order로 circular wait를 construction에서 끊는 방법이 일반적이다. dynamic resource rank와 callback/error path까지 포함해야 한다.</li>
+            <li style="margin-bottom:12px;"><strong style="color:#f8fafc;">“resource graph에 cycle이 있으면 항상 deadlock인가요?”</strong><br>답변 포인트: single-instance resource는 cycle이 필요충분이지만 multiple-instance는 cycle만으로 충분하지 않을 수 있다. allocation/request count와 cycle 밖 release 가능성을 봐야 한다. wait-for graph의 modeling 가정을 먼저 명시한다.</li>
+            <li><strong style="color:#f8fafc;">“timeout을 넣으면 deadlock이 해결되나요?”</strong><br>답변 포인트: 영구 wait는 제한하지만 dependency cycle 원인을 제거하지 않는다. timeout은 overload와 deadlock을 구분하지 못하고, partial locks/state를 완전히 rollback해야 한다. bounded idempotent retry, jitter, absolute deadline, evidence와 근본 lock-order 수정이 필요하다.</li>
+          </ol>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 퀴즈·누적 리뷰</h2>
+          <ol style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:6px;">T1: A→B, T2: B→C, T3: C→A의 wait-for graph와 Coffman 네 조건을 표시하라.</li>
+            <li style="margin-bottom:6px;">trylock 실패 때 두 thread가 동시에 release하고 같은 10ms 뒤 재시도하면 deadlock 대신 무엇이 생길 수 있는가?</li>
+            <li style="margin-bottom:6px;">DB가 deadlock victim 하나를 abort한 뒤 application이 즉시 retry할 때 idempotency와 jitter가 필요한 이유는?</li>
+            <li style="margin-bottom:6px;">Day 17 복습: blocking deadlock과 spinlock deadlock의 CPU·thread state 증거는 어떻게 다를 수 있는가?</li>
+            <li>Day 16 복습: condition wait가 mutex 하나를 release해도 다른 mutex를 가진 채 호출하면 왜 cycle이 가능해지는가?</li>
+          </ol>
+          <p style="margin:11px 0 0;color:#a7c7da;font-size:14px;">정답 핵심: cycle은 T1→T2→T3→T1이다. 고정 동시 retry는 livelock, 즉시 DB retry는 retry storm·중복 side effect 위험이 있다. blocked mutex cycle은 CPU가 낮을 수 있고 spin cycle은 CPU를 태울 수 있다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 다음 날 연결</h2>
+          <p style="margin:0;">Day 19에서는 <strong style="color:#f8fafc;">memory model, happens-before, compiler/CPU reorder</strong>를 다룬다. deadlock이 없다는 사실만으로 data race가 사라지지는 않는다. lock acquire/release가 어떤 visibility edge를 만들고 atomic memory order가 어느 reorder를 허용하는지 연결한다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">15. 공식·1차 출처</h2>
+          <ul style="margin:0;padding-left:22px;color:#a7c7da;">
+            <li><a href="https://docs.kernel.org/locking/lockdep-design.html" style="color:#67e8f9;">Linux kernel docs — Runtime locking correctness validator</a>: lock class, dependency order와 cycle/IRQ validation</li>
+            <li><a href="https://docs.kernel.org/locking/locktypes.html" style="color:#67e8f9;">Linux kernel docs — Lock types and their rules</a>: sleeping/spinning context와 lock nesting</li>
+            <li><a href="https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3p.html" style="color:#67e8f9;">Linux man-pages POSIX — pthread_mutex_lock(3p)</a>: NORMAL/ERRORCHECK/RECURSIVE와 EDEADLK·EOWNERDEAD</li>
+            <li><a href="https://man7.org/linux/man-pages/man3/pthread_mutex_timedlock.3p.html" style="color:#67e8f9;">Linux man-pages POSIX — pthread_mutex_timedlock(3p)</a>: absolute timeout과 ETIMEDOUT</li>
+            <li><a href="https://man7.org/linux/man-pages/man5/proc_pid_stack.5.html" style="color:#67e8f9;">Linux man-pages — /proc/pid/stack</a>: kernel stack trace와 permission 조건</li>
+            <li><a href="https://docs.kernel.org/admin-guide/sysctl/kernel.html#hung-task-timeout-secs" style="color:#67e8f9;">Linux kernel docs — hung task sysctls</a>: blocked-task detection, warnings와 panic policy</li>
+            <li><a href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/pthread_mutex_lock.html" style="color:#67e8f9;">POSIX.1-2024 — pthread_mutex_lock/unlock</a>: mutex ownership과 portable error contract</li>
+          </ul>
+        </td></tr>
+        <tr><td style="padding:18px 28px;background:#081522;border-top:1px solid #1e3a4c;color:#7fa4ba;font-size:12px;">Operating System 심화 커리큘럼 · Week 3 Concurrency and Synchronization</td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>

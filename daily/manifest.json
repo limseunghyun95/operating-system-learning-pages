@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-08-19T09:00:16+09:00",
+  "updatedAt": "2026-08-20T09:09:41+09:00",
   "lessons": [
     {
       "day": 1,
@@ -158,6 +158,15 @@
       "path": "day-17.html",
       "kind": "lesson",
       "publishedAt": "2026-08-19T09:00:16+09:00"
+    },
+    {
+      "day": 18,
+      "week": 3,
+      "title": "deadlock 네 조건과 예방·회피·탐지",
+      "summary": "Coffman 네 조건을 resource/wait-for graph로 판별하고 global lock order, safe-state 회피, lockdep·thread dump 탐지, victim rollback과 timeout error handling까지 연결합니다.",
+      "path": "day-18.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-20T09:09:41+09:00"
     }
   ]
 }
