@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operating System 심화 커리큘럼 Day 19 - memory model, happens-before, compiler/CPU reorder</title>
+</head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.68;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#07111f;">
+    <tr><td align="center" style="padding:20px 10px 44px;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#0b1728;border:1px solid #1e3a4c;border-radius:18px;overflow:hidden;">
+        <tr><td style="padding:30px 28px;background:#102438;border-bottom:1px solid #1e3a4c;">
+          <div style="font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:#5eead4;font-weight:800;">Operating System · Day 19 / 63 · Concurrency</div>
+          <h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">memory model, happens-before, compiler/CPU reorder</h1>
+          <p style="margin:0;color:#a5f3fc;font-size:16px;">한 줄 요약 — source code의 줄 순서는 다른 thread가 보는 순서가 아니다. <strong style="color:#f8fafc;">language memory model이 허용하는 실행 안에서 release→acquire, mutex unlock→lock 같은 synchronizes-with edge를 만들고, 이를 program order와 연결한 happens-before로 data publication을 증명</strong>해야 compiler 최적화와 약한 CPU ordering 위에서도 안전하다.</p>
+        </td></tr>
+        <tr><td style="padding:26px 28px;">
+          <h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:14px;">
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;width:31%;">memory model</td><td style="padding:9px;border:1px solid #29465d;">여러 thread의 read/write가 어떤 값을 관찰할 수 있는지 정의한 language/runtime의 규칙. 실제 실행 시간표보다 허용 가능한 관찰 집합을 말한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">abstract machine</td><td style="padding:9px;border:1px solid #29465d;">language 표준이 program 의미를 설명하는 가상 실행기. compiler는 실제 machine code가 이 observable semantics를 지키도록 변환한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">sequenced-before</td><td style="padding:9px;border:1px solid #29465d;">같은 thread 안에서 language가 정한 evaluation 순서 관계. source의 모든 부분이 단순 위→아래 순서인 것은 아니다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">synchronizes-with</td><td style="padding:9px;border:1px solid #29465d;">release store와 그 값을 읽은 acquire load처럼 두 thread 사이 visibility를 연결하는 표준이 정의한 edge.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">happens-before</td><td style="padding:9px;border:1px solid #29465d;">sequenced-before, synchronizes-with와 그 transitive closure로 만든 “A의 효과가 B보다 앞서 보여야 함” 관계.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">data race</td><td style="padding:9px;border:1px solid #29465d;">서로 다른 thread의 conflicting access 중 하나 이상이 write이고 atomic이 아니며 두 access가 happens-before로 정렬되지 않은 상태. C/C++에서는 undefined behavior다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">modification order</td><td style="padding:9px;border:1px solid #29465d;">각 atomic object의 모든 modification에 존재하는 객체별 total order. 서로 다른 atomic object의 order를 하나로 합친다는 뜻은 아니다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">memory order</td><td style="padding:9px;border:1px solid #29465d;">atomic operation이 주변 memory access에 제공하는 ordering 강도. relaxed, acquire, release, acq_rel, seq_cst 등이 있다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">reordering</td><td style="padding:9px;border:1px solid #29465d;">compiler 또는 CPU가 single-thread 결과를 유지하면서 instruction/memory access 실행·관찰 순서를 바꾸는 최적화.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">memory barrier/fence</td><td style="padding:9px;border:1px solid #29465d;">특정 방향의 memory operation이 barrier를 넘어 재배치·관찰되지 못하도록 제한하는 language/ISA/kernel primitive.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">cache coherence</td><td style="padding:9px;border:1px solid #29465d;">같은 memory location의 write 순서를 core들이 모순 없이 관찰하도록 하는 hardware protocol 성질. 여러 location 사이 order까지 자동 제공하지 않는다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">store buffer</td><td style="padding:9px;border:1px solid #29465d;">CPU가 store 완료를 기다리지 않고 진행하도록 임시 보관하는 per-core 구조. 다른 core에는 store가 늦게 보일 수 있다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">litmus test</td><td style="padding:9px;border:1px solid #29465d;">아주 작은 concurrent program으로 특정 outcome이 memory model에서 허용되는지 확인하는 시험.</td></tr>
+          </table>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 원고, 번역가, 물류센터</h2>
+          <div style="padding:16px;background:#0f2035;border-left:4px solid #5eead4;border-radius:8px;">
+            <p style="margin:0 0 9px;"><strong style="color:#f8fafc;">programmer</strong>는 “payload를 쓰고 ready를 켠다”는 원고를 쓴다.</p>
+            <p style="margin:0 0 9px;"><strong style="color:#f8fafc;">compiler</strong>는 한 thread의 규칙을 지키는 범위에서 load/store를 이동·합치고 register에 보관하는 번역가다.</p>
+            <p style="margin:0 0 9px;"><strong style="color:#f8fafc;">CPU/cache</strong>는 store buffer와 coherence로 delivery 순서가 core마다 달라질 수 있는 물류센터다.</p>
+            <p style="margin:0;"><strong style="color:#f8fafc;">memory model</strong>은 최종 독자가 볼 수 있는 결과를 정한 계약이다. release/acquire는 “ready가 도착했다면 그 전에 보낸 payload도 도착한 것으로 취급하라”는 추적 가능한 송장이다.</p>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: source에서 다른 core의 관찰까지</h2>
+          <div style="overflow:auto;padding:16px;background:#06101d;border:1px solid #29465d;border-radius:10px;">
+            <pre style="margin:0;color:#c4f1f9;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;">Producer source                 Consumer source
+payload = 42;                  if (ready.load(acquire))
+ready.store(true, release);        use(payload);
+      │                                │
+      ▼                                ▼
+Language abstract machine / memory model
+ sequenced-before + synchronizes-with → happens-before
+      │                                │
+      ▼                                ▼
+Compiler IR / optimizer
+ eliminate · hoist · sink · merge · keep in register
+      │     constrained by atomic and HB contract
+      ▼
+ISA instructions
+ load/store · acquire/release op · atomic RMW · fence
+      │
+      ▼
+CPU core P                         CPU core C
+store buffer → cache ◄─coherence─► cache ← speculative load
+      │                                │
+      └──── release publication ───────┘ acquire observation
+
+계약이 맞으면 payload write HB payload read.
+계약이 없으면 stale observation 또는 C/C++ data race/UB.</pre>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. happens-before graph: “ready==true”만으로는 부족하다</h2>
+          <div style="overflow:auto;padding:16px;background:#06101d;border:1px solid #29465d;border-radius:10px;">
+            <pre style="margin:0;color:#c4f1f9;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;">Thread P                           Thread C
+P1: payload = 42                  C1: r = ready.load(acquire)
+      │ sequenced-before                  │ sequenced-before
+      ▼                                   ▼
+P2: ready.store(true, release)    C2: use(payload)
+      │
+      └─ synchronizes-with C1 ───► only if C1 reads P2's value
+
+Transitivity:
+P1 sb P2, P2 sw C1, C1 sb C2
+                ⇒ P1 happens-before C2
+
+relaxed ready:
+P2와 C1은 atomic이지만 sw edge가 없음
+                ⇒ non-atomic payload write/read가 HB로 정렬되지 않음
+                ⇒ C/C++ data race, undefined behavior</pre>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. CS·compiler·CPU deep dive</h2>
+          <h3 style="margin:16px 0 8px;color:#f8fafc;font-size:17px;">5.1 memory model은 실제 시계를 맞추는 규칙이 아니다</h3>
+          <p style="margin:0 0 9px;">happens-before의 “before”는 wall-clock timestamp가 아니라 allowed execution을 제약하는 partial order다. 동시에 실행돼도 synchronization edge가 있으면 visibility가 보장되고, 먼저 실행된 것처럼 보여도 edge가 없으면 portable proof가 아니다.</p>
+          <p style="margin:0;">이 추상화 덕분에 compiler와 CPU는 단일-thread 의미를 보존하며 자유롭게 최적화할 수 있고, programmer는 모든 microarchitecture를 직접 제어하지 않고 language primitive로 contract를 작성한다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.2 data-race-free가 출발점이다</h3>
+          <p style="margin:0 0 9px;">C/C++에서 non-atomic conflicting access가 happens-before로 정렬되지 않으면 undefined behavior다. 단순히 “old value나 new value 중 하나”가 아니라 compiler가 race가 없다고 가정해 load를 제거·hoist하거나 loop를 무한화할 수 있다.</p>
+          <p style="margin:0;">mutex나 seq_cst atomic으로 data race를 제거한 program은 직관적인 interleaving에 가까운 DRF-SC 보장을 얻는다. 약한 order 최적화는 correctness proof와 benchmark가 준비된 뒤의 일이다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.3 atomicity와 ordering은 별도 축이다</h3>
+          <p style="margin:0 0 9px;">relaxed atomic도 해당 object access가 indivisible하고 그 object만의 modification order를 유지한다. 하지만 주변 non-atomic data의 publish order를 만들지 않는다.</p>
+          <p style="margin:0;">따라서 통계 counter처럼 값 자체의 원자성만 필요하면 relaxed가 적합할 수 있지만, “flag를 보면 다른 object 초기화도 완료”라는 protocol에는 release/acquire 또는 mutex가 필요하다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.4 memory order별 최소 계약</h3>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:13px;">
+            <tr><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;width:22%;">order</td><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">보장</td><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">전형적 사용</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">relaxed</td><td style="padding:8px;border:1px solid #29465d;">atomicity + 해당 object modification order</td><td style="padding:8px;border:1px solid #29465d;">독립 metrics counter</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">release</td><td style="padding:8px;border:1px solid #29465d;">앞선 access가 release 뒤로 넘어가는 것을 제한</td><td style="padding:8px;border:1px solid #29465d;">publication sender</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">acquire</td><td style="padding:8px;border:1px solid #29465d;">뒤의 access가 acquire 앞으로 넘어가는 것을 제한</td><td style="padding:8px;border:1px solid #29465d;">publication receiver</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">acq_rel</td><td style="padding:8px;border:1px solid #29465d;">RMW의 read는 acquire, write는 release</td><td style="padding:8px;border:1px solid #29465d;">queue index·reference protocol</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">seq_cst</td><td style="padding:8px;border:1px solid #29465d;">SC operation 사이 하나의 total order 추가</td><td style="padding:8px;border:1px solid #29465d;">기본 correctness, 복잡한 protocol 단순화</td></tr>
+          </table>
+          <p style="margin:10px 0 0;">seq_cst도 business invariant나 non-atomic data race를 자동 수정하지 않는다. atomic object 여러 개를 transaction 하나처럼 묶어주지도 않는다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.5 compiler reorder와 CPU reorder는 다른 층이다</h3>
+          <p style="margin:0 0 9px;">compiler는 abstract-machine observable behavior를 유지하면서 load/store를 register에 보관하고 loop 밖으로 옮기거나 dead store를 제거한다. plain shared flag polling은 매번 memory를 다시 읽는다는 보장이 없다.</p>
+          <p style="margin:0;">CPU는 out-of-order execution, speculative load, store buffer로 instruction retirement와 다른 core의 관찰 순서를 달리할 수 있다. language atomic은 compiler barrier와 target ISA instruction/fence를 함께 선택해 양쪽 층을 제약한다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.6 x86에서 됐다는 portable proof가 아니다</h3>
+          <p style="margin:0 0 9px;">x86 TSO는 많은 load/load와 store/store order가 강하지만 store→later load가 다른 core에 보이는 순서는 store buffer 때문에 달라질 수 있다. ARM 계열은 더 많은 약한 outcome을 허용하며 acquire/release instruction이 명시적으로 중요하다.</p>
+          <p style="margin:0;">더 중요한 점은 compiler가 target CPU 전에 source를 변환한다는 사실이다. hardware가 강해도 C/C++ data race UB를 살려주지 않는다. architecture-specific assumption은 language proof 다음에 명시적으로 문서화한다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.7 coherence와 consistency를 혼동하지 않는다</h3>
+          <p style="margin:0 0 9px;">cache coherence는 한 location X의 write가 core별로 역순으로 보이지 않게 하는 기반이다. 하지만 X=payload와 Y=ready처럼 서로 다른 location 사이에서 어떤 global order를 관찰할지는 memory consistency model과 barrier에 달려 있다.</p>
+          <p style="margin:0;">“cache가 결국 동기화된다”는 eventual visibility는 publication correctness가 아니다. consumer가 ready를 본 바로 그 시점에 payload까지 보인다는 edge가 필요하다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.8 fence만 흩뿌려서는 thread가 연결되지 않는다</h3>
+          <p style="margin:0 0 9px;">fence는 local reorder를 제한하지만 어떤 producer의 write를 어떤 consumer가 읽었는지 전달할 carrier atomic/read-from 관계가 필요하다. 대응하는 protocol 없이 full fence를 추가하면 느려져도 happens-before proof가 생기지 않을 수 있다.</p>
+          <p style="margin:0;">먼저 shared state machine과 read-from edge를 그리고, release/acquire operation 또는 mutex가 그 edge를 실제로 만드는지 확인한다. fence-only protocol은 표준 규칙을 정확히 증명할 수 있을 때만 사용한다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.9 Linux kernel memory model은 별도 vocabulary를 가진다</h3>
+          <p style="margin:0 0 9px;"><code style="color:#fbbf24;">READ_ONCE/WRITE_ONCE</code>는 compiler의 load/store 합치기·재사용 같은 변형을 제한하고 tearing을 다루지만 일반적인 full inter-CPU barrier가 아니다. ordering에는 <code style="color:#fbbf24;">smp_store_release</code>, <code style="color:#fbbf24;">smp_load_acquire</code>, <code style="color:#fbbf24;">smp_mb</code>와 올바른 pairing이 필요하다.</p>
+          <p style="margin:0;">LKMM은 kernel의 access marker, RCU, lock, barrier outcome을 formal하게 설명하고 herd7 litmus tool로 허용 여부를 검사한다. user-space C++ memory order와 이름이 비슷해도 API를 그대로 섞지 않는다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. litmus outcome을 읽는 법</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:13px;">
+            <tr><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">pattern</td><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">질문</td><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">핵심</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">message passing</td><td style="padding:8px;border:1px solid #29465d;">ready=1인데 payload=0 가능한가?</td><td style="padding:8px;border:1px solid #29465d;">release/acquire가 같은 ready value를 전달하면 불가</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">store buffering</td><td style="padding:8px;border:1px solid #29465d;">서로 store 후 상대 load가 모두 0 가능한가?</td><td style="padding:8px;border:1px solid #29465d;">relaxed/weak model에서 가능, SC total order에서는 cycle</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">load buffering</td><td style="padding:8px;border:1px solid #29465d;">load가 future store 값을 스스로 정당화하는가?</td><td style="padding:8px;border:1px solid #29465d;">out-of-thin-air 제한과 dependency를 함께 봄</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">IRIW</td><td style="padding:8px;border:1px solid #29465d;">독립 write 순서를 reader들이 다르게 보는가?</td><td style="padding:8px;border:1px solid #29465d;">multi-copy atomicity와 global order 차이를 드러냄</td></tr>
+          </table>
+          <p style="margin:10px 0 0;color:#a7c7da;font-size:14px;">한 번 실행해 outcome이 안 나온 것은 금지 증명이 아니다. model checker로 허용 집합을 확인하고 stress/TSan은 구현 실수 탐지 보조로 쓴다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. 실무 best practice</h2>
+          <ol style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">mutex를 기본값으로 둔다.</strong> measured contention과 formal proof가 없으면 직접 relaxed protocol을 만들지 않는다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">publication invariant를 문장과 graph로 쓴다.</strong> “어떤 atomic의 어떤 값이 어느 data initialization을 운반하는가”를 명시한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">가장 약한 order보다 가장 설명 가능한 order를 선택한다.</strong> benchmark에서 의미 있는 차이가 입증되기 전에는 seq_cst/acquire-release의 clarity를 우선한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">atomic/non-atomic access를 섞지 않는다.</strong> 같은 object의 모든 concurrent access가 동일 synchronization discipline을 따르게 한다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">lifetime과 reclamation도 protocol에 넣는다.</strong> pointer publication이 안전해도 object가 free된 뒤 reader가 접근하면 use-after-free다. hazard pointer/epoch/RCU 같은 별도 proof가 필요하다.</li>
+            <li style="margin-bottom:8px;"><strong style="color:#f8fafc;">TSan, stress, litmus를 역할별로 쓴다.</strong> TSan은 실행에서 race를 찾고, litmus/model은 weak outcome을 탐색하며, stress는 운영 timing을 넓힌다.</li>
+            <li><strong style="color:#f8fafc;">architecture matrix를 CI에 둔다.</strong> x86만 통과한 lock-free code를 ARM production에 바로 배포하지 않고 compiler version·optimization도 함께 바꿔 시험한다.</li>
+          </ol>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. error handling과 진단</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;font-size:13px;">
+            <tr><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;width:29%;">증상/오류</td><td style="padding:8px;border:1px solid #29465d;color:#f8fafc;font-weight:700;">대응</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">TSan data race</td><td style="padding:8px;border:1px solid #29465d;">두 access stack, allocation/lifetime, protecting lock/atomic을 보존한다. suppress 전에 intended happens-before edge를 graph로 설명한다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">ready=1, invalid payload</td><td style="padding:8px;border:1px solid #29465d;">flag와 payload access의 exact memory order, read-from carrier, initialization/lifetime을 확인한다. log 추가로 timing이 바뀐 결과를 fix로 보지 않는다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">특정 CPU/compiler만 실패</td><td style="padding:8px;border:1px solid #29465d;">binary·flags·ISA·CPU model을 보존하고 최소 litmus로 축소한다. architecture bug로 단정하기 전에 language UB와 missing barrier를 검사한다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">CAS loop livelock</td><td style="padding:8px;border:1px solid #29465d;">failure order, contention, retry count를 계측하고 bounded backoff/queueing을 검토한다. correctness와 progress guarantee를 분리한다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">성능 회귀</td><td style="padding:8px;border:1px solid #29465d;">barrier cost만 보지 말고 cache-line bouncing, false sharing, retries, tail latency를 함께 측정한다. order 완화 전 outcome proof를 regression test로 둔다.</td></tr>
+            <tr><td style="padding:8px;border:1px solid #29465d;">재현 안 됨</td><td style="padding:8px;border:1px solid #29465d;">race 없음으로 결론 내리지 않는다. optimization·compiler·core 수·affinity를 바꾸고 model checker와 sanitizer를 병행한다.</td></tr>
+          </table>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. 놓치기 쉬운 함정</h2>
+          <ul style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:7px;"><code style="color:#fbbf24;">volatile</code>을 thread synchronization으로 사용한다. C/C++ volatile은 atomicity와 happens-before를 제공하지 않는다.</li>
+            <li style="margin-bottom:7px;">atomic flag를 relaxed로 바꾸고 non-atomic payload는 그대로 읽어 publication data race를 만든다.</li>
+            <li style="margin-bottom:7px;">서로 다른 atomic object의 modification order가 하나의 global order라고 가정한다.</li>
+            <li style="margin-bottom:7px;">seq_cst atomic counter 여러 개가 복합 business invariant를 transaction으로 만든다고 생각한다.</li>
+            <li style="margin-bottom:7px;">acquire load가 어떤 release의 값도 읽지 않았는데 synchronizes-with가 생겼다고 주장한다.</li>
+            <li style="margin-bottom:7px;">full fence 하나를 넣고 carrier/read-from 관계 없이 thread가 연결됐다고 생각한다.</li>
+            <li style="margin-bottom:7px;">sleep, printf, debugger를 넣은 뒤 bug가 사라진 것을 fix로 판단한다. timing과 compiler optimization이 바뀌었을 뿐이다.</li>
+            <li style="margin-bottom:7px;">x86 debug build에서 수십억 번 성공한 실행을 language-level proof로 사용한다.</li>
+            <li>pointer publish order만 증명하고 object reclamation/ABA/lifetime을 빼먹는다.</li>
+          </ul>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 30분 실습: relation graph로 weak outcome 판정</h2>
+          <p style="margin:0 0 10px;">첫 script는 full C/C++/CPU model이 아닌 교육용 relation explorer다. message-passing에서 sw edge 유무와 store-buffering의 SC cycle을 deterministic하게 보여준다. 이어 실제 C11 release/acquire publication이 payload 42를 전달하는지 확인한다.</p>
+          <pre style="margin:0;padding:14px;background:#06101d;border:1px solid #29465d;border-radius:10px;color:#d1fae5;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word;">set -e
+LAB_DIR=$(mktemp -d)
+trap 'rm -rf "$LAB_DIR"' EXIT
+cat &gt;"$LAB_DIR/litmus.py" &lt;&lt;'PY'
+def closure(edges):
+    reach = set(edges)
+    changed = True
+    while changed:
+        changed = False
+        for a, b in list(reach):
+            for c, d in list(reach):
+                if b == c and (a, d) not in reach:
+                    reach.add((a, d)); changed = True
+    return reach
+
+def message(order):
+    # D=payload write, R=ready store, L=ready load, X=payload read
+    hb = {("D", "R"), ("L", "X")}
+    if order == "release_acquire":
+        hb.add(("R", "L"))  # L reads the value written by R
+    hb = closure(hb)
+    allowed = [42]
+    if ("D", "X") not in hb:
+        allowed.insert(0, 0)
+    print(f"message {order} data_when_ready={allowed}")
+
+def has_cycle(edges):
+    reach = closure(edges)
+    return any(a == b for a, b in reach)
+
+message("relaxed")
+message("release_acquire")
+
+# Store buffering: T0 W(x)=1; R(y), T1 W(y)=1; R(x)
+# Under SC, both reads=0 adds Ry&lt;Wy and Rx&lt;Wx to program order.
+sc_edges = {
+    ("Wx", "Ry"), ("Wy", "Rx"),
+    ("Ry", "Wy"), ("Rx", "Wx")
+}
+print("store_buffering relaxed r0=r1=0 allowed=yes")
+print("store_buffering seq_cst r0=r1=0 allowed=" +
+      ("no" if has_cycle(sc_edges) else "yes"))
+PY
+python3 "$LAB_DIR/litmus.py"
+
+cat &gt;"$LAB_DIR/publication.c" &lt;&lt;'C'
+#include &lt;pthread.h&gt;
+#include &lt;sched.h&gt;
+#include &lt;stdatomic.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+
+static atomic_int ready;
+static int payload;
+
+static void check(int rc, const char *what) {
+  if (rc != 0) { fprintf(stderr, "%s: %d\n", what, rc); exit(2); }
+}
+
+static void *producer(void *unused) {
+  (void)unused;
+  payload = 42;
+  atomic_store_explicit(&amp;ready, 1, memory_order_release);
+  return NULL;
+}
+
+static void *consumer(void *unused) {
+  (void)unused;
+  while (!atomic_load_explicit(&amp;ready, memory_order_acquire))
+    sched_yield();
+  printf("publication payload=%d\n", payload);
+  return NULL;
+}
+
+int main(void) {
+  pthread_t p, c;
+  check(pthread_create(&amp;p, NULL, producer, NULL), "create producer");
+  check(pthread_create(&amp;c, NULL, consumer, NULL), "create consumer");
+  check(pthread_join(p, NULL), "join producer");
+  check(pthread_join(c, NULL), "join consumer");
+  return payload == 42 ? 0 : 1;
+}
+C
+cc -std=c11 -O2 -Wall -Wextra -pthread "$LAB_DIR/publication.c" -o "$LAB_DIR/publication"
+"$LAB_DIR/publication"
+
+# expected:
+# message relaxed data_when_ready=[0, 42]
+# message release_acquire data_when_ready=[42]
+# store_buffering relaxed r0=r1=0 allowed=yes
+# store_buffering seq_cst r0=r1=0 allowed=no
+# publication payload=42</pre>
+          <ol style="margin:12px 0 0;padding-left:22px;">
+            <li style="margin-bottom:6px;">10분: release/acquire graph에서 D→R→L→X transitive path를 손으로 그리고 relaxed에서 끊기는 edge를 표시한다.</li>
+            <li style="margin-bottom:6px;">10분: store-buffering SC constraints가 <code style="color:#fbbf24;">Wx&lt;Ry&lt;Wy&lt;Rx&lt;Wx</code> cycle을 만드는지 확인한다.</li>
+            <li>10분: C11 code를 mutex version으로 바꾸고 unlock→lock이 어떤 sw/HB edge를 대신 만드는지 설명한다. relaxed로 바꿔 실행 결과가 42여도 표준상 proof가 아님을 기록한다.</li>
+          </ol>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. 실패 시나리오: ARM 배포에서 간헐적 빈 설정</h2>
+          <div style="padding:16px;background:#261423;border:1px solid #7f1d4e;border-radius:10px;">
+            <p style="margin:0 0 9px;"><strong style="color:#fbcfe8;">변경:</strong> startup latency를 줄이려고 mutex-protected config publication을 plain pointer + volatile ready flag로 교체했다. x86 staging에서는 실패하지 않았다.</p>
+            <p style="margin:0 0 9px;"><strong style="color:#fbcfe8;">증상:</strong> ARM production에서 ready=true인데 일부 field가 기본값이거나 freed object를 가리킨다. logging을 늘리면 재현률이 낮아진다.</p>
+            <p style="margin:0 0 9px;"><strong style="color:#fbcfe8;">증거:</strong> compiler/flags/ISA, crashing binary, field values, publication thread와 reader stack, object lifetime을 보존한다. source 줄 순서 대신 missing HB edge와 reclamation timeline을 그린다.</p>
+            <p style="margin:0 0 9px;"><strong style="color:#fbcfe8;">완화:</strong> 이전 mutex 구현으로 rollback하고 손상 config instance를 process 단위로 재구축한다. fence를 임의로 추가한 hotfix를 proof 없이 배포하지 않는다.</p>
+            <p style="margin:0;"><strong style="color:#fbcfe8;">영구 수정:</strong> release-store/acquire-load publication 또는 immutable shared_ptr protocol을 사용하고 TSan·ARM CI·litmus test와 lifetime proof를 추가한다.</p>
+          </div>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 대기업 면접 질문 3개</h2>
+          <ol style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:12px;"><strong style="color:#f8fafc;">“happens-before를 시간 순서와 다르게 설명해 보세요.”</strong><br>답변 포인트: language가 정의한 partial order이며 sequenced-before, synchronizes-with, transitivity로 구성된다. release store의 값을 acquire load가 읽으면 sw edge가 생기고, producer의 이전 write가 consumer의 이후 read에 HB해 visibility가 보장된다.</li>
+            <li style="margin-bottom:12px;"><strong style="color:#f8fafc;">“relaxed atomic은 무엇을 보장하고 무엇을 보장하지 않나요?”</strong><br>답변 포인트: 해당 atomic access의 indivisibility와 object별 modification order는 보장하지만 주변 memory의 cross-thread ordering/sw는 제공하지 않는다. independent counter에는 적합할 수 있지만 flag 기반 payload publication에는 부족하다.</li>
+            <li><strong style="color:#f8fafc;">“cache coherence가 있으면 memory barrier가 왜 필요한가요?”</strong><br>답변 포인트: coherence는 같은 location의 write order 기반이고 payload/flag 같은 여러 location 사이 관찰 순서를 만들지 않는다. compiler reorder, CPU store buffer/speculation도 존재한다. language acquire/release가 compiler와 ISA 양쪽을 제약해 필요한 cross-location HB를 만든다.</li>
+          </ol>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 퀴즈·누적 리뷰</h2>
+          <ol style="margin:0;padding-left:22px;">
+            <li style="margin-bottom:6px;">release store와 acquire load가 같은 atomic object를 사용해도 acquire가 다른 값을 읽으면 sw edge가 생기는가?</li>
+            <li style="margin-bottom:6px;">relaxed counter 두 개가 각각 정확해도 “debit+credit 합계 일정” invariant를 보장하지 못하는 이유는?</li>
+            <li style="margin-bottom:6px;"><code style="color:#fbbf24;">READ_ONCE</code>와 <code style="color:#fbbf24;">smp_load_acquire</code>의 역할 차이는?</li>
+            <li style="margin-bottom:6px;">Day 18 복습: deadlock-free lock order와 data-race-free memory order는 왜 서로 다른 correctness 축인가?</li>
+            <li>Day 17 복습: spinlock acquire/release ordering이 빠른 atomic flag 이상의 계약인 이유는?</li>
+          </ol>
+          <p style="margin:11px 0 0;color:#a7c7da;font-size:14px;">정답 핵심: acquire가 matching release value를 관찰해야 sw가 생긴다. 개별 atomicity는 multi-object transaction이 아니다. READ_ONCE는 compiler/access 제약, acquire는 이후 access ordering과 paired visibility까지 제공한다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 다음 날 연결</h2>
+          <p style="margin:0;">Day 20에서는 <strong style="color:#f8fafc;">실패 실습: lost update, deadlock, timeout 복구</strong>를 수행한다. Day 15–19의 race·lock·futex·deadlock·memory-order 지식을 한 incident lab으로 합쳐 증거 수집, 안전한 timeout, rollback과 regression assertion까지 만든다.</p>
+
+          <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">15. 공식·1차 출처</h2>
+          <ul style="margin:0;padding-left:22px;color:#a7c7da;">
+            <li><a href="https://eel.is/c++draft/intro.races" style="color:#67e8f9;">C++ working draft — [intro.races]</a>: conflicting action, synchronizes-with, happens-before와 data-race UB</li>
+            <li><a href="https://eel.is/c++draft/atomics.order" style="color:#67e8f9;">C++ working draft — [atomics.order]</a>: relaxed/acquire/release/seq_cst와 modification order</li>
+            <li><a href="https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/V1_chap04.html#tag_04_15" style="color:#67e8f9;">POSIX.1-2024 — Memory Ordering and Synchronization</a>: POSIX synchronization operation의 memory ordering</li>
+            <li><a href="https://docs.kernel.org/core-api/wrappers/memory-barriers.html" style="color:#67e8f9;">Linux kernel docs — Memory Barriers</a>: compiler/CPU ordering, acquire/release와 READ_ONCE/WRITE_ONCE</li>
+            <li><a href="https://docs.kernel.org/core-api/wrappers/atomic_t.html" style="color:#67e8f9;">Linux kernel docs — Atomic Types</a>: relaxed/acquire/release/fully ordered atomic operations</li>
+            <li><a href="https://docs.kernel.org/dev-tools/lkmm/docs/explanation.html" style="color:#67e8f9;">Linux kernel docs — LKMM explanation</a>: kernel memory model relation과 litmus outcome</li>
+            <li><a href="https://gcc.gnu.org/onlinedocs/gcc/_005f_005fatomic-Builtins.html" style="color:#67e8f9;">GCC docs — __atomic built-ins</a>: memory-order parameter와 target mapping</li>
+          </ul>
+        </td></tr>
+        <tr><td style="padding:18px 28px;background:#081522;border-top:1px solid #1e3a4c;color:#7fa4ba;font-size:12px;">Operating System 심화 커리큘럼 · Week 3 Concurrency and Synchronization</td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>

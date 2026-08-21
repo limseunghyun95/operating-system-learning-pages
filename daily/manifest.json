@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-08-20T09:09:41+09:00",
+  "updatedAt": "2026-08-21T09:21:17+09:00",
   "lessons": [
     {
       "day": 1,
@@ -167,6 +167,15 @@
       "path": "day-18.html",
       "kind": "lesson",
       "publishedAt": "2026-08-20T09:09:41+09:00"
+    },
+    {
+      "day": 19,
+      "week": 3,
+      "title": "memory model, happens-before, compiler/CPU reorder",
+      "summary": "sequenced-before와 synchronizes-with로 happens-before를 증명하고 relaxed·acquire/release·seq_cst, compiler/CPU reorder, coherence, Linux barrier와 LKMM까지 연결합니다.",
+      "path": "day-19.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-21T09:21:17+09:00"
     }
   ]
 }
