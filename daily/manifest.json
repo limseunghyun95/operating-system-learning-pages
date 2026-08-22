@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-08-21T09:21:17+09:00",
+  "updatedAt": "2026-08-22T09:00:23+09:00",
   "lessons": [
     {
       "day": 1,
@@ -176,6 +176,15 @@
       "path": "day-19.html",
       "kind": "lesson",
       "publishedAt": "2026-08-21T09:21:17+09:00"
+    },
+    {
+      "day": 20,
+      "week": 3,
+      "title": "실패 실습: lost update, deadlock, timeout 복구",
+      "summary": "atomic load/store로도 발생하는 compound lost update, ABBA deadlock, absolute deadline 기반 try-lock rollback을 하나의 안전한 failure lab에서 재현하고 증거·복구 불변식까지 검증합니다.",
+      "path": "day-20.html",
+      "kind": "lab",
+      "publishedAt": "2026-08-22T09:00:23+09:00"
     }
   ]
 }
