@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operating System 심화 커리큘럼 Day 21 - 리뷰: thread-safe API 설계 리뷰</title>
+</head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.72;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#07111f;">
+    <tr><td align="center" style="padding:24px 12px;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:680px;background:#0f1d2e;border:1px solid #23415d;border-radius:18px;overflow:hidden;">
+        <tr><td style="padding:30px 28px 22px;background:#102a43;border-bottom:1px solid #28506f;">
+          <div style="font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:#5eead4;font-weight:800;">Operating System · Day 21 / 63 · Week 3 Review</div>
+          <h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">리뷰: thread-safe API 설계 리뷰</h1>
+          <p style="margin:0;color:#b9d6eb;">한 줄 요약: thread-safe API는 “lock을 썼다”가 아니라 <strong style="color:#f8fafc;">상태·소유권·atomic contract·happens-before·lifecycle·실패 의미</strong>가 호출자에게 끝까지 닫혀 있어야 한다.</p>
+        </td></tr>
+        <tr><td style="padding:26px 28px 34px;">
+
+        <h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:14px;">
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;width:30%;">thread-safe / MT-Safe</td><td style="border-bottom:1px solid #27435d;">여러 thread가 문서화된 방식으로 동시에 호출해도 내부 상태와 결과 계약이 깨지지 않는 성질이다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">reentrant</td><td style="border-bottom:1px solid #27435d;">함수가 끝나기 전에 signal handler·callback·재귀 호출로 같은 함수가 다시 들어와도 안전한 성질이다. thread-safe와 별개다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">async-signal-safe</td><td style="border-bottom:1px solid #27435d;">비동기 signal handler 안에서도 호출이 허용되는 성질. mutex를 쓰는 thread-safe 함수가 signal-safe인 것은 아니다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">invariant</td><td style="border-bottom:1px solid #27435d;">모든 공개 API 호출 전후에 반드시 유지돼야 하는 상태 조건. 예: size는 0 이상 capacity 이하다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">linearizability</td><td style="border-bottom:1px solid #27435d;">동시 호출 각각이 호출과 반환 사이의 어느 한 순간에 원자적으로 실행된 것처럼 설명 가능한 성질이다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">linearization point</td><td style="border-bottom:1px solid #27435d;">연산의 효과가 논리적으로 확정되는 한 지점. mutex 안의 상태 변경이나 성공한 atomic RMW가 예다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">synchronization boundary</td><td style="border-bottom:1px solid #27435d;">어떤 lock·atomic·message 전달이 어느 상태를 보호하고 다른 thread에 보이게 하는지 정한 경계다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">ownership / alias</td><td style="border-bottom:1px solid #27435d;">누가 객체를 생성·수정·해제할 책임이 있는지, 같은 객체를 가리키는 다른 참조가 존재하는지에 관한 계약이다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">lifetime</td><td style="border-bottom:1px solid #27435d;">객체를 안전하게 접근할 수 있는 기간. lock은 객체가 이미 해제된 use-after-free를 고쳐 주지 못한다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">check-then-act</td><td style="border-bottom:1px solid #27435d;">조건을 확인한 뒤 행동하기 전에 다른 thread가 상태를 바꾸는 경쟁. contains 뒤 insert가 대표적이다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">backpressure</td><td style="border-bottom:1px solid #27435d;">소비 능력보다 요청이 많을 때 무한 적재 대신 대기·거절·속도 제한으로 생산자에게 압력을 돌려주는 정책이다.</td></tr>
+          <tr><td style="color:#7dd3fc;font-weight:700;">shutdown protocol</td><td>OPEN→CLOSING→CLOSED 전이를 정의하고 신규 호출 차단, 실행 중 호출 drain, 자원 해제를 순서대로 수행하는 규약이다.</td></tr>
+        </table>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 금고가 아니라 금고 서비스의 계약</h2>
+        <p style="margin:0 0 10px;">mutex는 금고 문 하나일 뿐이다. 좋은 API는 고객이 금고 내부 열쇠를 만지지 않아도 다음 질문에 답할 수 있어야 한다.</p>
+        <ul style="margin:0;padding-left:22px;">
+          <li>어떤 상태가 함께 바뀌며, 호출 전후 invariant는 무엇인가?</li>
+          <li>동시 호출의 순서는 어디에서 확정되고 결과는 무엇을 의미하는가?</li>
+          <li>대기할 수 있는가, deadline과 cancellation은 누가 전달하는가?</li>
+          <li>close가 시작될 때 새 호출과 이미 실행 중인 호출은 어떻게 되는가?</li>
+          <li>오류가 나면 state와 ownership이 어느 쪽에 남는가?</li>
+        </ul>
+        <p style="margin:10px 0 0;color:#a8c7db;">내부 lock 선택을 숨기는 것만으로는 encapsulation이 아니다. 호출자가 올바른 사용법을 추측하지 않아도 되는 <strong style="color:#f8fafc;">semantic contract</strong>가 진짜 캡슐화다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: 호출이 상태 변화로 커밋되는 경로</h2>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:separate;border-spacing:6px;background:#0b1726;border:1px solid #27435d;border-radius:12px;padding:8px;text-align:center;font-size:13px;">
+          <tr>
+            <td style="padding:10px 5px;background:#12314a;border-radius:8px;color:#bae6fd;">caller threads<br><small>request + deadline</small></td>
+            <td style="color:#5eead4;font-size:20px;">→</td>
+            <td style="padding:10px 5px;background:#12314a;border-radius:8px;color:#bae6fd;">API boundary<br><small>validate + pin lifetime</small></td>
+            <td style="color:#5eead4;font-size:20px;">→</td>
+            <td style="padding:10px 5px;background:#12314a;border-radius:8px;color:#bae6fd;">synchronization<br><small>lock / atomic / queue</small></td>
+          </tr>
+          <tr><td colspan="5" style="color:#5eead4;font-size:20px;">↓</td></tr>
+          <tr>
+            <td style="padding:10px 5px;background:#123d36;border-radius:8px;color:#a7f3d0;">return contract<br><small>value + ownership</small></td>
+            <td style="color:#5eead4;font-size:20px;">←</td>
+            <td style="padding:10px 5px;background:#123d36;border-radius:8px;color:#a7f3d0;">linearization point<br><small>effect becomes visible</small></td>
+            <td style="color:#5eead4;font-size:20px;">←</td>
+            <td style="padding:10px 5px;background:#123d36;border-radius:8px;color:#a7f3d0;">protected state<br><small>invariant transition</small></td>
+          </tr>
+          <tr><td colspan="5" style="padding:10px;background:#101d2d;border-radius:8px;color:#c4d8e8;">evidence plane: operation · object ID · wait time · deadline budget · state before/after · error · rollback</td></tr>
+        </table>
+        <p style="margin:10px 0 0;font-size:14px;color:#a8c7db;">hardware cache coherence는 동일 cache line의 전달 기반을 제공하지만, API의 여러 필드 invariant나 객체 lifetime을 자동으로 보장하지 않는다. 그 의미를 만드는 것은 language memory model과 synchronization protocol이다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. lifecycle 상태 전이: destroy는 마지막 단계다</h2>
+        <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;">UNINITIALIZED ──init/once──&gt; OPEN ──close──&gt; CLOSING ──active_calls==0──&gt; CLOSED ──destroy──&gt; DEAD
+                              │                 │
+                              │ new call: pin++ │ new call: reject(ECANCELED)
+                              │ return: pin--   │ in-flight: finish or cancel by contract
+                              └─────────────────┘
+
+금지 전이 1: OPEN ──free──&gt; DEAD while another thread has an alias
+금지 전이 2: CLOSING ──mutex_destroy──&gt; DEAD while waiter/owner exists
+완료 불변식: accepting==false AND active_calls==0 AND waiters==0</pre>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. 리뷰 순서: T-H-R-E-A-D 6개 gate</h2>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:13px;">
+          <tr style="background:#15314a;color:#bae6fd;"><td>Gate</td><td>리뷰 질문</td><td>반드시 남길 증거</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><strong>T</strong>opology</td><td style="border-top:1px solid #27435d;">공유 상태·alias·owner·invariant는?</td><td style="border-top:1px solid #27435d;">object graph와 ownership 표</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><strong>H</strong>appens-before</td><td style="border-top:1px solid #27435d;">publish와 읽기 사이 ordering은?</td><td style="border-top:1px solid #27435d;">lock/atomic/message edge</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><strong>R</strong>esult atomicity</td><td style="border-top:1px solid #27435d;">linearization point와 조합 연산은?</td><td style="border-top:1px solid #27435d;">호출 history와 허용 결과</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><strong>E</strong>rror semantics</td><td style="border-top:1px solid #27435d;">실패 뒤 state·ownership·retry 가능성은?</td><td style="border-top:1px solid #27435d;">오류별 상태 전이표</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><strong>A</strong>vailability</td><td style="border-top:1px solid #27435d;">block·deadline·fairness·backpressure는?</td><td style="border-top:1px solid #27435d;">SLO와 wait metric</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><strong>D</strong>estruction</td><td style="border-top:1px solid #27435d;">init/close/drain/destroy 순서는?</td><td style="border-top:1px solid #27435d;">lifecycle state machine</td></tr>
+        </table>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. CS·kernel·hardware deep dive</h2>
+        <h3 style="margin:16px 0 8px;color:#f8fafc;font-size:17px;">6.1 MT-Safe 함수 두 개를 이어도 atomic transaction은 아니다</h3>
+        <p style="margin:0;">GNU/Linux의 공식 safety 설명도 MT-Safe가 atomic을 뜻하지 않으며 MT-Safe 함수의 연속 호출이 atomic combination을 보장하지 않는다고 명시한다. <code style="color:#fde68a;">get()</code>과 <code style="color:#fde68a;">set()</code>이 각각 lock을 잡아도 <code style="color:#fde68a;">get()+1→set()</code> 사이에 다른 thread가 끼어 lost update가 난다. 호출자가 필요한 의미를 하나의 <code style="color:#fde68a;">add(delta)</code>, <code style="color:#fde68a;">put_if_absent()</code>, transaction/guard API로 제공해야 한다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">6.2 linearization point는 구현 설명이자 테스트 oracle이다</h3>
+        <p style="margin:0;">mutex 기반 add라면 lock 안의 value 변경, CAS 기반 stack이라면 성공한 compare-exchange가 선형화 지점이 될 수 있다. 호출보다 앞이나 반환보다 뒤에 선형화되면 안 된다. 실제 history를 수집해 real-time order를 지키는 순차 history로 재배열 가능한지 검사하면 단순 final counter보다 강한 테스트가 된다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">6.3 mutex unlock→다음 lock은 state publication 경계다</h3>
+        <p style="margin:0;">writer가 mutex 안에서 여러 non-atomic 필드를 갱신하고 unlock한 뒤 reader가 같은 mutex를 lock하면, POSIX synchronization을 통해 reader는 일관된 상태를 관찰할 수 있다. 반면 내부 포인터를 반환해 lock 밖에서 읽게 하면 보호 경계가 무너진다. 복사본, immutable snapshot, reference-counted handle처럼 lifetime과 visibility가 함께 유지되는 반환 형태를 선택한다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">6.4 atomic 하나가 여러 필드 invariant를 대신하지 못한다</h3>
+        <p style="margin:0;">size와 head/tail, balance와 ledger처럼 함께 바뀌어야 하는 값은 개별 atomic만으로 일관된 snapshot을 만들기 어렵다. lock, versioned snapshot/seqlock, immutable state의 atomic pointer 교체 등 프로토콜이 필요하다. lock-free는 “lock이 없음”이지 wait-free나 단순함을 뜻하지 않으며 ABA와 memory reclamation 문제가 추가된다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">6.5 lock은 lifetime pin이 아니다</h3>
+        <p style="margin:0;">thread A가 객체 주소를 얻은 뒤 thread B가 객체와 그 안의 mutex를 destroy/free하면 A는 lock 호출 전에 이미 use-after-free다. reference count, hazard pointer/epoch, owner thread, join/drain 같은 별도 lifetime protocol이 필요하다. POSIX에서 사용 중이거나 다른 thread가 참조하는 mutex를 destroy하는 행위는 안전한 recovery API가 아니다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">6.6 초기화도 publish protocol의 일부다</h3>
+        <p style="margin:0;">lazy init flag를 plain load/store로 확인하면 두 번 초기화하거나 부분 초기화 상태를 노출할 수 있다. 정적 <code style="color:#fde68a;">PTHREAD_MUTEX_INITIALIZER</code>, <code style="color:#fde68a;">pthread_once()</code>, 언어의 thread-safe static initialization을 사용하고, 완성된 객체를 synchronization edge 뒤에 publish한다. “pointer가 non-NULL”만으로 payload 가시성이 증명되지 않는다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">6.7 callback을 lock 안에서 호출하면 lock graph가 API 밖으로 열린다</h3>
+        <p style="margin:0;">사용자 callback이 같은 객체로 재진입하거나 다른 lock을 잡으면 self-deadlock·ABBA·긴 critical section이 생긴다. lock 안에서 snapshot/작업 목록만 만들고 unlock 뒤 callback을 호출한다. 반드시 lock 안에서 호출해야 한다면 “callback은 재진입·blocking 금지”를 명시하고 테스트·lock hierarchy에 포함해야 하지만 가능한 한 피한다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">6.8 cancellation은 cleanup과 ownership을 포함한 API 계약이다</h3>
+        <p style="margin:0;">POSIX deferred cancellation은 cancellation point에서 발생하고 cleanup handler는 LIFO로 실행될 수 있다. 따라서 lock·permit·buffer를 얻은 역순으로 cleanup을 등록한다. 그러나 library가 내부에서 cancellation을 허용하는지, partial effect가 있는지, caller가 retry 가능한지는 문서화해야 한다. timeout 응답만으로 worker와 side effect가 끝난 것은 아니다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">6.9 thread-safe, reentrant, signal-safe는 서로 다른 축이다</h3>
+        <p style="margin:0;">mutex 기반 함수는 여러 thread 사이에서는 안전할 수 있지만, mutex owner thread를 중단한 signal handler가 같은 함수를 부르면 deadlock한다. signal handler에는 POSIX async-signal-safe 목록의 함수만 사용하고 flag/self-pipe 같은 최소 전달만 수행한다. fork 뒤 child에서도 다른 thread가 잡고 사라진 lock을 건드리지 않도록 exec 전 허용 동작을 제한한다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">6.10 kernel의 lockdep 관점으로 user API도 본다</h3>
+        <p style="margin:0;">Linux lockdep은 개별 lock instance보다 논리적 lock class와 획득 dependency를 추적한다. user-space 리뷰에서도 “이 함수는 어떤 lock class를 어떤 순서로 잡는가”를 API 문서에 남기면 callback·중첩 호출·모듈 조합에서 생기는 cycle을 설계 단계에 찾을 수 있다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. 나쁜 계약과 좋은 계약 비교</h2>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:13px;">
+          <tr style="background:#15314a;color:#bae6fd;"><td>나쁜 API</td><td>숨은 경쟁</td><td>개선된 API</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>get()+set()</code></td><td style="border-top:1px solid #27435d;">사이 interleaving</td><td style="border-top:1px solid #27435d;"><code>add(delta)</code> 한 번에 선형화</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>contains(); insert()</code></td><td style="border-top:1px solid #27435d;">TOCTOU·중복</td><td style="border-top:1px solid #27435d;"><code>put_if_absent()</code>와 결과 enum</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>T *get_internal()</code></td><td style="border-top:1px solid #27435d;">lock 밖 alias·UAF</td><td style="border-top:1px solid #27435d;">immutable snapshot/owned copy</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>close(); free()</code></td><td style="border-top:1px solid #27435d;">in-flight call</td><td style="border-top:1px solid #27435d;"><code>close→drain/join→destroy</code></td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>do(callback)</code></td><td style="border-top:1px solid #27435d;">재진입·lock cycle</td><td style="border-top:1px solid #27435d;">snapshot 후 unlock, callback 실행</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>wait(timeout_ms)</code></td><td style="border-top:1px solid #27435d;">단계별 예산 증식</td><td style="border-top:1px solid #27435d;">absolute deadline/context 전달</td></tr>
+        </table>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. 실무 best practice</h2>
+        <ul style="margin:0;padding-left:22px;">
+          <li>헤더/API 문서에 thread-safety scope를 <strong style="color:#f8fafc;">같은 객체, 다른 객체, global state</strong>로 나눠 쓴다.</li>
+          <li>각 연산의 precondition, postcondition, invariant, linearization point를 한 문장으로 적는다.</li>
+          <li>호출자에게 check-then-act를 강요하지 말고 업무 의미 단위의 atomic method를 제공한다.</li>
+          <li>내부 lock과 mutable pointer를 노출하지 않고 snapshot 또는 명시적 scoped guard를 사용한다.</li>
+          <li>blocking 가능성, 최대 wait, interrupt/cancellation, fairness와 backpressure 정책을 계약에 넣는다.</li>
+          <li>close를 idempotent하게 만들고 신규 호출 차단→in-flight drain→destroy 순서를 강제한다.</li>
+          <li>callback, logging, allocator, RPC를 lock 안에서 호출하지 않는다.</li>
+          <li>오류마다 state 변경 여부, 자원 ownership, retry/idempotency 조건을 표로 남긴다.</li>
+          <li>ThreadSanitizer·stress·fault injection과 함께 history/invariant assertion을 운영한다.</li>
+          <li>wait time, contention, queue depth, timeout, rejected-after-close를 metric으로 노출한다.</li>
+        </ul>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. error handling과 상태 보존</h2>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:13px;">
+          <tr style="background:#15314a;color:#bae6fd;"><td>상황</td><td>API가 보장할 것</td><td>호출자 행동</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">validation 실패</td><td style="border-top:1px solid #27435d;">state 미변경</td><td style="border-top:1px solid #27435d;">입력 수정, blind retry 금지</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">deadline 전 획득 실패</td><td style="border-top:1px solid #27435d;">partial resource 역순 해제</td><td style="border-top:1px solid #27435d;">남은 budget과 idempotency 확인</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">CLOSED/ECANCELED</td><td style="border-top:1px solid #27435d;">새 state 변경 없음</td><td style="border-top:1px solid #27435d;">새 handle 획득 또는 종료</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">EOWNERDEAD</td><td style="border-top:1px solid #27435d;">lock 소유 + state inconsistent</td><td style="border-top:1px solid #27435d;">복구·consistent 또는 poison</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">callback 실패</td><td style="border-top:1px solid #27435d;">내부 lock 미보유, ownership 명확</td><td style="border-top:1px solid #27435d;">계약된 보상/중단 수행</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">destroy EBUSY/미정의 상태</td><td style="border-top:1px solid #27435d;">강제 파괴하지 않음</td><td style="border-top:1px solid #27435d;">drain/join protocol 결함 수정</td></tr>
+        </table>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 놓치기 쉬운 함정</h2>
+        <ul style="margin:0;padding-left:22px;">
+          <li><strong style="color:#fecaca;">const method면 thread-safe:</strong> 내부 cache, global allocator, 반환 alias가 mutable일 수 있다.</li>
+          <li><strong style="color:#fecaca;">getter/setter마다 lock:</strong> 호출 조합의 invariant는 보호하지 못한다.</li>
+          <li><strong style="color:#fecaca;">recursive mutex로 재진입 해결:</strong> invariant가 중간 상태인 채 callback이 들어오는 논리 오류는 남는다.</li>
+          <li><strong style="color:#fecaca;">rwlock이면 항상 빠름:</strong> 짧은 critical section, writer starvation, cache-line bouncing에서 더 느릴 수 있다.</li>
+          <li><strong style="color:#fecaca;">atomic pointer publish 후 바로 free:</strong> reader가 이전 pointer를 쓰는 reclamation 문제를 놓친다.</li>
+          <li><strong style="color:#fecaca;">close 후 mutex destroy:</strong> 이미 진입한 waiter와 alias를 drain하지 않았다.</li>
+          <li><strong style="color:#fecaca;">ThreadSanitizer가 조용하면 증명 완료:</strong> 실행되지 않은 interleaving과 논리적 atomicity 위반은 못 잡을 수 있다.</li>
+          <li><strong style="color:#fecaca;">MT-Safe와 signal-safe 혼동:</strong> signal handler의 재진입은 다른 제약이다.</li>
+        </ul>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. 30분 실습: 함수는 안전하지만 조합은 깨지는 API 리뷰</h2>
+        <p style="margin:0 0 10px;">다음 C11 프로그램은 모든 state 접근에 mutex를 쓰지만 <code style="color:#fde68a;">get→set</code> 조합에서 lost update가 난다. 이어 업무 의미 단위 <code style="color:#fde68a;">add</code>와 close 이후 호출 거절, join 뒤 destroy를 검증한다.</p>
+        <pre style="margin:0;white-space:pre;overflow-x:auto;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;">set -eu
+lab_dir="$(mktemp -d)"
+trap 'rm -rf "$lab_dir"' EXIT
+
+cat &gt; "$lab_dir/api_review.c" &lt;&lt;'C'
+#include &lt;pthread.h&gt;
+#include &lt;stdatomic.h&gt;
+#include &lt;errno.h&gt;
+#include &lt;sched.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+
+typedef struct {
+  pthread_mutex_t mu;
+  long value;
+  int closed;
+} counter_t;
+
+static atomic_int ready;
+static counter_t *shared;
+
+static void must(int rc, const char *what) {
+  if (rc != 0) { fprintf(stderr, "%s rc=%d\n", what, rc); exit(1); }
+}
+static int counter_init(counter_t *c) {
+  c-&gt;value = 0; c-&gt;closed = 0;
+  return pthread_mutex_init(&amp;c-&gt;mu, NULL);
+}
+static int counter_get(counter_t *c, long *out) {
+  int rc = pthread_mutex_lock(&amp;c-&gt;mu); if (rc) return rc;
+  *out = c-&gt;value;
+  return pthread_mutex_unlock(&amp;c-&gt;mu);
+}
+static int counter_set(counter_t *c, long value) {
+  int rc = pthread_mutex_lock(&amp;c-&gt;mu); if (rc) return rc;
+  if (c-&gt;closed) rc = ECANCELED; else c-&gt;value = value;
+  int urc = pthread_mutex_unlock(&amp;c-&gt;mu);
+  return rc ? rc : urc;
+}
+static int counter_add(counter_t *c, long delta) {
+  int rc = pthread_mutex_lock(&amp;c-&gt;mu); if (rc) return rc;
+  if (c-&gt;closed) rc = ECANCELED; else c-&gt;value += delta;
+  int urc = pthread_mutex_unlock(&amp;c-&gt;mu);
+  return rc ? rc : urc;
+}
+static int counter_close(counter_t *c) {
+  int rc = pthread_mutex_lock(&amp;c-&gt;mu); if (rc) return rc;
+  c-&gt;closed = 1;
+  return pthread_mutex_unlock(&amp;c-&gt;mu);
+}
+/* precondition: all callers joined; no alias can enter again */
+static int counter_destroy(counter_t *c) { return pthread_mutex_destroy(&amp;c-&gt;mu); }
+
+static void *broken_increment(void *unused) {
+  (void)unused; long snapshot;
+  must(counter_get(shared, &amp;snapshot), "get");
+  atomic_fetch_add_explicit(&amp;ready, 1, memory_order_release);
+  while (atomic_load_explicit(&amp;ready, memory_order_acquire) != 2) sched_yield();
+  must(counter_set(shared, snapshot + 1), "set");
+  return NULL;
+}
+static void *many_adds(void *unused) {
+  (void)unused;
+  for (int i = 0; i &lt; 25000; ++i) must(counter_add(shared, 1), "add");
+  return NULL;
+}
+int main(void) {
+  counter_t broken; pthread_t x, y; long value;
+  must(counter_init(&amp;broken), "init"); shared = &amp;broken; atomic_store(&amp;ready, 0);
+  must(pthread_create(&amp;x, NULL, broken_increment, NULL), "create");
+  must(pthread_create(&amp;y, NULL, broken_increment, NULL), "create");
+  must(pthread_join(x, NULL), "join"); must(pthread_join(y, NULL), "join");
+  must(counter_get(&amp;broken, &amp;value), "get");
+  printf("broken_composition final=%ld expected=2\n", value);
+  must(counter_destroy(&amp;broken), "destroy");
+
+  counter_t fixed; pthread_t workers[4];
+  must(counter_init(&amp;fixed), "init"); shared = &amp;fixed;
+  for (int i = 0; i &lt; 4; ++i) must(pthread_create(&amp;workers[i], NULL, many_adds, NULL), "create");
+  for (int i = 0; i &lt; 4; ++i) must(pthread_join(workers[i], NULL), "join");
+  must(counter_get(&amp;fixed, &amp;value), "get");
+  printf("atomic_api final=%ld expected=100000\n", value);
+  must(counter_close(&amp;fixed), "close");
+  int rejected = counter_add(&amp;fixed, 1) == ECANCELED;
+  must(counter_get(&amp;fixed, &amp;value), "get");
+  printf("after_close rejected=%d value=%ld\n", rejected, value);
+  int destroyed = counter_destroy(&amp;fixed) == 0;
+  printf("destroy_after_join ok=%d\n", destroyed);
+  return 0;
+}
+C
+
+cc -std=c11 -O2 -pthread "$lab_dir/api_review.c" -o "$lab_dir/api_review"
+"$lab_dir/api_review"
+</pre>
+        <p style="margin:10px 0 4px;"><strong style="color:#f8fafc;">기대 출력</strong></p>
+        <pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:12px;color:#bfdbfe;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">broken_composition final=1 expected=2
+atomic_api final=100000 expected=100000
+after_close rejected=1 value=100000
+destroy_after_join ok=1</pre>
+        <ol style="margin:12px 0 0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">0~10분:</strong> get/set 각각은 왜 thread-safe인데 두 호출의 조합은 왜 atomic하지 않은지 history를 그린다.</li>
+          <li><strong style="color:#f8fafc;">10~20분:</strong> counter_add의 linearization point, precondition, postcondition, error ownership을 주석으로 작성한다.</li>
+          <li><strong style="color:#f8fafc;">20~30분:</strong> close와 destroy 사이 active_calls를 drain하는 CLOSING 상태를 설계하고 T-H-R-E-A-D 표로 셀프 리뷰한다.</li>
+        </ol>
+        <p style="margin:10px 0 0;padding:10px 12px;background:#13283a;border-left:4px solid #5eead4;color:#c8e5f3;font-size:14px;"><strong>핵심 리뷰:</strong> 이 샘플은 모든 worker를 join한 뒤 destroy하므로 안전하다. 실제 library가 caller lifetime을 통제하지 못한다면 reference pin, close/drain wait, opaque handle 같은 별도 protocol이 필요하다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 실패 시나리오: 안전한 cache API가 만든 use-after-free</h2>
+        <p style="margin:0 0 8px;">cache의 <code style="color:#fde68a;">get()</code>, <code style="color:#fde68a;">put()</code>은 모두 mutex를 사용했다. 하지만 get은 내부 entry pointer를 반환했고 caller는 lock 밖에서 이를 사용했다. eviction thread가 entry를 제거·free한 직후 caller가 pointer를 읽어 crash했다. race detector에서는 타이밍에 따라 잡히지 않았고, mutex 사용 여부만 본 리뷰도 통과했다.</p>
+        <p style="margin:0;"><strong style="color:#f8fafc;">원인:</strong> state mutation은 보호했지만 반환 alias의 lifetime 계약이 없었다. <strong style="color:#f8fafc;">복구:</strong> cache를 read-only 모드로 전환하고 crash dump의 object ID·eviction history를 보존한다. <strong style="color:#f8fafc;">재발 방지:</strong> owned copy/immutable refcount handle, eviction과 reader pin의 state machine, close→drain→destroy, history 기반 stress test를 도입한다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 대기업 면접 질문 3개</h2>
+        <ol style="margin:0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">“모든 public method에 mutex를 걸면 thread-safe인가요?”</strong><br>답변 포인트: 개별 method의 data-race 방지는 가능하지만 method 조합의 atomicity, 내부 pointer lifetime, callback 재진입, init/destroy 경쟁은 남는다. invariant와 linearization point를 업무 연산 단위로 정의해야 한다.</li>
+          <li style="margin-top:10px;"><strong style="color:#f8fafc;">“thread-safe와 reentrant, async-signal-safe의 차이는?”</strong><br>답변 포인트: thread-safe는 여러 thread의 동시 호출, reentrant는 완료 전 동일 코드 재진입, signal-safe는 비동기 signal context 제약이다. mutex 기반 함수는 MT-Safe여도 signal handler에서 self-deadlock할 수 있다.</li>
+          <li style="margin-top:10px;"><strong style="color:#f8fafc;">“객체를 안전하게 destroy하는 API를 설계해 보세요.”</strong><br>답변 포인트: OPEN→CLOSING에서 신규 호출을 거절하고 lifetime pin/active count로 in-flight를 drain한 뒤 CLOSED에서만 destroy한다. owner/alias를 제한하고 close는 idempotent, 오류·deadline·callback 정책과 관측 지표를 명시한다.</li>
+        </ol>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 퀴즈·누적 리뷰</h2>
+        <ol style="margin:0;padding-left:22px;">
+          <li>MT-Safe 함수 둘의 연속 호출이 atomic하지 않은 반례를 설명하라.</li>
+          <li>linearization point가 호출 시작 전이나 반환 후일 수 없는 이유는?</li>
+          <li>mutex가 data visibility는 보장해도 object lifetime을 보장하지 못하는 이유는?</li>
+          <li>Day 15: atomicity, ordering, visibility를 API contract 세 문장으로 나눠 보라.</li>
+          <li>Day 16: condition variable API에서 predicate와 mutex를 caller에게 어떻게 문서화해야 하는가?</li>
+          <li>Day 17: spin/blocking 선택을 API의 SLO와 execution context에 어떻게 노출할 것인가?</li>
+          <li>Day 18: callback under lock이 wait-for graph를 왜 외부 모듈까지 확장하는가?</li>
+          <li>Day 19: immutable snapshot publish에 필요한 happens-before edge를 설명하라.</li>
+          <li>Day 20: timeout 뒤 state·ownership·retry 조건 세 가지를 말하라.</li>
+        </ol>
+        <p style="margin:12px 0 0;padding:10px 12px;background:#13283a;border-left:4px solid #5eead4;color:#c8e5f3;font-size:14px;"><strong>면접형 답변 순서:</strong> invariant → concurrent history → synchronization/linearization point → lifecycle → failure/observability → trade-off 순서로 90초 안에 설명한다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">15. 다음 날 연결</h2>
+        <p style="margin:0;">Day 22부터 Virtual Memory로 넘어간다. 첫 주제는 <strong style="color:#f8fafc;">virtual address, physical address, MMU, page table</strong>이다. 오늘 다룬 pointer lifetime과 visibility를 “주소 값이 실제 물리 메모리에 어떻게 번역되고, mapping lifecycle이 어떻게 관리되는가”로 확장한다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">16. 공식·1차 출처</h2>
+        <ul style="margin:0;padding-left:22px;font-size:14px;">
+          <li><a href="https://man7.org/linux/man-pages/man7/attributes.7.html" style="color:#7dd3fc;">Linux man-pages attributes(7)</a> — MT-Safe의 의미와 함수 조합 atomicity의 한계</li>
+          <li><a href="https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3p.html" style="color:#7dd3fc;">POSIX pthread_mutex_lock/trylock/unlock</a> — ownership, 오류, synchronization primitive 계약</li>
+          <li><a href="https://man7.org/linux/man-pages/man3/pthread_mutex_destroy.3p.html" style="color:#7dd3fc;">POSIX pthread_mutex_init/destroy</a> — 초기화·사용 중 destroy의 lifecycle 제약</li>
+          <li><a href="https://man7.org/linux/man-pages/man3/pthread_once.3p.html" style="color:#7dd3fc;">POSIX pthread_once</a> — once-only initialization</li>
+          <li><a href="https://man7.org/linux/man-pages/man3/pthread_cleanup_push.3p.html" style="color:#7dd3fc;">POSIX pthread_cleanup_push/pop</a> — cancellation cleanup의 LIFO 규칙</li>
+          <li><a href="https://man7.org/linux/man-pages/man3/pthread_cond_wait.3p.html" style="color:#7dd3fc;">POSIX pthread_cond_wait/timedwait</a> — predicate, atomic unlock-wait, cancellation</li>
+          <li><a href="https://man7.org/linux/man-pages/man7/signal-safety.7.html" style="color:#7dd3fc;">POSIX signal-safety</a> — async-signal-safe 함수와 재진입 제약</li>
+          <li><a href="https://docs.kernel.org/locking/lockdep-design.html" style="color:#7dd3fc;">Linux kernel lockdep design</a> — lock class와 dependency graph</li>
+          <li><a href="https://gcc.gnu.org/onlinedocs/gcc/Instrumentation-Options.html" style="color:#7dd3fc;">GCC instrumentation options</a> — ThreadSanitizer의 사용 범위</li>
+        </ul>
+
+        <p style="margin:28px 0 0;padding-top:18px;border-top:1px solid #27435d;color:#7899b0;font-size:12px;">Operating System 심화 커리큘럼 · Day 21 · 2026-08-23 (Asia/Seoul)</p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>

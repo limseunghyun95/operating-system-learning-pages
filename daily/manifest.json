@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-08-22T09:00:23+09:00",
+  "updatedAt": "2026-08-23T09:14:07+09:00",
   "lessons": [
     {
       "day": 1,
@@ -185,6 +185,15 @@
       "path": "day-20.html",
       "kind": "lab",
       "publishedAt": "2026-08-22T09:00:23+09:00"
+    },
+    {
+      "day": 21,
+      "week": 3,
+      "title": "리뷰: thread-safe API 설계 리뷰",
+      "summary": "개별 함수의 mutex를 넘어 invariant·linearization point·happens-before·ownership/lifetime·close/drain/destroy·deadline/cancellation을 T-H-R-E-A-D 6개 gate로 리뷰합니다.",
+      "path": "day-21.html",
+      "kind": "review",
+      "publishedAt": "2026-08-23T09:14:07+09:00"
     }
   ]
 }
