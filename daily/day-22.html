@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operating System 심화 커리큘럼 Day 22 - virtual address, physical address, MMU, page table</title>
+</head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.72;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#07111f;">
+    <tr><td align="center" style="padding:24px 12px;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:680px;background:#0f1d2e;border:1px solid #23415d;border-radius:18px;overflow:hidden;">
+        <tr><td style="padding:30px 28px 22px;background:#102a43;border-bottom:1px solid #28506f;">
+          <div style="font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:#5eead4;font-weight:800;">Operating System · Day 22 / 63 · Virtual Memory</div>
+          <h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">virtual address, physical address, MMU, page table</h1>
+          <p style="margin:0;color:#b9d6eb;">한 줄 요약: CPU가 만든 virtual address는 <strong style="color:#f8fafc;">MMU가 현재 process의 page table과 권한을 따라 PFN+offset의 physical address로 번역</strong>하며, 번역 불가가 곧바로 “메모리 부족”을 뜻하지는 않는다.</p>
+        </td></tr>
+        <tr><td style="padding:26px 28px 34px;">
+
+        <h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:14px;">
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;width:30%;">virtual address (VA)</td><td style="border-bottom:1px solid #27435d;">program의 instruction과 pointer가 사용하는 주소. process마다 독립된 address space에서 해석된다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">physical address (PA)</td><td style="border-bottom:1px solid #27435d;">CPU memory transaction이 최종적으로 가리키는 physical memory 주소. application이 보통 직접 다루지 않는다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">MMU</td><td style="border-bottom:1px solid #27435d;">Memory Management Unit. CPU의 virtual address를 physical address로 번역하고 접근 권한을 검사하는 hardware다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">page / page frame</td><td style="border-bottom:1px solid #27435d;">virtual memory의 고정 크기 조각이 page, physical memory의 같은 크기 슬롯이 page frame이다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">page size</td><td style="border-bottom:1px solid #27435d;">한 page의 크기. 4KiB가 흔하지만 architecture와 kernel 설정에 따라 다르므로 <code>sysconf(_SC_PAGESIZE)</code>로 확인한다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">VPN / PFN</td><td style="border-bottom:1px solid #27435d;">Virtual Page Number와 Page Frame Number. 주소를 page size로 나눈 몫에 해당한다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">offset</td><td style="border-bottom:1px solid #27435d;">page 내부 위치. 번역 전후에도 같은 low bits를 유지한다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">page table</td><td style="border-bottom:1px solid #27435d;">VPN을 PFN과 권한 비트로 연결하는 계층적 자료구조. kernel이 관리하고 MMU가 읽는다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">PTE</td><td style="border-bottom:1px solid #27435d;">Page Table Entry. PFN과 present, read/write, user, execute, accessed, dirty 같은 상태·권한을 담는 최하위 mapping entry다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">VMA</td><td style="border-bottom:1px solid #27435d;">Virtual Memory Area. Linux가 “이 주소 범위는 어떤 파일/anonymous memory이며 어떤 권한인가”를 기록한 범위 metadata다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">page fault</td><td style="border-bottom:1px solid #27435d;">MMU가 현재 translation/permission으로 접근을 완료할 수 없어 CPU가 kernel handler로 제어를 넘기는 exception이다.</td></tr>
+          <tr><td style="color:#7dd3fc;font-weight:700;">RSS / VSZ</td><td>RSS는 현재 resident physical memory의 근사치, VSZ는 예약된 virtual address range의 크기다. 둘은 같은 지표가 아니다.</td></tr>
+        </table>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 호텔 주소와 실제 객실</h2>
+        <p style="margin:0 0 10px;">application은 “12층 345호”라는 virtual address만 본다. 같은 호수라도 process라는 서로 다른 호텔에 속할 수 있다. MMU는 현재 호텔의 안내 장부(page table)를 따라 실제 건물의 객실(page frame)을 찾고, 숙박권한(PTE bits)을 확인한다.</p>
+        <ul style="margin:0;padding-left:22px;">
+          <li>주소가 존재해도 아직 실제 객실이 배정되지 않았을 수 있다: lazy allocation.</li>
+          <li>서로 다른 virtual page가 같은 frame을 공유할 수 있다: shared mapping.</li>
+          <li>같은 숫자의 VA가 process마다 다른 frame을 가리킬 수 있다: isolation.</li>
+          <li>장부에 범위는 있지만 권한이 없으면 kernel은 고칠 수 없고 SIGSEGV를 보낸다.</li>
+        </ul>
+        <p style="margin:10px 0 0;color:#a8c7db;">중요한 차이: VMA는 “이 방을 사용할 정책과 범위”, PTE는 “현재 이 virtual page가 어느 frame에 어떤 hardware 권한으로 연결됐는가”다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: load instruction에서 DRAM까지</h2>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:separate;border-spacing:6px;background:#0b1726;border:1px solid #27435d;border-radius:12px;padding:8px;text-align:center;font-size:13px;">
+          <tr>
+            <td style="padding:10px 5px;background:#12314a;border-radius:8px;color:#bae6fd;">instruction<br><small>load [VA]</small></td>
+            <td style="color:#5eead4;font-size:20px;">→</td>
+            <td style="padding:10px 5px;background:#12314a;border-radius:8px;color:#bae6fd;">MMU<br><small>current address space</small></td>
+            <td style="color:#5eead4;font-size:20px;">→</td>
+            <td style="padding:10px 5px;background:#12314a;border-radius:8px;color:#bae6fd;">TLB lookup<br><small>cached translation?</small></td>
+          </tr>
+          <tr><td colspan="5" style="color:#5eead4;font-size:20px;">miss ↓</td></tr>
+          <tr>
+            <td style="padding:10px 5px;background:#16344c;border-radius:8px;color:#bae6fd;">root register<br><small>x86: CR3 context</small></td>
+            <td style="color:#5eead4;font-size:20px;">→</td>
+            <td style="padding:10px 5px;background:#16344c;border-radius:8px;color:#bae6fd;">PGD→P4D→PUD<br><small>upper indices</small></td>
+            <td style="color:#5eead4;font-size:20px;">→</td>
+            <td style="padding:10px 5px;background:#16344c;border-radius:8px;color:#bae6fd;">PMD→PTE<br><small>PFN + permission</small></td>
+          </tr>
+          <tr><td colspan="5" style="color:#5eead4;font-size:20px;">↓</td></tr>
+          <tr>
+            <td colspan="2" style="padding:10px;background:#123d36;border-radius:8px;color:#a7f3d0;">allowed: PA = PFN × page_size + offset</td>
+            <td style="color:#5eead4;">│</td>
+            <td colspan="2" style="padding:10px;background:#4a2831;border-radius:8px;color:#fecdd3;">absent/denied: page-fault exception → kernel</td>
+          </tr>
+        </table>
+        <p style="margin:10px 0 0;font-size:14px;color:#a8c7db;">오늘은 page walk의 큰 흐름만 잡는다. TLB hit/miss, page-walk cache와 shootdown 비용은 Day 23에서 깊게 다룬다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. 주소 분해와 상태 전이 그림</h2>
+        <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;">4 KiB page 예시: PAGE_SHIFT=12, PAGE_SIZE=2^12
+
+virtual address 0x0001_2345
+┌──────────── VPN = VA &gt;&gt; 12 = 0x12 ────────────┬─ offset = 0x345 ─┐
+└─ indices: PGD / P4D / PUD / PMD / PTE ─────────┴──────────────────┘
+                                      │
+                                      └─ PTE says PFN=0xABC, present=1, user=1, rw=1, nx=1
+
+physical address = (0xABC &lt;&lt; 12) | 0x345 = 0xABC345
+
+ACCESS ──translation+permission OK──&gt; COMPLETE
+   │
+   └─ fault ─&gt; kernel checks VMA
+                ├─ valid + recoverable ─&gt; allocate/load/update PTE ─&gt; RETRY instruction
+                └─ unmapped/forbidden ─&gt; SIGSEGV (MAPERR/ACCERR) ─&gt; handler/default terminate</pre>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. CS·kernel·hardware deep dive</h2>
+        <h3 style="margin:16px 0 8px;color:#f8fafc;font-size:17px;">5.1 pointer 값은 physical location이 아니다</h3>
+        <p style="margin:0;">C의 pointer를 출력하면 보통 해당 process의 VA가 나온다. 그 숫자를 physical RAM offset으로 해석하면 안 된다. context switch 때 CPU가 사용하는 address-space root가 달라질 수 있어 같은 VA가 다른 process에서 다른 PFN을 가리킨다. 반대로 shared memory는 서로 다른 VA를 같은 PFN에 연결할 수 있다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.2 offset은 번역하지 않고 보존한다</h3>
+        <p style="margin:0;">page size가 2^n이면 VA의 low n bits는 page offset이고 나머지가 VPN이다. page table은 VPN 부분을 PFN으로 바꾸며 offset은 그대로 붙인다. 4KiB라면 n=12다. alignment, page boundary, 내부 단편화를 설명하는 출발점이 이 비트 분해다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.3 계층형 page table은 sparse address space 비용을 줄인다</h3>
+        <p style="margin:0;">64-bit VA 전체를 flat array로 만들면 대부분이 빈 entry인데도 막대한 메모리가 든다. 계층형 구조는 사용하지 않는 큰 범위를 upper-level entry 하나의 absent로 표현한다. Linux의 architecture-neutral 모델은 PGD→P4D→PUD→PMD→PTE 다섯 level이며 hardware가 적은 level만 쓰면 나머지를 folding한다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.4 Linux에서 VMA와 page table은 서로 다른 질문에 답한다</h3>
+        <p style="margin:0;">VMA는 address range, protection, file/anonymous backing, private/shared 정책을 기록한다. PTE는 page 단위의 현재 translation과 hardware bit를 기록한다. anonymous <code style="color:#fde68a;">mmap</code> 성공 직후 VMA가 생겨도 모든 page에 private frame/PTE가 즉시 생긴다고 단정할 수 없다. 첫 접근 fault에서 zero page 연결이나 frame allocation이 일어날 수 있다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.5 page table도 physical memory를 소비한다</h3>
+        <p style="margin:0;">“VA는 공짜”라는 말은 과장이다. 넓은 range를 예약만 하면 leaf PTE가 모두 생기지 않을 수 있지만, sparse하게 많은 page를 touch하면 data frame뿐 아니라 여러 level의 page-table page, reverse mapping과 kernel metadata가 필요하다. 운영에서는 VSZ·RSS와 함께 page-table memory를 본다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.6 PTE는 주소와 protection을 함께 운반한다</h3>
+        <p style="margin:0;">PTE format은 architecture-specific이지만 보통 PFN과 present, writable, user/supervisor, execute-disable, accessed, dirty 같은 bit를 담는다. 따라서 MMU는 번역과 보호를 같은 access path에서 수행한다. W^X는 한 mapping이 writable이면서 executable하지 않도록 관리하는 대표적 보안 원칙이다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.7 page fault는 exception이며 항상 오류는 아니다</h3>
+        <p style="margin:0;">valid VMA 안의 lazy allocation, swapped page, copy-on-write는 kernel이 PTE/frame을 준비한 뒤 faulting instruction을 재실행할 수 있는 정상 경로다. 주소가 VMA에 없거나 write를 read-only VMA에 시도하면 복구할 계약이 없어 SIGSEGV로 이어진다. <code style="color:#fde68a;">SEGV_MAPERR</code>는 mapping 없음, <code style="color:#fde68a;">SEGV_ACCERR</code>는 permission 위반을 구분한다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.8 각 process의 mm_struct가 translation context를 묶는다</h3>
+        <p style="margin:0;">Linux user process는 <code style="color:#fde68a;">task_struct</code>가 참조하는 <code style="color:#fde68a;">mm_struct</code>에 VMA 정보와 top-level page table(PGD)을 가진다. 같은 process의 thread는 보통 이 address space를 공유하므로 pointer를 공유할 수 있지만 synchronization 없이 데이터 접근이 안전해지는 것은 아니다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.9 “64-bit pointer = 64-bit VA 모두 사용”은 아니다</h3>
+        <p style="margin:0;">architecture와 paging mode가 실제 implemented address width를 정한다. x86-64의 4-level/5-level paging은 서로 다른 범위를 제공하며 Linux는 compatibility 때문에 5-level hardware에서도 높은 userspace 주소를 기본적으로 적극 할당하지 않는다. pointer의 사용하지 않는 high bit를 임의 tag로 쓰는 코드는 미래 주소 폭에서 깨질 수 있다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.10 PFN 관찰 제한도 security boundary다</h3>
+        <p style="margin:0;">Linux <code style="color:#fde68a;">/proc/pid/pagemap</code>은 mapping state를 제공하지만, 실제 PFN은 CAP_SYS_ADMIN이 없으면 최신 kernel에서 0으로 가려질 수 있다. PFN 정보가 Rowhammer 공격을 돕기 때문이다. 실무 도구가 PFN 0을 “physical frame 0”으로 오판하지 않게 권한과 kernel version을 기록해야 한다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. 관찰값을 읽는 법</h2>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:13px;">
+          <tr style="background:#15314a;color:#bae6fd;"><td>증거</td><td>답하는 질문</td><td>답하지 못하는 질문</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>/proc/PID/maps</code></td><td style="border-top:1px solid #27435d;">VMA range·rwx·private/shared·backing</td><td style="border-top:1px solid #27435d;">모든 page가 resident인가?</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>/proc/PID/smaps</code></td><td style="border-top:1px solid #27435d;">range별 RSS/PSS·dirty 등</td><td style="border-top:1px solid #27435d;">매 access의 translation latency</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>pagemap</code></td><td style="border-top:1px solid #27435d;">present/swapped/soft-dirty·권한 시 PFN</td><td style="border-top:1px solid #27435d;">무권한 PFN 0의 실제 frame</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">VSZ</td><td style="border-top:1px solid #27435d;">virtual range 총량</td><td style="border-top:1px solid #27435d;">실제 RAM 소비</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">RSS</td><td style="border-top:1px solid #27435d;">resident page 근사치</td><td style="border-top:1px solid #27435d;">shared page의 독점 비용</td></tr>
+        </table>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. 실무 best practice</h2>
+        <ul style="margin:0;padding-left:22px;">
+          <li>page size를 4096으로 hard-code하지 말고 runtime/architecture 계약을 확인한다.</li>
+          <li><code style="color:#fde68a;">mmap</code>, <code style="color:#fde68a;">mprotect</code>, <code style="color:#fde68a;">munmap</code>의 주소·길이 alignment와 overflow를 먼저 검증한다.</li>
+          <li>메모리 알람은 VSZ만 보지 말고 RSS/PSS, anonymous/file, dirty, page-table memory, fault rate를 함께 본다.</li>
+          <li>mapping permission은 최소 권한으로 시작하고 writable+executable 동시 허용을 피한다.</li>
+          <li><code style="color:#fde68a;">MAP_FIXED</code>는 기존 mapping을 덮을 위험이 있어 소유 범위가 증명된 경우만 사용한다.</li>
+          <li>process 외부로 raw pointer를 ID처럼 전달하지 않는다. IPC에서는 offset/handle과 shared mapping protocol을 사용한다.</li>
+          <li>physical contiguity가 필요한 DMA/huge page 요구와 virtual contiguity를 구분한다.</li>
+          <li>pagemap/PFN 진단은 privilege, kernel version, security impact를 명시하고 운영 기본 경로로 의존하지 않는다.</li>
+        </ul>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. error handling과 fault 분류</h2>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:13px;">
+          <tr style="background:#15314a;color:#bae6fd;"><td>결과</td><td>가능한 원인</td><td>처리</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>mmap == MAP_FAILED</code></td><td style="border-top:1px solid #27435d;">ENOMEM/EACCES/EINVAL/EPERM</td><td style="border-top:1px solid #27435d;">errno 보존, size·flags·limit·backing 권한 기록</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>mprotect EINVAL</code></td><td style="border-top:1px solid #27435d;">주소 미정렬·잘못된 flag/range</td><td style="border-top:1px solid #27435d;">page boundary로 정렬하고 overflow 검사</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>SEGV_MAPERR</code></td><td style="border-top:1px solid #27435d;">unmapped VA·UAF·bad pointer</td><td style="border-top:1px solid #27435d;">fault VA, PC, maps, stack을 보존</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>SEGV_ACCERR</code></td><td style="border-top:1px solid #27435d;">read/write/execute permission 위반</td><td style="border-top:1px solid #27435d;">VMA permission과 access type 비교</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>SIGBUS</code></td><td style="border-top:1px solid #27435d;">file mapping의 backing 범위 밖 접근 등</td><td style="border-top:1px solid #27435d;">file size/truncate 경쟁과 offset 확인</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">PFN=0</td><td style="border-top:1px solid #27435d;">unmapped 또는 capability로 masked</td><td style="border-top:1px solid #27435d;">present bit·CAP_SYS_ADMIN·kernel 문서 확인</td></tr>
+        </table>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. 놓치기 쉬운 함정</h2>
+        <ul style="margin:0;padding-left:22px;">
+          <li><strong style="color:#fecaca;">mmap 성공 = RAM 즉시 확보:</strong> VMA 예약과 resident frame 할당은 다를 수 있다.</li>
+          <li><strong style="color:#fecaca;">VA가 연속 = PA도 연속:</strong> page마다 흩어진 frame에 매핑할 수 있다.</li>
+          <li><strong style="color:#fecaca;">같은 pointer 숫자 = 같은 데이터:</strong> address-space context가 다르면 mapping도 다르다.</li>
+          <li><strong style="color:#fecaca;">page fault = 장애:</strong> demand paging의 정상 minor fault일 수 있다.</li>
+          <li><strong style="color:#fecaca;">segfault = RAM 부족:</strong> 보통 unmapped/permission 문제이며 OOM과 다르다.</li>
+          <li><strong style="color:#fecaca;">PTE와 VMA를 같은 것으로 보기:</strong> policy range는 있어도 현재 leaf translation은 absent일 수 있다.</li>
+          <li><strong style="color:#fecaca;">PFN 0을 그대로 믿기:</strong> 무권한 process에는 보안상 masking될 수 있다.</li>
+          <li><strong style="color:#fecaca;">pointer high bit 재활용:</strong> 더 넓은 VA mode나 pointer tagging 규칙에서 충돌할 수 있다.</li>
+        </ul>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 30분 실습: VA 분해·fork isolation·permission fault</h2>
+        <p style="margin:0 0 10px;">macOS/Linux에서 실행 가능한 C 실습이다. anonymous mapping의 page alignment를 확인하고, fork 뒤 같은 VA가 독립된 값을 가질 수 있음을 관찰하며, PROT_NONE 접근을 child process에 격리해 보호 위반 signal을 안전하게 확인한다. Linux는 SIGSEGV가 계약이고 macOS에서는 SIGBUS가 관찰될 수 있다.</p>
+        <pre style="margin:0;white-space:pre;overflow-x:auto;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;">set -eu
+lab_dir="$(mktemp -d)"
+trap 'rm -rf "$lab_dir"' EXIT
+
+cat &gt; "$lab_dir/vm_lab.c" &lt;&lt;'C'
+#define _GNU_SOURCE
+#include &lt;sys/mman.h&gt;
+#include &lt;sys/types.h&gt;
+#include &lt;sys/wait.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;signal.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+
+typedef struct { uintptr_t addr; int value; } report_t;
+static void die(const char *what) { perror(what); exit(1); }
+
+int main(void) {
+  long ps = sysconf(_SC_PAGESIZE);
+  if (ps &lt;= 0 || (ps &amp; (ps - 1)) != 0) return 2;
+  unsigned char *p = mmap(NULL, (size_t)ps * 2, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p == MAP_FAILED) die("mmap");
+  printf("page_size_power_of_two=1 mapped_offset=%lu\n",
+         (unsigned long)((uintptr_t)p % (uintptr_t)ps));
+
+  p[0] = 7;
+  int fd[2]; if (pipe(fd) != 0) die("pipe");
+  uintptr_t parent_va = (uintptr_t)p;
+  pid_t child = fork(); if (child &lt; 0) die("fork");
+  if (child == 0) {
+    close(fd[0]); p[0] = 99;
+    report_t r = { (uintptr_t)p, p[0] };
+    if (write(fd[1], &amp;r, sizeof(r)) != (ssize_t)sizeof(r)) _Exit(3);
+    _Exit(0);
+  }
+  close(fd[1]); report_t r;
+  if (read(fd[0], &amp;r, sizeof(r)) != (ssize_t)sizeof(r)) die("read");
+  int status; if (waitpid(child, &amp;status, 0) != child) die("waitpid");
+  printf("fork_same_va=%d isolated_value=%d\n",
+         r.addr == parent_va, r.value == 99 &amp;&amp; p[0] == 7);
+
+  unsigned char *guard = p + ps;
+  if (mprotect(guard, (size_t)ps, PROT_NONE) != 0) die("mprotect");
+  child = fork(); if (child &lt; 0) die("fork");
+  if (child == 0) {
+    volatile unsigned char forbidden = *guard;
+    (void)forbidden; _Exit(4);
+  }
+  if (waitpid(child, &amp;status, 0) != child) die("waitpid");
+  int protection_signal = WIFSIGNALED(status) &amp;&amp;
+                          (WTERMSIG(status) == SIGSEGV || WTERMSIG(status) == SIGBUS);
+  printf("permission_fault_signal=%d\n", protection_signal);
+
+  const uintptr_t model_va = 0x12345, model_pfn = 0xabc, model_ps = 4096;
+  uintptr_t vpn = model_va / model_ps, offset = model_va % model_ps;
+  uintptr_t pa = model_pfn * model_ps + offset;
+  printf("translation_model vpn=0x%lx offset=0x%lx pa=0x%lx\n",
+         (unsigned long)vpn, (unsigned long)offset, (unsigned long)pa);
+  if (munmap(p, (size_t)ps * 2) != 0) die("munmap");
+  return 0;
+}
+C
+
+cc -std=c11 -O2 "$lab_dir/vm_lab.c" -o "$lab_dir/vm_lab"
+"$lab_dir/vm_lab"
+</pre>
+        <p style="margin:10px 0 4px;"><strong style="color:#f8fafc;">기대 출력</strong></p>
+        <pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:12px;color:#bfdbfe;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">page_size_power_of_two=1 mapped_offset=0
+fork_same_va=1 isolated_value=1
+permission_fault_signal=1
+translation_model vpn=0x12 offset=0x345 pa=0xabc345</pre>
+        <ol style="margin:12px 0 0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">0~10분:</strong> 실제 page size와 mapping address의 offset=0을 확인하고 VA를 VPN+offset으로 손계산한다.</li>
+          <li><strong style="color:#f8fafc;">10~20분:</strong> fork child와 parent의 VA 숫자는 같지만 값이 분리되는 이유를 “address space, page table, COW preview”로 설명한다.</li>
+          <li><strong style="color:#f8fafc;">20~30분:</strong> Linux에서 별도 실행 중인 process의 <code style="color:#fde68a;">/proc/PID/maps</code>를 보고 VMA range와 permission을 표시한다. pagemap PFN은 root 권한으로 우회하지 말고 masking 가능성을 기록한다.</li>
+        </ol>
+        <p style="margin:10px 0 0;padding:10px 12px;background:#13283a;border-left:4px solid #5eead4;color:#c8e5f3;font-size:14px;"><strong>안전 장치:</strong> PROT_NONE 접근은 fork child에서만 수행하므로 parent 학습 shell은 살아남는다. 실제 service에서 SIGSEGV를 복구 수단처럼 잡아 계속 실행하지 말고 crash evidence를 보존하는 편이 안전하다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. 실패 시나리오: 1TiB VSZ를 memory leak으로 오진</h2>
+        <p style="margin:0 0 8px;">allocator가 넓은 virtual arena를 <code style="color:#fde68a;">PROT_NONE</code>으로 예약해 VSZ가 1TiB가 됐다. 모니터가 VSZ 하나만 임계치로 사용해 장애로 선언했고 운영자가 process를 재시작했지만 RSS와 system memory pressure는 낮았다. 반대로 일부 worker가 arena 곳곳을 sparse touch하면서 page-table memory와 minor fault가 증가한 진짜 비용은 보지 못했다.</p>
+        <p style="margin:0;"><strong style="color:#f8fafc;">대응:</strong> VSZ, RSS/PSS, anonymous/file breakdown, page-table memory, fault rate, PSI를 함께 확인한다. <strong style="color:#f8fafc;">재발 방지:</strong> virtual reservation과 committed/resident 지표를 분리하고, VMA/PTE/frame이라는 세 층으로 runbook을 작성한다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 대기업 면접 질문 3개</h2>
+        <ol style="margin:0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">“virtual address는 어떻게 physical address가 되나요?”</strong><br>답변 포인트: VA를 level index와 page offset으로 분해하고, MMU가 현재 address-space root에서 계층형 page table을 walk해 PTE의 PFN·permission을 얻는다. PA는 PFN+동일 offset이며 실패하면 page-fault exception으로 kernel에 진입한다.</li>
+          <li style="margin-top:10px;"><strong style="color:#f8fafc;">“두 process의 같은 pointer 값은 같은 메모리인가요?”</strong><br>답변 포인트: 기본적으로 아니다. process별 mm/page-table context가 다른 PFN으로 번역할 수 있다. shared mapping이면 같은 frame을 의도적으로 공유할 수 있고, 같은 process thread는 address space를 공유한다.</li>
+          <li style="margin-top:10px;"><strong style="color:#f8fafc;">“mmap 성공과 실제 RAM 사용의 차이는?”</strong><br>답변 포인트: mmap은 먼저 VMA와 virtual range 계약을 만들 수 있고 physical frame/PTE는 first touch에서 lazy allocation될 수 있다. VSZ와 RSS를 분리하고 fault, PSS, page-table overhead, overcommit 정책을 함께 본다.</li>
+        </ol>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 퀴즈·누적 리뷰</h2>
+        <ol style="margin:0;padding-left:22px;">
+          <li>4KiB page에서 VA 0x2345의 VPN과 offset을 계산하라.</li>
+          <li>VMA는 있는데 PTE가 absent일 수 있는 정상 시나리오는?</li>
+          <li>VA 연속성이 PA 연속성을 보장하지 않는 이유는?</li>
+          <li>SEGV_MAPERR와 SEGV_ACCERR의 진단 증거 차이는?</li>
+          <li>Day 3 복습: task_struct, mm_struct, VMA, PGD 관계를 연결하라.</li>
+          <li>Day 5 복습: context switch에서 address-space context 변경이 필요한 경우는?</li>
+          <li>Day 19 복습: 같은 address space의 thread라도 memory ordering이 별도 문제인 이유는?</li>
+          <li>Day 21 복습: pointer lifetime과 mapping lifetime을 API contract에 어떻게 넣을 것인가?</li>
+        </ol>
+        <p style="margin:12px 0 0;padding:10px 12px;background:#13283a;border-left:4px solid #5eead4;color:#c8e5f3;font-size:14px;"><strong>면접 답변 순서:</strong> VA 정의 → VPN/offset 분해 → address-space root → hierarchical walk/PTE → protection/fault → VMA·RSS·실무 진단 순서로 설명한다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 다음 날 연결</h2>
+        <p style="margin:0;">Day 23은 <strong style="color:#f8fafc;">TLB, multi-level page table, page walk</strong>다. 오늘 그린 translation path에서 매 load마다 여러 memory access를 하지 않도록 TLB와 page-walk cache가 어떻게 비용을 줄이며, miss와 shootdown이 왜 성능 문제가 되는지 파고든다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">15. 공식·1차 출처</h2>
+        <ul style="margin:0;padding-left:22px;font-size:14px;">
+          <li><a href="https://docs.kernel.org/mm/page_tables.html" style="color:#7dd3fc;">Linux Kernel — Page Tables</a> — five-level hierarchy, PFN/PTE, MMU와 fault 처리</li>
+          <li><a href="https://docs.kernel.org/admin-guide/mm/concepts.html" style="color:#7dd3fc;">Linux Kernel — Memory Management Concepts</a> — virtual memory, frame, hierarchy, anonymous memory</li>
+          <li><a href="https://docs.kernel.org/arch/x86/x86_64/5level-paging.html" style="color:#7dd3fc;">Linux x86 — 5-level paging</a> — address width와 userspace compatibility</li>
+          <li><a href="https://www.kernel.org/doc/html/latest/admin-guide/mm/pagemap.html" style="color:#7dd3fc;">Linux Kernel — Examining Process Page Tables</a> — pagemap bits와 PFN 권한 제한</li>
+          <li><a href="https://man7.org/linux/man-pages/man2/mmap.2.html" style="color:#7dd3fc;">Linux man-pages mmap(2)</a> — mapping, protection, MAP_FAILED와 signal</li>
+          <li><a href="https://man7.org/linux/man-pages/man2/mprotect.2.html" style="color:#7dd3fc;">Linux man-pages mprotect(2)</a> — page permission과 alignment/error</li>
+          <li><a href="https://man7.org/linux/man-pages/man5/proc_pid_maps.5.html" style="color:#7dd3fc;">Linux man-pages proc_pid_maps(5)</a> — VMA range와 permission 관찰</li>
+          <li><a href="https://man7.org/linux/man-pages/man2/sigaction.2.html" style="color:#7dd3fc;">Linux man-pages sigaction(2)</a> — SEGV_MAPERR와 SEGV_ACCERR</li>
+        </ul>
+
+        <p style="margin:28px 0 0;padding-top:18px;border-top:1px solid #27435d;color:#7899b0;font-size:12px;">Operating System 심화 커리큘럼 · Day 22 · 2026-08-24 (Asia/Seoul)</p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>

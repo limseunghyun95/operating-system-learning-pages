@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-08-23T09:14:07+09:00",
+  "updatedAt": "2026-08-24T09:17:28+09:00",
   "lessons": [
     {
       "day": 1,
@@ -194,6 +194,15 @@
       "path": "day-21.html",
       "kind": "review",
       "publishedAt": "2026-08-23T09:14:07+09:00"
+    },
+    {
+      "day": 22,
+      "week": 4,
+      "title": "virtual address, physical address, MMU, page table",
+      "summary": "VA를 VPN+offset으로 분해해 MMU의 계층형 page-table walk, PTE의 PFN·권한, VMA와 translation 차이, recoverable fault와 SIGSEGV, 실무 관찰 지표까지 연결합니다.",
+      "path": "day-22.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-24T09:17:28+09:00"
     }
   ]
 }
