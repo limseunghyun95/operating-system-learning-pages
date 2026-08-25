@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operating System 심화 커리큘럼 Day 23 - TLB, multi-level page table, page walk</title>
+</head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.72;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#07111f;">
+    <tr><td align="center" style="padding:24px 12px;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:680px;background:#0f1d2e;border:1px solid #23415d;border-radius:18px;overflow:hidden;">
+        <tr><td style="padding:30px 28px 22px;background:#102a43;border-bottom:1px solid #28506f;">
+          <div style="font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:#5eead4;font-weight:800;">Operating System · Day 23 / 63 · Virtual Memory</div>
+          <h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">TLB, multi-level page table, page walk</h1>
+          <p style="margin:0;color:#b9d6eb;">한 줄 요약: <strong style="color:#f8fafc;">TLB는 page-table 번역 결과를 CPU 가까이에 캐시</strong>하고, miss가 나면 MMU가 계층형 table을 walk하며, mapping 변경 뒤에는 모든 관련 CPU의 stale translation을 무효화해야 정확성과 보안을 지킬 수 있다.</p>
+        </td></tr>
+        <tr><td style="padding:26px 28px 34px;">
+
+        <h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:14px;">
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;width:31%;">TLB</td><td style="border-bottom:1px solid #27435d;">Translation Lookaside Buffer. virtual page→physical frame 번역과 권한을 저장하는 CPU의 작고 빠른 cache다. data 자체를 저장하는 L1 data cache와 다르다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">TLB hit / miss</td><td style="border-bottom:1px solid #27435d;">현재 VPN의 유효한 translation이 TLB에 있으면 hit, 없으면 miss다. miss는 보통 hardware가 처리하며 그 자체가 page fault는 아니다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">TLB reach</td><td style="border-bottom:1px solid #27435d;">TLB가 동시에 덮을 수 있는 memory 범위의 근사치. 단순 모델은 entry 수×page size지만 page-size별 TLB, associativity와 workload 분포도 영향을 준다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">page walk</td><td style="border-bottom:1px solid #27435d;">page-table root에서 virtual address의 level별 index를 사용해 leaf PTE 또는 huge-page entry를 찾는 절차다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">page-walk cache</td><td style="border-bottom:1px solid #27435d;">upper-level paging-structure 정보를 CPU가 선택적으로 캐시하는 구조. 구현은 microarchitecture마다 다르며 software가 존재를 가정하면 안 된다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">multi-level page table</td><td style="border-bottom:1px solid #27435d;">주소를 여러 index로 나누어 PGD→P4D→PUD→PMD→PTE처럼 단계적으로 찾는 sparse tree다. 비어 있는 큰 주소 범위의 하위 table을 만들지 않아도 된다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">leaf entry</td><td style="border-bottom:1px solid #27435d;">최종 PFN·권한을 담아 translation을 끝내는 entry. 보통 PTE지만 huge page는 PMD/PUD에서 walk를 끝낼 수 있다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">associativity</td><td style="border-bottom:1px solid #27435d;">한 VPN이 들어갈 수 있는 cache slot 집합의 수. capacity가 남아도 같은 set에 몰리면 conflict miss가 생길 수 있다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">ASID / PCID</td><td style="border-bottom:1px solid #27435d;">translation을 address-space별 tag로 구분하는 식별자. x86의 PCID는 Process-Context Identifier이며 context switch 때 무조건 전체 TLB를 비우는 비용을 줄인다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">TLB invalidation</td><td style="border-bottom:1px solid #27435d;">page table을 바꾼 뒤 기존 cached translation을 더 쓰지 못하게 만드는 동작. page, range, address space, 전체 범위로 수행할 수 있다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">TLB shootdown</td><td style="border-bottom:1px solid #27435d;">같은 address space를 실행한 다른 CPU에도 invalidation을 요청하고 완료를 동기화하는 SMP 작업. 보통 IPI와 원격 CPU 응답이 관여한다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">IPI</td><td style="border-bottom:1px solid #27435d;">Inter-Processor Interrupt. 한 CPU가 다른 CPU에 즉시 처리할 일을 알리는 interrupt다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">huge page</td><td style="border-bottom:1px solid #27435d;">기본 page보다 큰 mapping. x86에서는 흔히 2MiB/1GiB이며 TLB reach와 page-table overhead를 개선하지만 memory waste·allocation·latency trade-off가 있다.</td></tr>
+          <tr><td style="color:#7dd3fc;font-weight:700;">nested paging</td><td>가상화에서 guest VA→guest PA와 guest PA→host PA의 두 translation을 조합하는 방식. TLB miss의 walk 비용이 확대될 수 있다.</td></tr>
+        </table>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 자주 쓰는 경로를 적어 둔 안내 데스크</h2>
+        <p style="margin:0 0 10px;">page table은 건물 전체의 공식 주소 장부이고 TLB는 CPU 코어 안내 데스크의 작은 메모장이다. 요청한 virtual page가 메모장에 있으면 바로 physical frame과 권한을 얻는다. 없으면 장부의 상위 분류부터 leaf까지 찾아가 translation을 메모장에 채운다.</p>
+        <ul style="margin:0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">hit:</strong> 번역은 빨라도 이어지는 data-cache miss나 DRAM access는 여전히 느릴 수 있다.</li>
+          <li><strong style="color:#f8fafc;">miss:</strong> 장부에 mapping이 있으면 walk 후 TLB fill로 끝나며 kernel에 진입하지 않을 수 있다.</li>
+          <li><strong style="color:#f8fafc;">fault:</strong> leaf가 absent이거나 권한이 맞지 않으면 CPU exception으로 kernel에 진입한다.</li>
+          <li><strong style="color:#f8fafc;">mapping change:</strong> 공식 장부만 고치고 메모장을 지우지 않으면 CPU가 옛 frame·옛 권한을 계속 사용할 수 있다.</li>
+        </ul>
+        <p style="margin:10px 0 0;color:#a8c7db;">핵심 구분: <strong style="color:#f8fafc;">TLB miss는 performance event</strong>, <strong style="color:#f8fafc;">page fault는 architectural exception</strong>이다. 둘은 원인·관찰 지표·처리 주체가 다르다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: load/store 한 번의 translation 흐름</h2>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:separate;border-spacing:6px;background:#0b1726;border:1px solid #27435d;border-radius:12px;padding:8px;text-align:center;font-size:12px;">
+          <tr>
+            <td style="padding:10px 5px;background:#12314a;border-radius:8px;color:#bae6fd;">CPU<br><small>load/store VA</small></td>
+            <td style="color:#5eead4;font-size:19px;">→</td>
+            <td style="padding:10px 5px;background:#12314a;border-radius:8px;color:#bae6fd;">L1 TLB<br><small>VPN+ASID tag</small></td>
+            <td style="color:#5eead4;font-size:19px;">→ hit →</td>
+            <td style="padding:10px 5px;background:#123d36;border-radius:8px;color:#a7f3d0;">PFN+permission<br><small>cache/memory access</small></td>
+          </tr>
+          <tr><td colspan="5" style="color:#5eead4;font-size:19px;">miss ↓</td></tr>
+          <tr>
+            <td style="padding:10px 5px;background:#16344c;border-radius:8px;color:#bae6fd;">root<br><small>x86 CR3</small></td>
+            <td style="color:#5eead4;font-size:19px;">→</td>
+            <td style="padding:10px 5px;background:#16344c;border-radius:8px;color:#bae6fd;">PGD/P4D/PUD<br><small>walk/cache</small></td>
+            <td style="color:#5eead4;font-size:19px;">→</td>
+            <td style="padding:10px 5px;background:#16344c;border-radius:8px;color:#bae6fd;">PMD/PTE<br><small>leaf?</small></td>
+          </tr>
+          <tr>
+            <td colspan="2" style="padding:10px;background:#123d36;border-radius:8px;color:#a7f3d0;">present+allowed: TLB fill → retry/complete</td>
+            <td style="color:#5eead4;font-size:18px;">│</td>
+            <td colspan="2" style="padding:10px;background:#4a2831;border-radius:8px;color:#fecdd3;">absent/denied: page-fault exception → kernel</td>
+          </tr>
+        </table>
+        <p style="margin:10px 0 0;font-size:14px;color:#a8c7db;">그림은 x86의 hardware-managed walk를 중심으로 단순화했다. 일부 architecture는 TLB miss를 software handler가 채우며, cache level·TLB 구조·replacement policy는 CPU별 구현 세부다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. 4KiB x86-64 주소 분해와 계층 구조</h2>
+        <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;">4-level, 4 KiB page의 전형적 48-bit VA
+
+63                 48 47       39 38       30 29       21 20       12 11        0
+┌────────────────────┬───────────┬───────────┬───────────┬───────────┬────────────┐
+│ canonical sign bits│ PGD index │ PUD index │ PMD index │ PTE index │ page offset│
+│                    │  9 bits   │  9 bits   │  9 bits   │  9 bits   │  12 bits   │
+└────────────────────┴─────┬─────┴─────┬─────┴─────┬─────┴─────┬─────┴────────────┘
+                           ↓           ↓           ↓           ↓
+CR3 → PGD page → PUD page → PMD page → PTE page → PFN + permission
+      512 entries  512 entries  512 entries  512 entries
+
+각 table page: 512 entries × 8 bytes = 4096 bytes
+각 9-bit index: 0..511 중 한 entry 선택
+4 KiB leaf coverage: 4 KiB
+PMD huge leaf coverage: 2 MiB
+PUD huge leaf coverage: 1 GiB
+
+5-level paging은 PGD와 PUD 사이에 P4D index를 하나 더 쓴다.
+Linux의 generic hierarchy는 PGD→P4D→PUD→PMD→PTE이며,
+hardware가 4-level이면 P4D가 folded되어 별도 memory access가 되지 않는다.</pre>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. CS·kernel·hardware deep dive</h2>
+        <h3 style="margin:16px 0 8px;color:#f8fafc;font-size:17px;">5.1 왜 flat page table이 아니라 radix tree인가</h3>
+        <p style="margin:0;">4KiB page로 48-bit VA를 flat mapping하면 2^36개의 leaf entry가 필요하다. entry가 8 bytes라면 process 하나에 512GiB다. 계층형 table은 사용하지 않는 상위 range를 absent entry 하나로 표현하고, 실제로 touch/mapping한 경로만 하위 table page를 만든다. 비용은 sparse address space에 비례하지만 mapping이 무작위로 넓게 흩어지면 page-table page가 늘어난다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.2 TLB는 content cache가 아니라 translation cache다</h3>
+        <p style="margin:0;">TLB entry는 대략 VPN, PFN, page size, access permission, global/address-space tag를 가진다. hit 뒤에도 physical address로 L1/L2/LLC/data memory hierarchy를 접근해야 한다. 따라서 “TLB hit=load가 L1 latency”도 아니고 “cache miss=TLB miss”도 아니다. instruction fetch에는 iTLB, load/store에는 dTLB가 관여할 수 있고 더 큰 shared TLB가 뒤에 있을 수 있다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.3 page walk는 dependent memory chain이다</h3>
+        <p style="margin:0;">다음-level table의 physical address는 현재 entry를 읽어야 알 수 있어 walk access는 의존적이다. 냉각된 4-level walk를 단순히 “DRAM 4번”이라 부르기도 하지만 실제 latency는 paging-structure cache, 일반 data cache, memory-level parallelism, speculative walk에 크게 좌우된다. Intel은 paging-structure cache의 존재·부재를 software가 가정하지 말라고 명시한다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.4 TLB reach와 locality가 miss rate를 결정한다</h3>
+        <p style="margin:0;">64-entry TLB와 4KiB page의 단순 reach는 256KiB, 같은 entry 수에서 2MiB page면 128MiB다. 그러나 capacity만 보면 안 된다. reuse distance가 capacity보다 크거나 특정 set에 VPN이 몰리면 eviction이 발생한다. sequential scan, pointer chasing, random sparse access는 같은 byte 수라도 miss pattern이 다르다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.5 huge page는 walk를 일찍 끝내고 reach를 늘린다</h3>
+        <p style="margin:0;">x86의 2MiB mapping은 PMD leaf에서, 1GiB mapping은 PUD leaf에서 translation을 끝낼 수 있다. leaf 수와 page-table memory, TLB pressure가 줄어드는 대신 contiguous physical memory 확보, compaction latency, 내부 단편화, COW split, NUMA placement가 문제가 될 수 있다. “큰 page가 항상 빠르다”가 아니라 workload의 working set과 allocation lifecycle로 검증해야 한다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.6 PCID/ASID는 context switch의 collateral damage를 줄인다</h3>
+        <p style="margin:0;">address-space tag가 없으면 page-table root 교체 시 다른 process의 translation과 혼동하지 않도록 넓은 flush가 필요하다. PCID가 있으면 TLB entry를 context별로 구분해 재사용할 수 있다. 하지만 mapping이 unmap되거나 권한이 낮아지면 해당 PCID의 stale entry는 여전히 정확히 invalidate해야 한다. tag는 coherency를 자동 해결하는 마법이 아니다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.7 PTE update와 TLB invalidation은 하나의 correctness protocol이다</h3>
+        <p style="margin:0;">kernel이 <code style="color:#fde68a;">munmap</code>이나 <code style="color:#fde68a;">mprotect</code>로 PTE를 바꿨는데 TLB에 old PFN/writable permission이 남으면 use-after-unmap, 잘못된 frame access, protection bypass가 가능하다. Linux는 page-table 변경 뒤 <code style="color:#fde68a;">flush_tlb_page/range/mm/all</code> 계열을 통해 변경이 CPU에 보이도록 architecture contract를 제공한다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.8 shootdown은 shared-memory scale의 숨은 tax다</h3>
+        <p style="margin:0;">같은 <code style="color:#fde68a;">mm_struct</code>를 실행한 여러 CPU에 translation이 캐시될 수 있다. initiating CPU는 관련 CPU에 IPI를 보내고 local invalidation을 수행하게 하며 안전한 재사용 전에 완료를 기다릴 수 있다. CPU 수, target mask, 변경 빈도, IPI 지연이 tail latency를 만든다. Linux는 해당 mm을 실행한 적 없는 CPU를 target에서 제외하는 등의 최적화를 한다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.9 precise invalidation과 full flush는 trade-off다</h3>
+        <p style="margin:0;">x86 Linux는 작은 range를 page별 <code style="color:#fde68a;">invlpg</code>로 지우거나 TLB 전체를 flush할 수 있다. page별 invalidation은 instruction 수·IPI work가 늘고, full flush는 관계없는 hot translation까지 버려 refill miss를 만든다. 최적 threshold는 TLB 크기, range, current contents, microarchitecture와 workload에 따라 달라진다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.10 nested paging은 miss penalty를 곱셈적으로 키울 수 있다</h3>
+        <p style="margin:0;">VM에서는 guest page table로 GVA→GPA를 찾고 EPT/NPT 같은 second-stage table로 GPA→HPA를 찾는다. 각 guest table page 자체의 GPA도 host physical로 번역해야 하므로 naive walk는 많은 의존 access를 만든다. hardware의 combined TLB와 walk cache가 이를 완화하지만, VM에서 TLB miss·huge page·vCPU migration을 함께 보는 이유다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. 상태 전이: stale translation이 사라질 때까지</h2>
+        <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;">CPU0 TLB: VPN 0x42 → PFN 0x10, writable
+CPU3 TLB: VPN 0x42 → PFN 0x10, writable
+                         │
+                         │ CPU1: unmap / permission revoke
+                         ▼
+[VALID_OLD] → PTE UPDATE → [INVALIDATION_PENDING]
+                              │
+                              ├─ target CPU mask 계산
+                              ├─ local invalidate
+                              ├─ remote CPUs에 shootdown IPI
+                              └─ completion/ack 대기
+                                         │
+                                         ▼
+                                  [NO_STALE_ENTRY]
+                                         │
+                         old frame reuse / access deny가 안전
+
+금지되는 순서:
+PTE만 변경 → old frame을 다른 용도로 즉시 재사용 → remote CPU가 stale TLB로 write
+
+필수 불변식:
+"이전 translation을 가진 어떤 CPU도 old mapping을 사용할 수 없음"이
+증명된 뒤에만 old frame과 권한 상태를 안전하게 재사용한다.</pre>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. 실무 best practice</h2>
+        <ul style="margin:0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">measure first:</strong> latency 회귀를 TLB 탓으로 단정하지 말고 cycles, instructions, cache misses, page faults, working set, CPU migration과 함께 비교한다.</li>
+          <li><strong style="color:#f8fafc;">rate로 비교:</strong> raw miss count보다 miss/access, walk duration, runtime 대비 비율과 p95/p99를 같은 workload·CPU affinity에서 본다.</li>
+          <li><strong style="color:#f8fafc;">mapping churn 줄이기:</strong> hot path의 반복 <code style="color:#fde68a;">mmap/munmap/mprotect</code>를 피하고 lifetime이 맞으면 batch·pool·arena를 검토한다.</li>
+          <li><strong style="color:#f8fafc;">huge page는 실험:</strong> baseline과 메모리 낭비, allocation/compaction latency, NUMA locality, COW·split 비용을 함께 기록하고 rollback을 준비한다.</li>
+          <li><strong style="color:#f8fafc;">thread fan-out 인식:</strong> 하나의 mm을 많은 CPU에서 동시에 실행할수록 shootdown target과 tail risk가 커질 수 있다.</li>
+          <li><strong style="color:#f8fafc;">CPU pinning은 통제 변수:</strong> benchmark 재현에는 쓰되 production에서 무분별한 pinning으로 load balance·NUMA 문제를 만들지 않는다.</li>
+          <li><strong style="color:#f8fafc;">architecture 기록:</strong> CPU model, kernel, page size, THP/HugeTLB mode, VM/host 여부, perf event 이름을 결과와 함께 보존한다.</li>
+          <li><strong style="color:#f8fafc;">permission revoke는 correctness:</strong> kernel/driver 코드는 page-table update, ordering, invalidation API 계약을 임의로 생략하지 않는다.</li>
+        </ul>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. error handling과 관찰 runbook</h2>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:13px;">
+          <tr style="background:#15314a;color:#bae6fd;"><td>증상</td><td>가능한 원인</td><td>안전한 처리</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>perf: permission denied</code></td><td style="border-top:1px solid #27435d;"><code>perf_event_paranoid</code>, CAP_PERFMON 정책</td><td style="border-top:1px solid #27435d;">값과 조직 정책을 기록한다. 학습 때문에 보안 설정을 임의로 낮추지 않는다.</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>event not supported</code></td><td style="border-top:1px solid #27435d;">CPU/PMU마다 event 이름·지원 범위 다름</td><td style="border-top:1px solid #27435d;"><code>perf list</code>로 현재 host의 dTLB/iTLB event를 확인하고 portable software event와 분리한다.</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">count가 <code>&lt;not counted&gt;</code></td><td style="border-top:1px solid #27435d;">PMU slot 부족, multiplexing, process가 너무 짧음</td><td style="border-top:1px solid #27435d;">event 수를 줄이고 실행 시간을 늘리며 time-enabled/time-running 비율을 확인한다.</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">TLB miss 증가, latency 동일</td><td style="border-top:1px solid #27435d;">walk가 cache에 hit하거나 bottleneck이 다른 곳</td><td style="border-top:1px solid #27435d;">walk-cycle event, IPC, cache/memory, wall time을 함께 보고 성능 영향이 없으면 과잉 최적화하지 않는다.</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">page fault 증가를 TLB miss로 해석</td><td style="border-top:1px solid #27435d;">서로 다른 event 혼동</td><td style="border-top:1px solid #27435d;"><code>minor/major-faults</code>와 dTLB/iTLB miss를 별도 시계열로 수집한다.</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">huge page 적용 후 RSS 급증</td><td style="border-top:1px solid #27435d;">내부 단편화·touch 범위 확대</td><td style="border-top:1px solid #27435d;">mapping별 page size/RSS를 확인하고 제한 rollout 뒤 rollback한다.</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">mprotect/munmap p99 spike</td><td style="border-top:1px solid #27435d;">shootdown IPI와 remote CPU 응답 지연</td><td style="border-top:1px solid #27435d;">mapping-change rate, CPU fan-out, scheduler/IRQ 증거를 수집하고 batch/lifetime 재설계를 검토한다.</td></tr>
+        </table>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. 놓치기 쉬운 함정</h2>
+        <ul style="margin:0;padding-left:22px;">
+          <li><strong style="color:#fecaca;">TLB miss=page fault:</strong> valid PTE를 hardware walk로 찾으면 kernel exception 없이 끝난다.</li>
+          <li><strong style="color:#fecaca;">4-level miss=DRAM 네 번:</strong> page-walk cache와 일반 cache hit 때문에 고정 비용이 아니다.</li>
+          <li><strong style="color:#fecaca;">모든 64-bit VA bit 사용:</strong> paging mode와 canonical-address 규칙이 usable width를 정한다.</li>
+          <li><strong style="color:#fecaca;">Linux 5-level=hardware 항상 5회:</strong> 사용하지 않는 level은 folded될 수 있고 huge leaf는 일찍 끝난다.</li>
+          <li><strong style="color:#fecaca;">PCID가 flush 제거:</strong> context-switch flush를 줄일 뿐 mapping 변경의 invalidation 요구는 남는다.</li>
+          <li><strong style="color:#fecaca;">huge page는 무조건 승리:</strong> memory waste, compaction, NUMA, COW split과 page-size별 TLB 구조를 봐야 한다.</li>
+          <li><strong style="color:#fecaca;">perf event는 portable:</strong> 이름·의미·정확도·지원 여부가 CPU model에 종속될 수 있다.</li>
+          <li><strong style="color:#fecaca;">full flush가 항상 나쁨:</strong> 큰 range에서는 page별 invalidation보다 전체 flush가 싸고 정확할 수 있다.</li>
+        </ul>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 30분 실습: TLB reach와 stale translation simulator</h2>
+        <p style="margin:0 0 10px;">hardware counter 권한이나 CPU 종류에 의존하지 않는 Python 3 표준 라이브러리 실습이다. 같은 256개 access를 TLB capacity와 page size만 바꿔 비교하고, PTE 변경 뒤 invalidation을 누락하면 old PFN이 남는 failure를 재현한다.</p>
+        <pre style="margin:0;white-space:pre;overflow-x:auto;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;">python3 - &lt;&lt;'PY'
+from collections import OrderedDict
+
+def simulate(name, page_size, capacity, repeats=4, base_pages=64):
+    # 4KiB 간격의 64개 주소를 4회 순회한다.
+    addresses = [i * 4096 for _ in range(repeats) for i in range(base_pages)]
+    tlb = OrderedDict()
+    hits = misses = walks = 0
+    for va in addresses:
+        vpn = va // page_size
+        if vpn in tlb:
+            hits += 1
+            tlb.move_to_end(vpn)
+        else:
+            misses += 1
+            walks += 1
+            tlb[vpn] = vpn  # identity mapping인 단순 page table
+            if len(tlb) &gt; capacity:
+                tlb.popitem(last=False)  # LRU 한 개 제거
+    print(f"{name} hits={hits} misses={misses} walks={walks}")
+
+simulate("small_tlb_4k", 4096, 8)
+simulate("large_tlb_4k", 4096, 128)
+simulate("huge_page_2m", 2 * 1024 * 1024, 8)
+
+# PTE를 바꿨지만 TLB를 invalidate하지 않은 버그를 모형화한다.
+page_table = {3: 10}
+tlb = {}
+def translate(vpn):
+    if vpn not in tlb:
+        tlb[vpn] = page_table[vpn]
+    return tlb[vpn]
+
+assert translate(3) == 10       # old mapping을 TLB에 채움
+page_table[3] = 99              # kernel이 PTE만 변경했다고 가정
+stale = translate(3)            # flush가 없으므로 old PFN 10
+del tlb[3]                      # local invalidate 모형
+fresh = translate(3)            # 새 PTE에서 PFN 99를 refill
+print(f"stale_without_flush={stale} fresh_after_flush={fresh}")
+
+assert (stale, fresh) == (10, 99)
+PY</pre>
+        <p style="margin:10px 0 4px;"><strong style="color:#f8fafc;">기대 출력</strong></p>
+        <pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:12px;color:#bfdbfe;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">small_tlb_4k hits=0 misses=256 walks=256
+large_tlb_4k hits=192 misses=64 walks=64
+huge_page_2m hits=255 misses=1 walks=1
+stale_without_flush=10 fresh_after_flush=99</pre>
+        <ol style="margin:12px 0 0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">0~10분:</strong> 8-entry TLB에서 reuse distance 64가 capacity를 넘어 매 scan마다 eviction되는 과정을 손으로 설명한다.</li>
+          <li><strong style="color:#f8fafc;">10~20분:</strong> capacity 128은 compulsory miss 64개 뒤 hit가 되고, 2MiB page는 모든 주소를 VPN 하나로 묶는 이유를 계산한다.</li>
+          <li><strong style="color:#f8fafc;">20~30분:</strong> stale PFN 10이 실제 kernel에서 왜 data corruption/security bug가 되는지, remote CPU shootdown까지 포함한 고치는 순서를 적는다.</li>
+        </ol>
+        <p style="margin:10px 0 0;padding:10px 12px;background:#13283a;border-left:4px solid #5eead4;color:#c8e5f3;font-size:14px;"><strong>모델 한계:</strong> 이 simulator는 fully-associative LRU, 단일 TLB, zero walk-cache cost를 가정한다. 실제 CPU의 set associativity, multi-level/page-size별 TLB, speculative walk, PCID와 cache latency를 측정한 결과처럼 해석하면 안 된다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. Linux 선택 실습: PMU가 허용될 때만 관찰</h2>
+        <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;"># read-only preflight: 설정을 바꾸지 않는다.
+uname -a
+getconf PAGESIZE
+cat /proc/sys/kernel/perf_event_paranoid
+perf list | sed -n '/[dDiI][tT][lL][bB]/p' | head -40
+
+# 지원되는 host에서만: -d -d는 dTLB/iTLB 상세 event를 포함할 수 있다.
+perf stat -d -d -- python3 - &lt;&lt;'PY'
+x = bytearray(128 * 1024 * 1024)
+for repeat in range(8):
+    for i in range(0, len(x), 4096):
+        x[i] ^= 1
+print(sum(x))
+PY</pre>
+        <p style="margin:10px 0 0;">permission error나 unsupported event가 나오면 실패 사실과 CPU/kernel을 기록하고 simulator로 돌아간다. root 권한 획득이나 <code style="color:#fde68a;">perf_event_paranoid</code> 하향은 이 실습의 요구사항이 아니다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 실패 시나리오: permission hot path가 p99를 무너뜨림</h2>
+        <p style="margin:0 0 8px;">JIT/runtime이 작은 code range를 요청마다 RW→RX로 바꿨다. 기능은 맞았지만 동일 address space의 worker가 96개 CPU에 퍼져 있었고, 잦은 <code style="color:#fde68a;">mprotect</code>가 range invalidation과 shootdown IPI를 만들었다. 평균 CPU 사용률은 낮은데 p99만 튀었고 PMU의 TLB refill보다 IPI 대기와 mapping churn이 핵심이었다.</p>
+        <p style="margin:0;"><strong style="color:#f8fafc;">진단:</strong> permission-change rate, call stack, worker CPU fan-out, irq/scheduler trace, p99를 같은 timeline에 맞춘다. <strong style="color:#f8fafc;">개선:</strong> W^X는 유지하면서 compile batch, code-cache lifecycle, worker topology를 재설계하고 작은 canary에서 검증한다. <strong style="color:#f8fafc;">금지:</strong> 성능 때문에 RWX를 상시 허용하거나 flush를 생략하지 않는다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 대기업 면접 질문 3개</h2>
+        <ol style="margin:0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">“TLB miss와 page fault의 차이는 무엇인가요?”</strong><br>답변 포인트: TLB miss는 cached translation 부재이며 hardware page walk로 valid PTE를 찾으면 kernel에 진입하지 않는다. page fault는 translation/permission으로 access를 완료하지 못해 발생하는 architectural exception이다. minor/major fault와 TLB PMU event도 분리한다.</li>
+          <li style="margin-top:10px;"><strong style="color:#f8fafc;">“4-level page table은 왜 필요하고, miss 때 memory access는 정확히 네 번인가요?”</strong><br>답변 포인트: sparse VA의 table memory를 줄이는 radix hierarchy다. 4KiB x86-64는 9+9+9+9+12 bit로 나눈다. cold 모델은 여러 dependent access지만 page-walk cache/data cache/huge leaf 때문에 실제 비용은 고정 네 번의 DRAM access가 아니다.</li>
+          <li style="margin-top:10px;"><strong style="color:#f8fafc;">“PTE를 바꾼 뒤 왜 TLB shootdown이 필요한가요?”</strong><br>답변 포인트: 다른 CPU에 old PFN·permission이 남을 수 있어 unmap·revoke의 correctness와 security가 깨진다. PTE update 후 관련 CPU의 entry를 invalidate하고 완료를 보장한 뒤 frame을 재사용한다. range와 full flush의 precision/collateral-damage trade-off도 설명한다.</li>
+        </ol>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 퀴즈·누적 리뷰</h2>
+        <ol style="margin:0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">4KiB page에서 offset은 몇 bit인가?</strong> 12 bit. page size가 2^12이기 때문이다.</li>
+          <li><strong style="color:#f8fafc;">TLB hit인데 load가 느릴 수 있는가?</strong> 그렇다. translation 이후 data cache miss, DRAM, dependency 등이 남는다.</li>
+          <li><strong style="color:#f8fafc;">Linux generic P4D가 있으면 모든 CPU가 5-level walk를 하는가?</strong> 아니다. architecture가 쓰지 않으면 folded된다.</li>
+          <li><strong style="color:#f8fafc;">huge page의 장점 두 개와 위험 두 개는?</strong> TLB reach 증가·table overhead 감소, 내부 단편화·allocation/compaction/NUMA/COW 비용 중 두 개.</li>
+          <li><strong style="color:#f8fafc;">Day 22 연결:</strong> VMA가 존재하고 PTE도 present인데 TLB에는 entry가 없으면? hardware walk로 PTE를 찾아 fill할 수 있으며 page fault일 필요가 없다.</li>
+          <li><strong style="color:#f8fafc;">Week 3 연결:</strong> PTE update와 shootdown completion 사이에는 어떤 사고가 필요한가? 다른 CPU와의 ordering·visibility·lifetime 불변식이며 stale reader가 사라지기 전 frame 재사용을 금지해야 한다.</li>
+        </ol>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">15. 다음 날 연결</h2>
+        <p style="margin:0;">Day 24는 <strong style="color:#f8fafc;">demand paging, page fault, copy-on-write</strong>다. 오늘의 마지막 분기인 “PTE absent/permission fault”에서 kernel이 VMA를 확인하고 page를 할당·load하거나 COW로 복사한 뒤 instruction을 재시작하는 경로를 파고든다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">16. 공식·1차 출처</h2>
+        <ul style="margin:0;padding-left:22px;word-break:break-word;">
+          <li><a href="https://docs.kernel.org/mm/page_tables.html" style="color:#7dd3fc;">Linux Kernel — Page Tables</a>: five-level generic hierarchy, folding, MMU/TLB/page-walk cache, huge-page leaf.</li>
+          <li><a href="https://docs.kernel.org/next/core-api/cachetlb.html" style="color:#7dd3fc;">Linux Kernel — Cache and TLB Flushing Under Linux</a>: <code>flush_tlb_*</code> semantics와 SMP 확장.</li>
+          <li><a href="https://kernel.org/doc/html/next/arch/x86/tlb.html" style="color:#7dd3fc;">Linux Kernel x86 — The TLB</a>: single-page invalidation과 full-flush trade-off.</li>
+          <li><a href="https://docs.kernel.org/arch/x86/x86_64/5level-paging.html" style="color:#7dd3fc;">Linux Kernel x86 — 5-level paging</a>: 4/5-level compatibility와 P4D folding.</li>
+          <li><a href="https://docs.kernel.org/admin-guide/mm/hugetlbpage.html" style="color:#7dd3fc;">Linux Kernel — HugeTLB Pages</a>: architecture별 huge-page support와 TLB 목적.</li>
+          <li><a href="https://docs.kernel.org/admin-guide/perf-security.html" style="color:#7dd3fc;">Linux Kernel — Perf events and tool security</a>: <code>perf_event_paranoid</code>, capability와 resource controls.</li>
+          <li><a href="https://man7.org/linux/man-pages/man1/perf-stat.1.html" style="color:#7dd3fc;">Linux perf-stat(1)</a>: 상세 dTLB/iTLB event 관찰 옵션.</li>
+          <li><a href="https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html" style="color:#7dd3fc;">Intel 64 and IA-32 SDM, Vol. 3</a>: paging, TLB, paging-structure cache, PCID와 invalidation의 architecture contract.</li>
+        </ul>
+
+        <p style="margin:28px 0 0;padding-top:18px;border-top:1px solid #27435d;color:#8fb3c9;font-size:13px;">Day 23 완료 기준: hit/miss/fault를 구분하고, 4KiB VA index를 설명하며, stale TLB가 왜 shootdown protocol을 요구하는지 correctness·performance 양쪽에서 말할 수 있다.</p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>

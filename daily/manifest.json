@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-08-24T09:17:28+09:00",
+  "updatedAt": "2026-08-25T09:00:42+09:00",
   "lessons": [
     {
       "day": 1,
@@ -203,6 +203,15 @@
       "path": "day-22.html",
       "kind": "lesson",
       "publishedAt": "2026-08-24T09:17:28+09:00"
+    },
+    {
+      "day": 23,
+      "week": 4,
+      "title": "TLB, multi-level page table, page walk",
+      "summary": "TLB hit/miss와 계층형 page walk를 분리하고, TLB reach·huge page·PCID·shootdown의 성능과 stale translation correctness를 simulator와 운영 runbook으로 연결합니다.",
+      "path": "day-23.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-25T09:00:42+09:00"
     }
   ]
 }
