@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operating System 심화 커리큘럼 Day 24 - demand paging, page fault, copy-on-write</title>
+</head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.72;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#07111f;">
+    <tr><td align="center" style="padding:24px 12px;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:680px;background:#0f1d2e;border:1px solid #23415d;border-radius:18px;overflow:hidden;">
+        <tr><td style="padding:30px 28px 22px;background:#102a43;border-bottom:1px solid #28506f;">
+          <div style="font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:#5eead4;font-weight:800;">Operating System · Day 24 / 63 · Virtual Memory</div>
+          <h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">demand paging, page fault, copy-on-write</h1>
+          <p style="margin:0;color:#b9d6eb;">한 줄 요약: <strong style="color:#f8fafc;">page fault는 CPU가 현재 translation으로 access를 끝내지 못해 kernel에 도움을 요청하는 exception</strong>이며, kernel은 VMA 계약에 따라 page를 준비·복사·load하고 PTE를 갱신해 instruction을 재시작하거나 SIGSEGV·SIGBUS·OOM으로 실패시킨다.</p>
+        </td></tr>
+        <tr><td style="padding:26px 28px 34px;">
+
+        <h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:14px;">
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;width:31%;">demand paging</td><td style="border-bottom:1px solid #27435d;">virtual range를 만들 때 모든 physical page를 준비하지 않고 실제 access가 생긴 page만 필요 시 준비하는 방식이다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">page fault</td><td style="border-bottom:1px solid #27435d;">MMU가 translation 또는 permission 문제로 memory access를 완료하지 못해 CPU가 kernel fault handler로 제어를 넘기는 synchronous exception이다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">exception / signal</td><td style="border-bottom:1px solid #27435d;">exception은 CPU가 현재 instruction 때문에 만드는 kernel 진입 사건이고, signal은 kernel이 process에 전달하는 비동기적 interface다. 복구 불가 fault가 SIGSEGV/SIGBUS로 변환될 수 있다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">minor fault</td><td style="border-bottom:1px solid #27435d;">I/O 없이 처리된 page fault. anonymous zero-fill, page-cache hit, COW copy처럼 kernel work와 memory copy가 있어도 minor일 수 있다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">major fault</td><td style="border-bottom:1px solid #27435d;">처리에 storage I/O가 필요했던 page fault. process가 잠들고 storage·queue latency를 기다릴 수 있다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">first touch</td><td style="border-bottom:1px solid #27435d;">예약된 virtual page를 처음 읽거나 쓰는 access. page allocation, zeroing, NUMA placement, fault 처리 비용이 이 시점에 나타날 수 있다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">zero page / zero-fill</td><td style="border-bottom:1px solid #27435d;">새 anonymous memory가 0으로 보이도록 하는 구현. read는 공유 read-only zero page로, write는 새로 0-cleared page를 할당하는 방식이 가능하다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">copy-on-write (COW)</td><td style="border-bottom:1px solid #27435d;">처음에는 physical page를 공유하고 write가 발생할 때 writer용 private copy를 만드는 지연 복사 기법이다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">write-protect fault</td><td style="border-bottom:1px solid #27435d;">write가 허용된 VMA라도 COW를 위해 PTE를 read-only로 둔 경우 발생하는 permission fault. kernel이 정상적으로 복구할 수 있다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">page cache</td><td style="border-bottom:1px solid #27435d;">file 내용을 memory page/folio로 캐시하는 kernel 계층. file-backed fault가 cache hit면 I/O 없는 minor fault가 될 수 있다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">VMA</td><td style="border-bottom:1px solid #27435d;">Virtual Memory Area. address range의 backing, private/shared, read/write/execute 정책을 나타내는 kernel metadata다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">PTE</td><td style="border-bottom:1px solid #27435d;">Page Table Entry. 현재 page의 PFN, present, writable 등 hardware translation 상태를 담는다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">overcommit</td><td style="border-bottom:1px solid #27435d;">virtual memory 요청 시점에 모든 future physical/swap backing을 즉시 보장하지 않는 정책. <code>mmap</code>/<code>malloc</code> 성공과 future touch 성공을 분리한다.</td></tr>
+          <tr><td style="color:#7dd3fc;font-weight:700;">OOM</td><td>Out Of Memory. reclaim 등으로 allocation을 만족시키지 못해 kernel 또는 memory cgroup이 victim을 종료하거나 allocation을 실패시키는 상태다.</td></tr>
+        </table>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 좌석 예약과 실제 입장</h2>
+        <p style="margin:0 0 10px;"><code style="color:#fde68a;">mmap</code>은 공연장의 좌석 구역(VMA)을 예약하는 일에 가깝다. 모든 좌석에 관객과 물품(physical page)을 미리 배치하는 것은 아니다. 첫 access가 입장 요청이고 page fault는 안내 직원(kernel)을 부르는 벨이다.</p>
+        <ul style="margin:0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">anonymous first write:</strong> 빈 좌석에 0으로 초기화된 새 page를 배치한다.</li>
+          <li><strong style="color:#f8fafc;">file mapping:</strong> page cache에서 찾고 없으면 file에서 읽어 온다.</li>
+          <li><strong style="color:#f8fafc;">COW:</strong> parent와 child가 같은 책을 보다가 누군가 메모하려는 순간 그 사람에게만 복사본을 준다.</li>
+          <li><strong style="color:#f8fafc;">invalid access:</strong> 예약 범위가 없거나 계약된 권한이 없으면 kernel이 page를 만들지 않고 signal을 보낸다.</li>
+        </ul>
+        <p style="margin:10px 0 0;color:#a8c7db;">따라서 page fault 수가 0이어야 좋은 system이 아니다. <strong style="color:#f8fafc;">fault 종류, 처리 latency, fault rate, SLO와 memory headroom</strong>을 함께 본다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: faulting instruction이 다시 실행되기까지</h2>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:separate;border-spacing:6px;background:#0b1726;border:1px solid #27435d;border-radius:12px;padding:8px;text-align:center;font-size:12px;">
+          <tr>
+            <td style="padding:10px 5px;background:#12314a;border-radius:8px;color:#bae6fd;">CPU access<br><small>read/write VA</small></td>
+            <td style="color:#5eead4;font-size:18px;">→</td>
+            <td style="padding:10px 5px;background:#12314a;border-radius:8px;color:#bae6fd;">MMU/PTE<br><small>absent or denied</small></td>
+            <td style="color:#5eead4;font-size:18px;">→</td>
+            <td style="padding:10px 5px;background:#4a2831;border-radius:8px;color:#fecdd3;">page-fault exception<br><small>VA+access type+PC</small></td>
+          </tr>
+          <tr><td colspan="5" style="color:#5eead4;font-size:18px;">↓ kernel architecture handler → find VMA → permission check</td></tr>
+          <tr>
+            <td style="padding:10px 5px;background:#16344c;border-radius:8px;color:#bae6fd;">anonymous<br><small>zero/allocate</small></td>
+            <td style="padding:10px 5px;background:#16344c;border-radius:8px;color:#bae6fd;">file/swap<br><small>cache or I/O</small></td>
+            <td style="padding:10px 5px;background:#16344c;border-radius:8px;color:#bae6fd;">COW write<br><small>reuse or copy</small></td>
+            <td style="padding:10px 5px;background:#16344c;border-radius:8px;color:#bae6fd;">invalid<br><small>MAPERR/ACCERR</small></td>
+            <td style="padding:10px 5px;background:#16344c;border-radius:8px;color:#bae6fd;">resource fail<br><small>OOM/SIGBUS</small></td>
+          </tr>
+          <tr>
+            <td colspan="3" style="padding:10px;background:#123d36;border-radius:8px;color:#a7f3d0;">PTE install/update → TLB sync → return → same instruction retry</td>
+            <td colspan="2" style="padding:10px;background:#4a2831;border-radius:8px;color:#fecdd3;">signal / OOM handling / process termination</td>
+          </tr>
+        </table>
+        <p style="margin:10px 0 0;font-size:14px;color:#a8c7db;">Linux의 architecture handler는 fault address와 read/write/execute 성격을 만들고 VMA를 찾은 뒤 공통 <code style="color:#fde68a;">handle_mm_fault()</code> 경로로 이어진다. lock 경쟁·I/O·signal 때문에 handler가 retry할 수 있으므로 한 줄짜리 “page를 넣는다”보다 복잡하다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. COW 상태 전이 그림</h2>
+        <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;">fork 전
+Parent VA A ── writable PTE ──→ PFN 0x10 [data="hello"]
+
+fork 직후: data page는 복사하지 않고 page table/VMA context는 분리
+Parent VA A ── read-only COW PTE ─┐
+                                  ├──→ PFN 0x10 [refcount/shared]
+Child  VA A ── read-only COW PTE ─┘
+
+Child가 A에 write
+WRITE ─→ permission fault ─→ VMA는 WRITE 허용? ─no→ SIGSEGV
+                                  │yes
+                                  ▼
+                         COW handler가 page 상태 재검사
+                          ├─ exclusive면 copy 없이 writable 복구 가능
+                          └─ shared면 새 page allocate+copy
+                                         │
+                                         ▼
+Parent VA A ── read-only/writable policy ─→ PFN 0x10 ["hello"]
+Child  VA A ── writable PTE ─────────────→ PFN 0x99 ["Hello"]
+                                         │
+                         old TLB entry invalidate → instruction retry
+
+핵심: "child가 항상 복사"가 아니라 write를 일으킨 쪽이 private copy를 얻으며,
+경쟁 중 refcount/mapcount가 바뀔 수 있어 kernel은 lock 아래 상태를 다시 확인한다.</pre>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. CS·kernel·hardware deep dive</h2>
+        <h3 style="margin:16px 0 8px;color:#f8fafc;font-size:17px;">5.1 VMA permission과 PTE permission은 같은 층이 아니다</h3>
+        <p style="margin:0;">VMA는 application 계약상 writable일 수 있지만 COW를 구현하려고 현재 PTE의 writable bit를 끌 수 있다. write-protect fault가 오면 kernel은 “VMA도 write 금지”인지 “VMA는 write 허용이고 PTE만 COW용 read-only”인지 구분한다. 전자는 <code style="color:#fde68a;">SEGV_ACCERR</code>, 후자는 정상 복구 경로다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.2 anonymous read와 write의 비용이 다를 수 있다</h3>
+        <p style="margin:0;">새 private anonymous range는 0으로 보여야 한다. read fault는 shared read-only zero page를 매핑해 private frame allocation을 미룰 수 있고, write fault는 process가 변경할 수 있는 zeroed page를 할당·charge한다. 구현과 huge-page 정책에 따라 세부는 달라지지만 “VA 예약=즉시 RSS 증가”가 아닌 이유다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.3 minor는 cheap의 동의어가 아니다</h3>
+        <p style="margin:0;">minor fault는 storage I/O가 없다는 뜻이다. 큰 page zeroing, COW copy, page-table allocation, memcg charge, NUMA allocation, lock contention과 TLB invalidation은 여전히 CPU time과 tail latency를 만든다. 수백만 minor fault/s가 startup이나 request hot path에 몰리면 실제 장애가 된다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.4 major는 file read 한 번과 1:1이 아니다</h3>
+        <p style="margin:0;">file-backed page가 page cache에 없으면 fault path가 I/O를 시작하고 task가 기다릴 수 있다. readahead가 주변 page도 가져오므로 다음 access는 minor가 될 수 있고, 여러 task가 같은 page를 기다리면 한 I/O에 합쳐질 수 있다. raw major count만으로 bytes나 storage operation 수를 계산하면 안 된다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.5 fork는 data page보다 metadata를 먼저 복사한다</h3>
+        <p style="margin:0;">Linux <code style="color:#fde68a;">fork()</code>는 child의 task/mm context와 page tables를 만들고 writable private mapping을 COW 공유 상태로 바꾼다. data page 전체 복사를 피하지만 page-table 복사, rmap/refcount, write-protection과 TLB work는 즉시 발생한다. 매우 큰 address space에서는 “아직 write 안 했으니 fork는 공짜”가 아니다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.6 COW의 copy는 최적화될 수 있다</h3>
+        <p style="margin:0;">fault 시점에 old page를 실제로 공유하는 mapping이 더는 없다면 kernel이 새 page 복사 없이 old page를 writable로 돌릴 수 있다. 반대로 shared라면 새 page/folio를 allocate하고 content를 copy한 뒤 writer PTE만 바꾼다. 그래서 “COW fault=항상 memcpy 한 page”도 정확한 설명은 아니다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.7 MAP_PRIVATE와 MAP_SHARED의 write 의미가 다르다</h3>
+        <p style="margin:0;"><code style="color:#fde68a;">MAP_PRIVATE</code> file mapping은 write가 process-private COW page를 만들며 변경이 underlying file에 기록되지 않는다. <code style="color:#fde68a;">MAP_SHARED</code> write는 다른 mapper와 file에 보이는 shared state를 바꾸며 page cache·dirty/writeback 경로로 연결된다. “mmap은 전부 COW”가 아니다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.8 mmap 성공은 future touch의 물리 자원 보장이 아니다</h3>
+        <p style="margin:0;">Linux overcommit mode 0/1에서는 큰 writable anonymous mapping이 성공해도 나중 first-write에서 memory가 부족할 수 있다. mode 2는 commit limit을 엄격히 검사하지만 stack growth 등 corner case가 남는다. 운영에서는 <code style="color:#fde68a;">CommitLimit</code>, <code style="color:#fde68a;">Committed_AS</code>, cgroup limit, swap, reclaim을 함께 본다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.9 page fault 중 allocation도 실패할 수 있다</h3>
+        <p style="margin:0;">anonymous/COW fault가 새 page를 요구할 때 kernel은 memory cgroup charge, reclaim, compaction을 시도할 수 있다. 만족하지 못하면 fault 결과가 OOM 경로로 이어져 current task 또는 다른 victim이 종료될 수 있다. application 관점에서 “malloc은 성공했는데 write하다 죽음”이 가능한 이유다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.10 THP는 fault와 COW의 granularity를 바꾼다</h3>
+        <p style="margin:0;">Transparent Huge Page는 fault 횟수와 TLB pressure를 줄일 수 있지만 한 번의 allocation·zero·copy가 커지고 작은 write에도 split/copy 판단이 필요할 수 있다. 일부 workload는 first-touch 또는 fork-after-large-heap p99가 나빠진다. page size별 latency와 RSS를 실제 workload로 비교해야 한다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.11 faulting instruction은 완료된 것이 아니다</h3>
+        <p style="margin:0;">recoverable fault에서 kernel이 PTE와 TLB 상태를 고친 뒤 user mode로 돌아오면 CPU는 같은 instruction을 다시 실행한다. 그래서 instruction은 application 관점에서 한 번의 load/store처럼 보인다. handler는 side effect가 중복되지 않도록 architecture가 정한 precise exception semantics에 의존한다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. fault 분류표: 원인·I/O·결과</h2>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:13px;">
+          <tr style="background:#15314a;color:#bae6fd;"><td>상황</td><td>보통 분류</td><td>kernel 결과</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">anonymous first write</td><td style="border-top:1px solid #27435d;">minor</td><td style="border-top:1px solid #27435d;">zeroed page allocate·PTE install</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">file mapping, page-cache hit</td><td style="border-top:1px solid #27435d;">minor</td><td style="border-top:1px solid #27435d;">cached folio를 PTE에 연결</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">file/swap data가 storage에만 있음</td><td style="border-top:1px solid #27435d;">major</td><td style="border-top:1px solid #27435d;">I/O 시작·sleep·retry</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">private COW page write</td><td style="border-top:1px solid #27435d;">minor인 경우가 일반적</td><td style="border-top:1px solid #27435d;">exclusive reuse 또는 allocate+copy</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">VMA 밖 주소</td><td style="border-top:1px solid #27435d;">invalid</td><td style="border-top:1px solid #27435d;"><code>SIGSEGV/SEGV_MAPERR</code></td></tr>
+          <tr><td style="border-top:1px solid #27435d;">VMA permission 위반</td><td style="border-top:1px solid #27435d;">invalid</td><td style="border-top:1px solid #27435d;"><code>SIGSEGV/SEGV_ACCERR</code></td></tr>
+          <tr><td style="border-top:1px solid #27435d;">truncate된 file mapping 접근</td><td style="border-top:1px solid #27435d;">backing error</td><td style="border-top:1px solid #27435d;">일반적으로 <code>SIGBUS/BUS_ADRERR</code></td></tr>
+          <tr><td style="border-top:1px solid #27435d;">anonymous/COW allocation 불가</td><td style="border-top:1px solid #27435d;">resource failure</td><td style="border-top:1px solid #27435d;">reclaim/OOM, victim termination 가능</td></tr>
+        </table>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. 실무 best practice</h2>
+        <ul style="margin:0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">SLO-sensitive first touch를 분리:</strong> startup warm-up이나 controlled pre-touch를 검토하되 peak RSS와 startup time을 함께 budget한다.</li>
+          <li><strong style="color:#f8fafc;">fault rate와 latency 동시 관찰:</strong> process minflt/majflt, wall latency, CPU, storage I/O, PSI, reclaim과 cgroup <code style="color:#fde68a;">memory.events</code>를 같은 timeline에 둔다.</li>
+          <li><strong style="color:#f8fafc;">fork 전 heap 크기와 write rate 확인:</strong> snapshot/checkpoint worker가 큰 writable heap을 공유한 채 오래 살면 COW RSS와 p99가 폭증할 수 있다.</li>
+          <li><strong style="color:#f8fafc;">headroom 계산:</strong> steady RSS뿐 아니라 COW burst, allocator metadata, page tables, page cache와 kernel memory까지 memory limit 안에 포함한다.</li>
+          <li><strong style="color:#f8fafc;">file mapping lifetime 계약:</strong> mapper가 살아 있는 동안 backing file을 truncate/replace하는 주체와 protocol을 명확히 한다. atomic rename은 열린 old inode를 자동 truncate하지 않는다.</li>
+          <li><strong style="color:#f8fafc;">madvise는 semantic review 후:</strong> <code style="color:#fde68a;">MADV_DONTFORK</code>는 child가 해당 range를 정말 사용하지 않을 때만, <code style="color:#fde68a;">MADV_WIPEONFORK</code>는 secret/lifecycle 요구와 함께 쓴다.</li>
+          <li><strong style="color:#f8fafc;">THP는 canary:</strong> fault latency, COW, RSS, compaction, NUMA를 baseline과 비교하고 명확한 rollback을 둔다.</li>
+          <li><strong style="color:#f8fafc;">overcommit 설정을 app이 바꾸지 않기:</strong> host policy는 fleet 전체에 영향이 있으므로 관찰하고 deployment memory contract로 흡수한다.</li>
+        </ul>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. error handling runbook</h2>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:13px;">
+          <tr style="background:#15314a;color:#bae6fd;"><td>증상/API</td><td>확인할 것</td><td>처리</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>mmap == MAP_FAILED</code></td><td style="border-top:1px solid #27435d;"><code>errno</code>: ENOMEM/EACCES/EINVAL/EMFILE 등</td><td style="border-top:1px solid #27435d;">errno를 즉시 보존하고 length·flags·limit·backing 권한을 기록한다.</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>fork == -1</code></td><td style="border-top:1px solid #27435d;">EAGAIN/ENOMEM, PID/cgroup/thread limit, commit</td><td style="border-top:1px solid #27435d;">무한 retry하지 말고 backoff·load shedding·상위 작업 실패로 전파한다.</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>SIGSEGV MAPERR</code></td><td style="border-top:1px solid #27435d;">fault VA, PC, maps, lifetime</td><td style="border-top:1px solid #27435d;">UAF/bad pointer 가능성. crash artifact를 보존하고 임의 복구를 피한다.</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>SIGSEGV ACCERR</code></td><td style="border-top:1px solid #27435d;">read/write/execute와 VMA permission</td><td style="border-top:1px solid #27435d;">W^X·guard page·race를 확인한다. permission을 넓혀 증상을 숨기지 않는다.</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>SIGBUS</code> on mmap</td><td style="border-top:1px solid #27435d;">file size, offset, concurrent truncate</td><td style="border-top:1px solid #27435d;">mapping 소유 protocol을 고치고 immutable/versioned file 또는 handoff를 쓴다.</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">OOM kill</td><td style="border-top:1px solid #27435d;">kernel/cgroup log, <code>memory.events</code>, PSI, RSS breakdown</td><td style="border-top:1px solid #27435d;">재시작만 반복하지 말고 limit/headroom·COW burst·reclaim 원인을 수정한다.</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">major fault p99</td><td style="border-top:1px solid #27435d;">page-cache coldness, storage queue, readahead</td><td style="border-top:1px solid #27435d;">warmup·working-set 축소·I/O path 개선을 canary로 검증한다.</td></tr>
+        </table>
+        <p style="margin:10px 0 0;padding:10px 12px;background:#3c2230;border-left:4px solid #fb7185;color:#fecdd3;font-size:14px;"><strong>signal handler 주의:</strong> arbitrary SIGSEGV 뒤 process state가 일관적이라고 가정하지 않는다. handler에서는 async-signal-safe 함수만 고려하고, 일반 application은 진단 정보 보존 후 종료하는 편이 안전하다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. 놓치기 쉬운 함정</h2>
+        <ul style="margin:0;padding-left:22px;">
+          <li><strong style="color:#fecaca;">page fault=bug:</strong> demand paging과 COW의 정상 제어 경로일 수 있다.</li>
+          <li><strong style="color:#fecaca;">minor=무료:</strong> zero/copy/allocation/lock/TLB 비용이 있어 hot path를 망칠 수 있다.</li>
+          <li><strong style="color:#fecaca;">major=page가 RAM에 없음:</strong> 정의의 핵심은 처리에 I/O가 필요했는지이며 cache/readahead 상태가 관여한다.</li>
+          <li><strong style="color:#fecaca;">fork가 process memory를 즉시 전부 복사:</strong> data page는 COW지만 page tables와 process metadata 비용은 즉시 든다.</li>
+          <li><strong style="color:#fecaca;">COW는 child만 부담:</strong> parent든 child든 먼저 write한 mapping이 fault를 일으킨다.</li>
+          <li><strong style="color:#fecaca;">COW fault는 항상 memcpy:</strong> page가 exclusive면 writable 복구만 할 수 있다.</li>
+          <li><strong style="color:#fecaca;">mmap 성공=memory guarantee:</strong> overcommit과 cgroup limit 때문에 future first touch에서 OOM이 날 수 있다.</li>
+          <li><strong style="color:#fecaca;">file mapping은 file size 변화에 안전:</strong> mapping 뒤 truncate된 범위를 access하면 SIGBUS가 날 수 있다.</li>
+          <li><strong style="color:#fecaca;">MAP_SHARED도 private COW:</strong> shared write는 공유 page/cache와 file visibility 계약을 가진다.</li>
+        </ul>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 30분 실습: first-touch와 fork COW를 계수로 확인</h2>
+        <p style="margin:0 0 10px;">Linux/macOS의 C11 환경에서 anonymous 32MiB를 예약하고 page마다 첫 write를 수행한 뒤, <code style="color:#fde68a;">fork</code> child가 모든 page를 다시 write하며 발생한 minor fault를 측정한다. exact count는 kernel·THP·page size에 따라 달라지므로 양수와 memory isolation이라는 불변식만 검증한다.</p>
+        <pre style="margin:0;white-space:pre;overflow-x:auto;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;">set -eu
+lab_dir="$(mktemp -d)"
+trap 'rm -rf "$lab_dir"' EXIT
+
+cat &gt; "$lab_dir/fault_lab.c" &lt;&lt;'C'
+#define _GNU_SOURCE
+#include &lt;sys/mman.h&gt;
+#include &lt;sys/resource.h&gt;
+#include &lt;sys/types.h&gt;
+#include &lt;sys/wait.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+
+typedef struct {
+  long cow_minflt;
+  unsigned char child_value;
+} report_t;
+
+static long minflt(void) {
+  struct rusage r;
+  if (getrusage(RUSAGE_SELF, &amp;r) != 0) { perror("getrusage"); exit(2); }
+  return r.ru_minflt;
+}
+
+static void full_write(int fd, const void *buf, size_t n) {
+  const unsigned char *p = buf;
+  while (n) {
+    ssize_t k = write(fd, p, n);
+    if (k &lt; 0) { perror("write"); _Exit(3); }
+    p += (size_t)k; n -= (size_t)k;
+  }
+}
+
+int main(void) {
+  long ps = sysconf(_SC_PAGESIZE);
+  if (ps &lt;= 0) return 4;
+  size_t bytes = 32u * 1024u * 1024u;
+  size_t pages = bytes / (size_t)ps;
+  unsigned char *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p == MAP_FAILED) { perror("mmap"); return 5; }
+
+  long before = minflt();
+  for (size_t i = 0; i &lt; pages; i++) p[i * (size_t)ps] = 1;
+  long first_touch = minflt() - before;
+  if (first_touch &lt;= 0) return 6;
+
+  int fd[2];
+  if (pipe(fd) != 0) { perror("pipe"); return 7; }
+  pid_t child = fork();
+  if (child &lt; 0) { perror("fork"); return 8; }
+  if (child == 0) {
+    close(fd[0]);
+    long c0 = minflt();
+    for (size_t i = 0; i &lt; pages; i++) p[i * (size_t)ps] = 2;
+    report_t report = { minflt() - c0, p[0] };
+    full_write(fd[1], &amp;report, sizeof(report));
+    _Exit(report.cow_minflt &gt; 0 &amp;&amp; report.child_value == 2 ? 0 : 9);
+  }
+
+  close(fd[1]);
+  report_t report;
+  ssize_t got = read(fd[0], &amp;report, sizeof(report));
+  int status = 0;
+  if (waitpid(child, &amp;status, 0) != child) return 10;
+  int child_ok = got == (ssize_t)sizeof(report) &amp;&amp;
+                 WIFEXITED(status) &amp;&amp; WEXITSTATUS(status) == 0;
+  int parent_isolated = p[0] == 1;
+
+  printf("page_size=%ld pages=%zu\n", ps, pages);
+  printf("first_touch_minflt_delta=%ld positive=%d\n",
+         first_touch, first_touch &gt; 0);
+  printf("child_cow_minflt_delta=%ld positive=%d\n",
+         report.cow_minflt, report.cow_minflt &gt; 0);
+  printf("child_value=%u parent_value=%u isolated=%d child_ok=%d\n",
+         report.child_value, p[0], parent_isolated, child_ok);
+
+  if (munmap(p, bytes) != 0) { perror("munmap"); return 11; }
+  return child_ok &amp;&amp; parent_isolated &amp;&amp; first_touch &gt; 0 ? 0 : 12;
+}
+C
+
+cc -std=c11 -O2 -Wall -Wextra -Werror "$lab_dir/fault_lab.c" -o "$lab_dir/fault_lab"
+"$lab_dir/fault_lab"</pre>
+        <p style="margin:10px 0 4px;"><strong style="color:#f8fafc;">기대 형태</strong></p>
+        <pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:12px;color:#bfdbfe;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">page_size=4096 pages=8192
+first_touch_minflt_delta=&lt;환경별 양수&gt; positive=1
+child_cow_minflt_delta=&lt;환경별 양수&gt; positive=1
+child_value=2 parent_value=1 isolated=1 child_ok=1</pre>
+        <ol style="margin:12px 0 0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">0~10분:</strong> <code style="color:#fde68a;">mmap</code> 직후가 아니라 page별 first write에서 minor fault가 늘어나는 이유를 VMA/PTE/frame으로 설명한다.</li>
+          <li><strong style="color:#f8fafc;">10~20분:</strong> fork 직후 shared page와 read-only COW PTE를 그리고 child write가 page마다 private copy를 만드는 경로를 표시한다.</li>
+          <li><strong style="color:#f8fafc;">20~30분:</strong> 32MiB를 256MiB로 바꿀 때 latency·temporary RSS·fault 수가 어떻게 변할지 예측한 뒤 memory limit 안에서만 실행한다.</li>
+        </ol>
+        <p style="margin:10px 0 0;padding:10px 12px;background:#13283a;border-left:4px solid #5eead4;color:#c8e5f3;font-size:14px;"><strong>안전 장치:</strong> 32MiB만 사용하고 child를 반드시 wait하며 임시 directory만 정리한다. 정확한 fault 수를 assertion하지 않아 THP·prefault·kernel 차이를 허용한다. production host에서 cold-cache를 만들려고 system cache를 drop하지 않는다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. Linux 관찰 명령: 설정을 바꾸지 않는 증거 수집</h2>
+        <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;"># system policy와 pressure
+cat /proc/sys/vm/overcommit_memory
+awk '/CommitLimit|Committed_AS|MemAvailable|SwapFree/ {print}' /proc/meminfo
+cat /proc/pressure/memory
+
+# process별 누적 minor/major fault: /proc/PID/stat의 field 10, 12
+ps -o pid,min_flt,maj_flt,rss,vsz,comm -p "$PID"
+awk '/Rss|Pss|Private|Shared|AnonHugePages/ {print}' /proc/"$PID"/smaps_rollup
+
+# cgroup v2 안에서 실행 중이라면
+cat /sys/fs/cgroup/memory.current 2&gt;/dev/null || true
+cat /sys/fs/cgroup/memory.events 2&gt;/dev/null || true</pre>
+        <p style="margin:10px 0 0;">counter는 누적값이므로 interval delta/rate로 비교한다. <code style="color:#fde68a;">min_flt</code>와 <code style="color:#fde68a;">maj_flt</code>가 증가한 code path를 알기 위해 workload phase, latency trace, file I/O를 함께 기록한다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 실패 시나리오: fork checkpoint가 memory limit을 터뜨림</h2>
+        <p style="margin:0 0 8px;">8GiB writable heap을 가진 service가 checkpoint를 위해 child를 fork했다. “COW라 추가 memory는 거의 없다”고 예상했지만 child가 snapshot을 쓰는 동안 parent의 request thread가 heap을 빠르게 갱신했다. 수많은 COW fault가 private page를 만들고 THP split/copy와 memory charge가 겹쳐 cgroup <code style="color:#fde68a;">memory.max</code>에 도달했다. major fault는 적었지만 minor fault, RSS, memory PSI, p99가 급증한 뒤 OOM kill이 발생했다.</p>
+        <p style="margin:0;"><strong style="color:#f8fafc;">진단:</strong> fork 시점, child lifetime, parent write rate, minflt delta, private dirty/RSS, <code style="color:#fde68a;">memory.events</code>의 oom/oom_kill을 맞춘다. <strong style="color:#f8fafc;">대응:</strong> checkpoint concurrency를 제한하고 headroom을 확보하며 child lifetime을 줄인다. <strong style="color:#f8fafc;">재설계:</strong> incremental snapshot, application-level immutable data, 별도 process architecture를 검토한다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 대기업 면접 질문 3개</h2>
+        <ol style="margin:0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">“page fault는 항상 disk I/O나 오류를 의미하나요?”</strong><br>답변 포인트: 아니다. present/permission으로 access를 완료하지 못한 CPU exception이다. anonymous demand-zero, page-cache hit, COW는 I/O 없는 minor fault로 정상 복구된다. I/O가 필요하면 major, VMA 없음/권한 위반은 SIGSEGV, backing 오류는 SIGBUS가 될 수 있다.</li>
+          <li style="margin-top:10px;"><strong style="color:#f8fafc;">“fork의 COW가 실제로 어떻게 동작하나요?”</strong><br>답변 포인트: child page tables/metadata는 만들되 private writable data page를 공유하고 양쪽 PTE를 write-protect한다. writer의 permission fault에서 VMA write 계약을 확인해 exclusive page는 재사용하거나 shared page는 allocate+copy하고 PTE/TLB를 갱신해 instruction을 retry한다.</li>
+          <li style="margin-top:10px;"><strong style="color:#f8fafc;">“mmap/malloc이 성공했는데 나중에 OOM으로 죽을 수 있나요?”</strong><br>답변 포인트: overcommit에서는 reservation과 physical commit이 분리된다. first write/COW fault에서 allocation·memcg charge·reclaim이 실패하면 OOM 경로가 가능하다. CommitLimit/Committed_AS, cgroup limit, swap, COW burst와 SLO headroom으로 운영 계약을 잡는다.</li>
+        </ol>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 퀴즈·누적 리뷰</h2>
+        <ol style="margin:0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">VMA는 writable인데 PTE는 read-only일 수 있는가?</strong> 가능하다. COW를 위한 write protection이며 write fault에서 kernel이 복구한다.</li>
+          <li><strong style="color:#f8fafc;">COW fault는 minor인가?</strong> 보통 I/O 없이 처리되므로 minor지만 allocation/copy 비용은 작지 않을 수 있다.</li>
+          <li><strong style="color:#f8fafc;">MAP_PRIVATE file write가 file을 바꾸는가?</strong> 아니다. writer의 private COW page를 만든다.</li>
+          <li><strong style="color:#f8fafc;">major fault 수로 storage read 횟수를 알 수 있는가?</strong> 1:1로 알 수 없다. readahead, shared wait, page cache가 관여한다.</li>
+          <li><strong style="color:#f8fafc;">Day 23 연결:</strong> recoverable fault 뒤 무엇이 필요한가? PTE를 설치/갱신하고 stale TLB를 처리한 뒤 faulting instruction을 retry한다.</li>
+          <li><strong style="color:#f8fafc;">Day 22 연결:</strong> mmap 성공 직후 VMA·PTE·frame 중 확실히 생긴 것은? VMA 계약이며 leaf PTE/private frame은 first touch까지 지연될 수 있다.</li>
+        </ol>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">15. 다음 날 연결</h2>
+        <p style="margin:0;">Day 25는 <strong style="color:#f8fafc;">stack, heap, mmap, shared memory</strong>다. 오늘 배운 fault 경로가 각 virtual region의 growth, allocator, file/anonymous backing, process 간 sharing에서 어떤 의미를 갖는지 address-space map 전체로 확장한다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">16. 공식·1차 출처</h2>
+        <ul style="margin:0;padding-left:22px;word-break:break-word;">
+          <li><a href="https://docs.kernel.org/mm/page_tables.html" style="color:#7dd3fc;">Linux Kernel — Page Tables</a>: MMU fault에서 <code>handle_mm_fault</code>, anonymous/file/COW 경로까지의 개요.</li>
+          <li><a href="https://docs.kernel.org/admin-guide/mm/concepts.html" style="color:#7dd3fc;">Linux Kernel — Memory Management Concepts</a>: demand paging, anonymous memory, page cache, reclaim와 OOM.</li>
+          <li><a href="https://github.com/torvalds/linux/blob/master/mm/memory.c" style="color:#7dd3fc;">Linux source — mm/memory.c</a>: <code>do_anonymous_page</code>, write-protect/COW와 fault 처리 구현.</li>
+          <li><a href="https://man7.org/linux/man-pages/man2/fork.2.html" style="color:#7dd3fc;">Linux man-pages — fork(2)</a>: Linux COW 구현과 page-table/task 구조 비용.</li>
+          <li><a href="https://man7.org/linux/man-pages/man2/mmap.2.html" style="color:#7dd3fc;">Linux man-pages — mmap(2)</a>: MAP_PRIVATE COW, MAP_SHARED, fork inheritance와 file-tail 규칙.</li>
+          <li><a href="https://man7.org/linux/man-pages/man2/getrusage.2.html" style="color:#7dd3fc;">Linux man-pages — getrusage(2)</a>: <code>ru_minflt</code>와 <code>ru_majflt</code> 정의.</li>
+          <li><a href="https://docs.kernel.org/mm/overcommit-accounting.html" style="color:#7dd3fc;">Linux Kernel — Overcommit Accounting</a>: mode 0/1/2, commit cost와 <code>CommitLimit/Committed_AS</code>.</li>
+          <li><a href="https://docs.kernel.org/admin-guide/mm/transhuge.html" style="color:#7dd3fc;">Linux Kernel — Transparent Hugepage Support</a>: fault frequency, larger clear/copy와 memory trade-off.</li>
+          <li><a href="https://docs.kernel.org/admin-guide/cgroup-v2.html" style="color:#7dd3fc;">Linux Kernel — cgroup v2 memory controller</a>: <code>memory.high</code>, <code>memory.max</code>, reclaim과 cgroup OOM.</li>
+        </ul>
+
+        <p style="margin:28px 0 0;padding-top:18px;border-top:1px solid #27435d;color:#8fb3c9;font-size:13px;">Day 24 완료 기준: minor/major/invalid fault를 구분하고, fork COW 상태 전이를 설명하며, overcommit과 COW burst가 OOM·p99로 이어지는 runbook을 제시할 수 있다.</p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>

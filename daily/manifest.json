@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-08-25T09:00:42+09:00",
+  "updatedAt": "2026-08-26T09:19:51+09:00",
   "lessons": [
     {
       "day": 1,
@@ -212,6 +212,15 @@
       "path": "day-23.html",
       "kind": "lesson",
       "publishedAt": "2026-08-25T09:00:42+09:00"
+    },
+    {
+      "day": 24,
+      "week": 4,
+      "title": "demand paging, page fault, copy-on-write",
+      "summary": "정상 minor fault와 major I/O·invalid access를 분리하고 demand-zero, file-backed fault, fork COW, overcommit·OOM을 상태 전이와 first-touch/COW 실습으로 연결합니다.",
+      "path": "day-24.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-26T09:19:51+09:00"
     }
   ]
 }
