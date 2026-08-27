@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operating System 심화 커리큘럼 Day 25 - stack, heap, mmap, shared memory</title>
+</head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.72;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#07111f;">
+    <tr><td align="center" style="padding:24px 12px;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:680px;background:#0f1d2e;border:1px solid #23415d;border-radius:18px;overflow:hidden;">
+        <tr><td style="padding:30px 28px 22px;background:#102a43;border-bottom:1px solid #28506f;">
+          <div style="font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:#5eead4;font-weight:800;">Operating System · Day 25 / 63 · Virtual Memory</div>
+          <h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">stack, heap, mmap, shared memory</h1>
+          <p style="margin:0;color:#b9d6eb;">한 줄 요약: <strong style="color:#f8fafc;">stack과 heap은 program/runtime의 사용 모델이고 mmap/VMA는 kernel의 mapping 모델</strong>이며, shared memory는 여러 address space의 서로 다른 VA를 같은 backing pages에 연결하되 synchronization·schema·lifetime은 application이 책임진다.</p>
+        </td></tr>
+        <tr><td style="padding:26px 28px 34px;">
+
+        <h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:14px;">
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;width:31%;">stack</td><td style="border-bottom:1px solid #27435d;">function call frame, local variable, return state 등을 두는 thread별 memory region. 흔히 아래 방향으로 자라지만 방향·배치는 ABI와 architecture에 종속된다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">stack frame</td><td style="border-bottom:1px solid #27435d;">함수 한 번의 호출에 필요한 local state 묶음. compiler 최적화로 register에만 있거나 생략·재배치될 수 있다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">guard page</td><td style="border-bottom:1px solid #27435d;">접근 불가로 둔 page. stack boundary를 넘어선 access를 fault로 잡아 조용한 memory corruption을 줄인다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">heap</td><td style="border-bottom:1px solid #27435d;">dynamic allocation을 위해 runtime allocator가 관리하는 memory의 논리적 영역. 단일 연속 VMA라고 가정하면 안 된다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">allocator / arena</td><td style="border-bottom:1px solid #27435d;">malloc 요청을 free list·size class 등으로 재사용하는 runtime 계층과 그 관리 단위. kernel page allocator와 다르다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">program break</td><td style="border-bottom:1px solid #27435d;">traditional process data/heap 끝 주소. <code>brk/sbrk</code>로 조정하지만 application이 malloc과 섞어 직접 쓰는 것은 위험하다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">mmap</td><td style="border-bottom:1px solid #27435d;">file 또는 anonymous backing을 process VA range에 mapping하는 API. 성공값은 실제 주소이고 실패값은 <code>MAP_FAILED</code>다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">anonymous mapping</td><td style="border-bottom:1px solid #27435d;">일반 file content 없이 0으로 시작하는 memory mapping. allocator, thread stack, private buffer 등에 쓰인다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">MAP_PRIVATE</td><td style="border-bottom:1px solid #27435d;">write가 private COW page에 반영되는 mapping. 변경은 다른 process나 underlying file에 공유되지 않는다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">MAP_SHARED</td><td style="border-bottom:1px solid #27435d;">여러 mapping이 같은 backing page의 변경을 관찰하는 mapping. visibility만 제공하며 ordering/atomicity protocol은 별도다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">POSIX shared memory</td><td style="border-bottom:1px solid #27435d;"><code>shm_open</code>으로 이름 있는 object를 얻고 <code>ftruncate</code>로 크기를 정한 뒤 <code>MAP_SHARED</code>로 mapping하는 IPC mechanism이다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">process-shared mutex</td><td style="border-bottom:1px solid #27435d;">shared region 안에 두고 <code>PTHREAD_PROCESS_SHARED</code>로 초기화해 process 간 동기화에 쓰는 mutex. 구현이 지원하지 않으면 ENOTSUP다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">offset pointer</td><td style="border-bottom:1px solid #27435d;">shared object 시작부터의 byte offset. 각 process의 mapping VA가 달라도 같은 object 위치를 표현한다.</td></tr>
+          <tr><td style="color:#7dd3fc;font-weight:700;">ASLR</td><td>Address Space Layout Randomization. code/stack/heap/mapping 위치를 예측하기 어렵게 바꾸는 보안 기법으로 raw pointer IPC가 깨지는 이유 중 하나다.</td></tr>
+        </table>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 주소 공간은 용도별 방이 있는 건물</h2>
+        <p style="margin:0 0 10px;">process address space를 하나의 건물로 보자. stack·heap은 방의 <em>사용 목적</em>이고, VMA는 관리사무소(kernel)가 기록한 “어느 주소 범위가 어떤 backing과 permission을 갖는가”라는 등기다.</p>
+        <ul style="margin:0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">stack:</strong> thread마다 별도 작업대가 있지만 같은 process의 thread라면 pointer를 통해 서로 접근할 수도 있다.</li>
+          <li><strong style="color:#f8fafc;">heap:</strong> allocator가 작은 칸으로 나눠 빌려 주며, 실제 건물 증축은 brk나 mmap을 통해 kernel에 요청할 수 있다.</li>
+          <li><strong style="color:#f8fafc;">mmap:</strong> 새 방을 주소 공간에 직접 등기한다. file, anonymous, shared-object 등 backing이 다를 수 있다.</li>
+          <li><strong style="color:#f8fafc;">shared memory:</strong> 두 건물의 서로 다른 방 번호가 같은 창고 물품을 보도록 연결한다. 방 번호(raw pointer)는 공유할 수 없다.</li>
+        </ul>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: process address space와 backing</h2>
+        <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">높은 VA       ┌────────────────────────────────────┐
+              │ main/thread stacks + guard pages  │  thread별 VMA, demand paging
+              ├────────────────────────────────────┤
+              │ mmap area                          │
+              │  shared libraries / file maps      │──→ page cache / file
+              │  anonymous allocator arenas        │──→ anonymous pages / swap
+              │  POSIX shared memory MAP_SHARED    │──→ shmem/tmpfs object
+              ├────────────────────────────────────┤
+              │ heap / program-break area          │──→ allocator chunks
+              ├────────────────────────────────────┤
+              │ .bss / .data / read-only / text    │──→ executable file / zero pages
+낮은 VA       └────────────────────────────────────┘
+
+주의: 실제 순서·주소·growth direction은 ABI, ASLR, loader, architecture에 따라 다르다.
+      "stack은 항상 최고 주소, heap은 항상 하나"를 program contract로 쓰지 않는다.
+
+Process A: VA 0x7000 ─┐
+                      ├──→ shared object page PFN 0x42
+Process B: VA 0xA000 ─┘
+
+같은 PFN을 볼 수 있지만 VA 숫자는 다르다 → shared structure에는 raw pointer 대신 offset.</pre>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. shared-memory lifecycle 상태 전이</h2>
+        <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">[ABSENT]
+   │ shm_open(name, O_CREAT|O_EXCL|O_RDWR, 0600)
+   ▼
+[NAMED OBJECT, size=0] ── ftruncate(size) ─→ [SIZED OBJECT]
+   │                                           │
+   │ Process A/B: mmap(..., MAP_SHARED, fd, 0) │
+   ▼                                           ▼
+[MAPPINGS EXIST] ── close(fd) ─→ mappings remain valid
+   │
+   ├─ synchronized access: mutex/semaphore/atomic protocol + version/schema
+   │
+   ├─ shm_unlink(name) ─→ name removed, existing mappings/object refs remain
+   │
+   └─ every process munmap + last ref gone ─→ [OBJECT DESTROYED]
+
+실패 전이:
+size=0에서 access / concurrent truncate ─→ SIGBUS 가능
+creator crash before ready flag ─→ partial initialization
+mutex owner crash ─→ stalled forever 또는 robust mutex EOWNERDEAD recovery
+shm_unlink 누락 ─→ /dev/shm object leak (Linux implementation)</pre>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. CS·kernel·hardware deep dive</h2>
+        <h3 style="margin:16px 0 8px;color:#f8fafc;font-size:17px;">5.1 stack은 thread별이지만 memory protection domain은 process다</h3>
+        <p style="margin:0;">각 thread는 보통 자신의 stack VMA와 guard를 갖지만 모든 thread가 같은 page table/mm을 공유한다. 다른 thread의 stack pointer를 알고 lifetime이 유효하면 hardware가 자동 차단하지 않는다. 따라서 local variable 주소를 worker에 넘긴 뒤 caller가 return하는 것은 stack-use-after-return이다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.2 stack growth는 무제한이 아니다</h3>
+        <p style="margin:0;">Linux는 인접 stack VMA를 fault 시 확장할 수 있지만 resource limit, guard, address collision과 available memory가 경계다. 큰 local array·깊은 recursion은 stack overflow를 만든다. overflow 시 기존 stack이 망가져 normal signal handler조차 실행 공간이 없을 수 있어 diagnostic handler에는 <code style="color:#fde68a;">sigaltstack</code>이 필요하다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.3 compiler가 source의 모든 local을 stack에 두지는 않는다</h3>
+        <p style="margin:0;">register allocation, inlining, escape analysis와 optimization으로 local variable은 register에만 있거나 frame에서 사라질 수 있다. “stack variable=memory access”는 source-level mental model이지 generated machine code의 보장이 아니다. debug build와 optimized build의 stack trace/layout이 다른 이유다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.4 malloc은 syscall이 아니다</h3>
+        <p style="margin:0;"><code style="color:#fde68a;">malloc/free</code>는 process 내부 allocator API다. free list/size class/arena에서 즉시 처리되면 kernel 진입이 없다. allocator가 더 큰 backing을 원할 때 brk 또는 anonymous mmap을 쓸 수 있다. glibc는 큰 allocation과 추가 arena에 mmap을 쓰지만 threshold는 동적·구현별이므로 hard-code하지 않는다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.5 free와 RSS 감소는 다른 사건이다</h3>
+        <p style="margin:0;"><code style="color:#fde68a;">free</code>는 block을 allocator에 반환한다. 주변 block 상태, arena policy, fragmentation과 cache 때문에 page를 즉시 <code style="color:#fde68a;">munmap</code>하거나 kernel에 돌려주지 않을 수 있다. application이 재사용 가능한 heap과 OS가 reclaim 가능한 memory를 구분해 RSS·PSS·allocator metric을 본다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.6 mmap은 VMA만 만들고 physical page는 지연될 수 있다</h3>
+        <p style="margin:0;">mapping 성공은 address range와 policy를 만든다. anonymous first touch, file page-cache miss, COW는 Day 24의 fault path에서 PTE/frame을 준비한다. mapping address는 hint일 뿐이고 <code style="color:#fde68a;">NULL</code>로 kernel에 선택을 맡기는 것이 기본이다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.7 MAP_FIXED는 기존 mapping을 파괴할 수 있다</h3>
+        <p style="margin:0;">일반 <code style="color:#fde68a;">MAP_FIXED</code>는 지정 range와 겹치는 기존 mapping을 교체할 수 있어 multithreaded process에서 다른 thread의 mapping을 손상시킬 수 있다. Linux에서 range 예약을 증명하며 충돌을 실패로 받고 싶다면 지원 여부를 확인한 뒤 <code style="color:#fde68a;">MAP_FIXED_NOREPLACE</code>를 검토한다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.8 shared mapping은 cache coherence만으로 충분하지 않다</h3>
+        <p style="margin:0;">CPU cache coherence는 같은 physical cache line의 값을 eventually 일관되게 유지하지만 compound invariant, publication ordering, crash recovery를 정의하지 않는다. process-shared mutex/semaphore 또는 명시적 inter-process atomic protocol이 필요하며 memory layout의 version·size·endianness·alignment도 계약이다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.9 raw pointer는 address-space local capability다</h3>
+        <p style="margin:0;">Process A의 <code style="color:#fde68a;">base+128</code> VA를 B에 저장해도 B의 mapping base가 다르면 엉뚱한 주소다. shared structure에는 offset, index, object ID를 저장하고 각 process가 자신의 base에 더한다. 또한 integer overflow와 object bounds를 검증해야 한다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.10 name, descriptor, mapping은 lifetime이 분리된다</h3>
+        <p style="margin:0;"><code style="color:#fde68a;">shm_open</code> name은 discovery, fd는 open reference, mapping은 VA reference다. mmap 뒤 fd를 close해도 mapping은 유효하고, <code style="color:#fde68a;">shm_unlink</code> 뒤 새 open은 실패하지만 기존 mapping은 마지막 reference까지 유지된다. file의 pathname/inode/open-file-description과 유사한 lifetime 분리다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.11 shared memory는 durability가 아니다</h3>
+        <p style="margin:0;">POSIX shm은 IPC이며 reboot/crash 뒤 persistence가 portable하게 보장되지 않는다. Linux는 보통 tmpfs <code style="color:#fde68a;">/dev/shm</code>에 구현한다. durable state가 필요하면 file format, write ordering, fsync/rename 같은 Day 39의 crash-consistency protocol이 필요하다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. 영역 비교: ownership과 failure mode</h2>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:13px;">
+          <tr style="background:#15314a;color:#bae6fd;"><td>영역</td><td>lifetime/owner</td><td>대표 실패</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">stack</td><td style="border-top:1px solid #27435d;">thread·function scope</td><td style="border-top:1px solid #27435d;">overflow, use-after-return, escaped pointer</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">heap allocation</td><td style="border-top:1px solid #27435d;">allocator + explicit free/GC</td><td style="border-top:1px solid #27435d;">leak, UAF, double free, fragmentation, NULL</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">private mmap</td><td style="border-top:1px solid #27435d;">process mapping + munmap</td><td style="border-top:1px solid #27435d;">MAP_FAILED, stale pointer after munmap, COW burst</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">shared mmap</td><td style="border-top:1px solid #27435d;">multi-process protocol</td><td style="border-top:1px solid #27435d;">data race, partial init, owner crash, SIGBUS</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">shm name/object</td><td style="border-top:1px solid #27435d;">creator/cleanup policy + references</td><td style="border-top:1px solid #27435d;">name collision, permission leak, unlink omission</td></tr>
+        </table>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. 실무 best practice</h2>
+        <ul style="margin:0;padding-left:22px;">
+          <li>large local buffer와 unbounded recursion을 피하고 thread 수×stack reservation을 capacity에 포함한다.</li>
+          <li>malloc 계열의 size multiplication overflow에는 <code style="color:#fde68a;">calloc</code>/<code style="color:#fde68a;">reallocarray</code> 또는 명시적 검사식을 사용한다.</li>
+          <li><code style="color:#fde68a;">realloc</code> 결과를 원본 pointer에 바로 덮지 않는다. 실패 시 original allocation은 여전히 유효하다.</li>
+          <li>mmap은 <code style="color:#fde68a;">MAP_FAILED</code>, length/offset alignment, address+length overflow를 검사하고 소유 range만 munmap한다.</li>
+          <li>shared object creator는 <code style="color:#fde68a;">O_CREAT|O_EXCL</code>, 최소 permission, versioned unique name을 사용하고 size를 정한 뒤 ready를 publish한다.</li>
+          <li>shared header에 magic, schema version, total size, state/epoch을 두고 모든 offset을 bounds-check한다.</li>
+          <li>동기화 object는 mapping 안에 두고 process-shared 지원 여부와 모든 return code를 확인한다. owner crash가 가능하면 robust recovery transaction을 설계한다.</li>
+          <li>shutdown 순서를 producer stop→consumer drain→no references 증명→munmap/destroy→unlink로 문서화한다.</li>
+          <li>관찰 시 <code style="color:#fde68a;">/proc/PID/maps</code>의 address/perms/backing과 <code style="color:#fde68a;">smaps</code>의 RSS/PSS/private/shared를 함께 본다.</li>
+        </ul>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. error handling runbook</h2>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:13px;">
+          <tr style="background:#15314a;color:#bae6fd;"><td>결과</td><td>가능한 원인</td><td>처리</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>malloc == NULL</code></td><td style="border-top:1px solid #27435d;">ENOMEM, size/limit</td><td style="border-top:1px solid #27435d;">요청 size를 기록하고 partial state를 rollback, load shedding 또는 명시적 실패 전파</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>mmap == MAP_FAILED</code></td><td style="border-top:1px solid #27435d;">EINVAL/ENOMEM/EACCES/EMFILE</td><td style="border-top:1px solid #27435d;">errno 보존, flags·fd mode·offset·VMA limit 확인</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>shm_open EEXIST</code></td><td style="border-top:1px solid #27435d;">동시 creator 또는 stale object</td><td style="border-top:1px solid #27435d;">blind truncate 금지. ownership/epoch 확인 후 attach 또는 별도 unique name</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>ftruncate</code> 실패</td><td style="border-top:1px solid #27435d;">fd mode, limit, storage/resource</td><td style="border-top:1px solid #27435d;">mapping 전 중단하고 creator가 name을 cleanup</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>SIGBUS</code></td><td style="border-top:1px solid #27435d;">object보다 먼 access, concurrent truncate</td><td style="border-top:1px solid #27435d;">size/version protocol 수정, crash evidence 보존</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>pthread_mutex_lock=EOWNERDEAD</code></td><td style="border-top:1px solid #27435d;">robust owner crash</td><td style="border-top:1px solid #27435d;">lock은 획득됨. protected state 복구·검증 후 <code>pthread_mutex_consistent</code></td></tr>
+          <tr><td style="border-top:1px solid #27435d;">stack overflow</td><td style="border-top:1px solid #27435d;">recursion, large frame, stack limit</td><td style="border-top:1px solid #27435d;">alt stack 기반 최소 진단, core/trace 보존, algorithm/frame 수정</td></tr>
+        </table>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. 놓치기 쉬운 함정</h2>
+        <ul style="margin:0;padding-left:22px;">
+          <li><strong style="color:#fecaca;">malloc memory=항상 [heap]:</strong> allocator는 anonymous mmap과 여러 arena를 사용할 수 있다.</li>
+          <li><strong style="color:#fecaca;">free=RSS 즉시 감소:</strong> allocator가 page를 재사용하려고 보유할 수 있다.</li>
+          <li><strong style="color:#fecaca;">stack local=thread-safe:</strong> pointer가 escape하거나 shared object를 가리키면 race/lifetime 문제가 생긴다.</li>
+          <li><strong style="color:#fecaca;">MAP_SHARED=자동 동기화:</strong> visibility와 invariant atomicity는 다르다.</li>
+          <li><strong style="color:#fecaca;">close(fd)=unmap:</strong> mmap 뒤 fd를 닫아도 mapping은 유지된다.</li>
+          <li><strong style="color:#fecaca;">shm_unlink=즉시 memory 삭제:</strong> name만 제거하고 기존 mapping은 마지막 reference까지 남는다.</li>
+          <li><strong style="color:#fecaca;">shared raw pointer 저장:</strong> process별 mapping base와 ASLR 때문에 깨진다.</li>
+          <li><strong style="color:#fecaca;">creator가 ftruncate하면 즉시 ready:</strong> schema 초기화와 publication barrier/flag가 별도다.</li>
+          <li><strong style="color:#fecaca;">shared memory=durable storage:</strong> IPC visibility와 crash durability는 다른 계약이다.</li>
+        </ul>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 30분 실습: private COW와 named shared mapping 비교</h2>
+        <p style="margin:0 0 10px;">POSIX C11 환경에서 stack·malloc 주소를 관찰하고, child가 private anonymous mapping을 쓰면 parent에 보이지 않지만 별도로 <code style="color:#fde68a;">shm_open</code>한 shared object를 쓰면 parent가 관찰함을 검증한다. <code style="color:#fde68a;">waitpid</code>가 실습의 순서를 보장한다.</p>
+        <pre style="margin:0;white-space:pre;overflow-x:auto;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;">set -eu
+lab_dir="$(mktemp -d)"
+trap 'rm -rf "$lab_dir"' EXIT
+
+cat &gt; "$lab_dir/regions.c" &lt;&lt;'C'
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE
+#else
+#define _GNU_SOURCE
+#endif
+#include &lt;fcntl.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;sys/stat.h&gt;
+#include &lt;sys/types.h&gt;
+#include &lt;sys/wait.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+
+static char shm_name[80];
+static void cleanup(void) { if (shm_name[0]) shm_unlink(shm_name); }
+static void fail(const char *what) { perror(what); exit(2); }
+
+int main(void) {
+  int stack_value = 7;
+  int *heap_value = malloc(sizeof(*heap_value));
+  if (!heap_value) fail("malloc");
+  *heap_value = 8;
+
+  long ps = sysconf(_SC_PAGESIZE);
+  if (ps &lt;= 0) return 3;
+  snprintf(shm_name, sizeof(shm_name), "/os-day25-%ld", (long)getpid());
+  if (atexit(cleanup) != 0) return 4;
+
+  int fd = shm_open(shm_name, O_CREAT | O_EXCL | O_RDWR, 0600);
+  if (fd &lt; 0) fail("shm_open-create");
+  if (ftruncate(fd, ps) != 0) fail("ftruncate");
+  int *shared = mmap(NULL, (size_t)ps, PROT_READ | PROT_WRITE,
+                     MAP_SHARED, fd, 0);
+  if (shared == MAP_FAILED) fail("mmap-shared");
+  close(fd);                         /* mapping은 계속 유효 */
+
+  int *private_map = mmap(NULL, (size_t)ps, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (private_map == MAP_FAILED) fail("mmap-private");
+  *shared = 10; *private_map = 10;
+
+  pid_t child = fork();
+  if (child &lt; 0) fail("fork");
+  if (child == 0) {
+    /* 상속된 shared mapping 대신 같은 name을 새로 open/map한다. */
+    if (munmap(shared, (size_t)ps) != 0) _Exit(5);
+    int cfd = shm_open(shm_name, O_RDWR, 0);
+    if (cfd &lt; 0) _Exit(6);
+    int *child_shared = mmap(NULL, (size_t)ps, PROT_READ | PROT_WRITE,
+                             MAP_SHARED, cfd, 0);
+    close(cfd);
+    if (child_shared == MAP_FAILED) _Exit(7);
+    *child_shared = 42;              /* parent의 MAP_SHARED에서 보임 */
+    *private_map = 99;               /* COW라 parent에는 보이지 않음 */
+    if (munmap(child_shared, (size_t)ps) != 0) _Exit(8);
+    _Exit(0);
+  }
+
+  int status = 0;
+  if (waitpid(child, &amp;status, 0) != child) fail("waitpid");
+  int child_ok = WIFEXITED(status) &amp;&amp; WEXITSTATUS(status) == 0;
+  int shared_visible = *shared == 42;
+  int private_isolated = *private_map == 10;
+
+  printf("page_size=%ld\n", ps);
+  printf("stack_addr=%p heap_addr=%p shared_addr=%p private_addr=%p\n",
+         (void *)&amp;stack_value, (void *)heap_value,
+         (void *)shared, (void *)private_map);
+  printf("shared_value=%d visible=%d private_value=%d isolated=%d child_ok=%d\n",
+         *shared, shared_visible, *private_map, private_isolated, child_ok);
+
+  if (munmap(shared, (size_t)ps) != 0) fail("munmap-shared");
+  if (munmap(private_map, (size_t)ps) != 0) fail("munmap-private");
+  if (shm_unlink(shm_name) != 0) fail("shm_unlink");
+  shm_name[0] = '\0';
+  free(heap_value);
+  return child_ok &amp;&amp; shared_visible &amp;&amp; private_isolated ? 0 : 9;
+}
+C
+
+cc -std=c11 -O2 -Wall -Wextra -Werror "$lab_dir/regions.c" -o "$lab_dir/regions"
+"$lab_dir/regions"</pre>
+        <p style="margin:10px 0 4px;"><strong style="color:#f8fafc;">기대 형태</strong></p>
+        <pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:12px;color:#bfdbfe;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">page_size=&lt;환경별 값&gt;
+stack_addr=&lt;ASLR 주소&gt; heap_addr=&lt;주소&gt; shared_addr=&lt;주소&gt; private_addr=&lt;주소&gt;
+shared_value=42 visible=1 private_value=10 isolated=1 child_ok=1</pre>
+        <ol style="margin:12px 0 0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">0~10분:</strong> 출력 주소를 분류하되 주소의 대소 순서를 portable rule로 일반화하지 않는다.</li>
+          <li><strong style="color:#f8fafc;">10~20분:</strong> child가 named object를 별도 open/map해도 같은 backing을 보는 흐름과 MAP_PRIVATE COW를 그린다.</li>
+          <li><strong style="color:#f8fafc;">20~30분:</strong> shared struct에 pointer 대신 offset·version·ready flag를 넣는 header를 설계하고 crash 중간 상태를 적는다.</li>
+        </ol>
+        <p style="margin:10px 0 0;padding:10px 12px;background:#13283a;border-left:4px solid #5eead4;color:#c8e5f3;font-size:14px;"><strong>안전 장치:</strong> PID 기반 0600 object를 O_EXCL로 만들고 parent의 atexit와 정상 경로 모두 unlink한다. synchronization 검증은 waitpid로 제한하며 production shared data protocol을 대신하지 않는다. 오래된 Linux에서 link 오류가 나면 문서에 따라 <code>-lrt</code>가 필요할 수 있다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. Linux 관찰: VMA와 실제 사용량을 같이 보기</h2>
+        <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;"># 대상 PID의 mapping range, permission, private/shared, backing
+cat /proc/"$PID"/maps
+
+# mapping별 RSS/PSS/private/shared/anonymous/huge-page 근거
+awk '/^[0-9a-f]+-|^Size:|^Rss:|^Pss:|^Private_|^Shared_|^Anonymous:|^AnonHugePages:/' \
+  /proc/"$PID"/smaps
+
+# thread 목록과 limits
+ls /proc/"$PID"/task
+grep -E 'Max stack size|Max data size|Max address space' /proc/"$PID"/limits
+
+# Linux POSIX shm implementation의 object 목록은 권한 범위에서만
+ls -l /dev/shm</pre>
+        <p style="margin:10px 0 0;">maps의 <code style="color:#fde68a;">rw-p</code>는 private, <code style="color:#fde68a;">rw-s</code>는 shared mapping을 뜻하지만 실제 resident/shared 비용은 smaps를 함께 봐야 한다. <code style="color:#fde68a;">[heap]</code>만 더해 process의 모든 malloc memory라고 부르면 안 된다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 실패 시나리오: shared ring buffer가 재시작 뒤 멈춤</h2>
+        <p style="margin:0 0 8px;">두 process가 POSIX shm ring buffer를 공유했다. creator가 header 초기화 중 죽었는데 peer는 size만 보고 ready로 오인했다. mutex owner도 죽어 default stalled mutex가 영구 lock됐고, 재시작 script는 같은 name을 <code style="color:#fde68a;">O_TRUNC</code>해 살아 있는 old peer의 mapping에 SIGBUS/data corruption을 만들었다.</p>
+        <p style="margin:0;"><strong style="color:#f8fafc;">대응:</strong> traffic을 격리하고 object name/size/version, process liveness, mutex state를 보존한다. <strong style="color:#f8fafc;">재설계:</strong> O_EXCL creator election, INIT→READY epoch, robust mutex의 EOWNERDEAD recovery, offset bounds, 새 epoch object로 handoff 후 old peer drain/unlink를 사용한다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 대기업 면접 질문 3개</h2>
+        <ol style="margin:0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">“stack, heap, mmap은 서로 배타적인 영역인가요?”</strong><br>답변 포인트: stack/heap은 runtime usage model, mmap/VMA는 kernel mapping model이다. thread stack과 allocator arena도 anonymous mapping으로 구현될 수 있고 malloc은 brk·mmap·free list를 섞는다. 실제 배치는 maps/smaps로 확인한다.</li>
+          <li style="margin-top:10px;"><strong style="color:#f8fafc;">“MAP_SHARED면 동기화가 필요 없나요?”</strong><br>답변 포인트: 같은 backing page visibility를 제공할 뿐 multi-field invariant, ordering, owner crash는 해결하지 않는다. process-shared mutex/semaphore/atomic protocol, schema/version, EOWNERDEAD recovery와 lifetime handshake가 필요하다.</li>
+          <li style="margin-top:10px;"><strong style="color:#f8fafc;">“shared memory에 pointer를 저장하면 왜 위험한가요?”</strong><br>답변 포인트: process마다 ASLR과 free VA range가 달라 같은 object가 다른 base에 mapping된다. raw VA는 address-space local이다. offset/index를 저장하고 base+offset overflow·bounds·version을 검증한다.</li>
+        </ol>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 퀴즈·누적 리뷰</h2>
+        <ol style="margin:0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">free 후 RSS가 그대로여도 leak인가?</strong> 단정할 수 없다. allocator reuse/fragmentation과 live allocation을 구분한다.</li>
+          <li><strong style="color:#f8fafc;">mmap 뒤 fd를 close하면 pointer가 invalid한가?</strong> 아니다. mapping lifetime은 fd와 독립적이다.</li>
+          <li><strong style="color:#f8fafc;">shm_unlink 뒤 기존 process는 계속 접근 가능한가?</strong> mapping/reference가 남아 있으면 가능하다.</li>
+          <li><strong style="color:#f8fafc;">guard page가 모든 stack overflow를 안전 복구하는가?</strong> 아니다. detection을 돕지만 handler stack과 corrupted state 문제는 남는다.</li>
+          <li><strong style="color:#f8fafc;">Day 24 연결:</strong> 새 heap/mmap page의 실제 frame은 언제 생길 수 있는가? first-touch page fault에서 demand allocation될 수 있다.</li>
+          <li><strong style="color:#f8fafc;">Week 3 연결:</strong> shared memory publication에 무엇이 필요한가? happens-before를 만드는 inter-process synchronization과 crash-consistent state machine이다.</li>
+        </ol>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">15. 다음 날 연결</h2>
+        <p style="margin:0;">Day 26은 <strong style="color:#f8fafc;">page cache, dirty page, writeback</strong>이다. 오늘의 file/shared mapping이 언제 cache page를 보고, write가 dirty 상태가 된 뒤 storage로 언제·어떤 순서로 내려가는지를 다룬다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">16. 공식·1차 출처</h2>
+        <ul style="margin:0;padding-left:22px;word-break:break-word;">
+          <li><a href="https://docs.kernel.org/mm/process_addrs.html" style="color:#7dd3fc;">Linux Kernel — Process Addresses</a>: mm, VMA, maple tree, stack expansion과 locking model.</li>
+          <li><a href="https://man7.org/linux/man-pages/man2/mmap.2.html" style="color:#7dd3fc;">Linux man-pages — mmap(2)</a>: MAP_SHARED/PRIVATE, address hint, MAP_FIXED 위험과 errors.</li>
+          <li><a href="https://man7.org/linux/man-pages/man3/free.3.html" style="color:#7dd3fc;">Linux man-pages — malloc/free(3)</a>: glibc brk/mmap/arena 구현, overcommit과 allocator errors.</li>
+          <li><a href="https://man7.org/linux/man-pages/man3/shm_open.3.html" style="color:#7dd3fc;">Linux man-pages — shm_open(3)</a>: create, size=0, descriptor/mapping/unlink lifetime과 Linux tmpfs 구현.</li>
+          <li><a href="https://man7.org/linux/man-pages/man7/shm_overview.7.html" style="color:#7dd3fc;">Linux man-pages — POSIX shared memory overview</a>: shm_open→ftruncate→mmap API 흐름.</li>
+          <li><a href="https://man7.org/linux/man-pages/man5/proc_pid_maps.5.html" style="color:#7dd3fc;">Linux man-pages — proc_pid_maps(5)</a>: mapping address, permission, backing, [heap]/[stack] 표기.</li>
+          <li><a href="https://man7.org/linux/man-pages/man3/pthread_create.3.html" style="color:#7dd3fc;">Linux man-pages — pthread_create(3)</a>: thread stack size와 RLIMIT_STACK 관계.</li>
+          <li><a href="https://man7.org/linux/man-pages/man3/pthread_mutexattr_getpshared.3.html" style="color:#7dd3fc;">Linux man-pages — process-shared mutex attributes</a>: PTHREAD_PROCESS_SHARED와 ENOTSUP.</li>
+          <li><a href="https://man7.org/linux/man-pages/man3/pthread_mutexattr_setrobust.3.html" style="color:#7dd3fc;">Linux man-pages — robust mutex</a>: EOWNERDEAD, consistent recovery, ENOTRECOVERABLE.</li>
+          <li><a href="https://man7.org/linux/man-pages/man2/sigaltstack.2.html" style="color:#7dd3fc;">Linux man-pages — sigaltstack(2)</a>: alternate signal stack for exhausted/corrupted normal stack diagnostics.</li>
+        </ul>
+
+        <p style="margin:28px 0 0;padding-top:18px;border-top:1px solid #27435d;color:#8fb3c9;font-size:13px;">Day 25 완료 기준: stack/heap/VMA 층을 구분하고, MAP_PRIVATE/SHARED와 shared-object lifetime을 그리며, cross-process synchronization·offset·owner-crash runbook을 제시할 수 있다.</p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>

@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-08-26T09:19:51+09:00",
+  "updatedAt": "2026-08-27T09:18:32+09:00",
   "lessons": [
     {
       "day": 1,
@@ -221,6 +221,15 @@
       "path": "day-24.html",
       "kind": "lesson",
       "publishedAt": "2026-08-26T09:19:51+09:00"
+    },
+    {
+      "day": 25,
+      "week": 4,
+      "title": "stack, heap, mmap, shared memory",
+      "summary": "stack·heap의 runtime 모델과 mmap/VMA의 kernel 모델을 분리하고, MAP_PRIVATE/SHARED, POSIX shm lifetime, offset·동기화·owner-crash 대응을 실습으로 연결합니다.",
+      "path": "day-25.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-27T09:18:32+09:00"
     }
   ]
 }
