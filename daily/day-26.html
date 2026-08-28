@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operating System 심화 커리큘럼 Day 26 - page cache, dirty page, writeback</title>
+</head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.72;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#07111f;">
+    <tr><td align="center" style="padding:24px 12px;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:680px;background:#0f1d2e;border:1px solid #23415d;border-radius:18px;overflow:hidden;">
+        <tr><td style="padding:30px 28px 22px;background:#102a43;border-bottom:1px solid #28506f;">
+          <div style="font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:#5eead4;font-weight:800;">Operating System · Day 26 / 63 · Virtual Memory</div>
+          <h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">page cache, dirty page, writeback</h1>
+          <p style="margin:0;color:#b9d6eb;">한 줄 요약: buffered I/O의 <code>write()</code>는 보통 user buffer를 file의 page cache에 반영해 dirty로 만들고 먼저 끝날 수 있으며, writeback은 이를 storage로 내리는 비동기 흐름이다. <strong style="color:#f8fafc;">성공적으로 반환한 write와 crash 뒤 남는 durable write는 다른 계약</strong>이다.</p>
+        </td></tr>
+        <tr><td style="padding:26px 28px 34px;">
+
+        <h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:14px;">
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;width:31%;">page cache</td><td style="border-bottom:1px solid #27435d;">file content를 RAM에 보관하는 kernel cache. 일반 read/write와 file-backed mmap이 같은 cached data를 만나는 중심 계층이다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">folio</td><td style="border-bottom:1px solid #27435d;">Linux page cache가 memory를 관리하는 단위. base page 하나 이상을 묶을 수 있어 “항상 4KiB page 하나”로 단정하면 안 된다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">address_space</td><td style="border-bottom:1px solid #27435d;">inode 같은 cacheable object의 cached folio를 file offset index로 관리하고 Dirty/Writeback 상태와 filesystem operation을 연결하는 Linux kernel object.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">buffered I/O</td><td style="border-bottom:1px solid #27435d;">application과 storage 사이에 page cache를 사용하는 I/O. 대부분의 일반 file read/write가 해당한다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">cache hit / miss</td><td style="border-bottom:1px solid #27435d;">필요한 file range가 page cache에 있으면 hit, 없어 storage read가 필요하면 miss다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">dirty page/folio</td><td style="border-bottom:1px solid #27435d;">RAM의 cached content가 backing storage보다 새로워 아직 writeback이 필요한 상태. CPU cache line의 dirty bit와 구분한다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">writeback</td><td style="border-bottom:1px solid #27435d;">dirty cached data를 filesystem·block layer·device 방향으로 제출하고 완료를 추적하는 흐름.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">dirty throttling</td><td style="border-bottom:1px solid #27435d;">dirty data가 너무 쌓이면 writer가 무제한 RAM을 소비하지 못하도록 kernel이 write-producing task를 늦추는 backpressure.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">reclaim</td><td style="border-bottom:1px solid #27435d;">memory pressure에서 page를 재사용 가능하게 만드는 작업. clean file cache는 버리고 나중에 다시 읽을 수 있지만 dirty cache는 먼저 writeback해야 한다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">fsync / fdatasync</td><td style="border-bottom:1px solid #27435d;">file의 in-core 변경을 storage와 동기화하고 완료·오류를 기다리는 API. fdatasync는 이후 data retrieval에 불필요한 metadata를 생략할 수 있다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">fflush</td><td style="border-bottom:1px solid #27435d;">stdio user-space buffer를 kernel로 밀어내는 libc API. storage durability를 보장하지 않는다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">short write</td><td style="border-bottom:1px solid #27435d;">요청한 byte보다 적게 쓴 성공 반환. 남은 byte를 caller가 반복 처리해야 한다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">delayed error</td><td style="border-bottom:1px solid #27435d;">writeback 중 발견된 EIO/ENOSPC가 최초 write가 아니라 이후 write 또는 fsync에서 보고되는 현상.</td></tr>
+          <tr><td style="color:#7dd3fc;font-weight:700;">volatile device cache</td><td>전원 상실 시 사라질 수 있는 storage controller/device 내부 cache. 올바른 durability에는 filesystem의 flush/barrier와 device의 정직한 completion이 필요하다.</td></tr>
+        </table>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 주문서와 실제 창고 반영은 다른 사건</h2>
+        <p style="margin:0 0 10px;">page cache를 매장의 작업대, storage를 외부 창고로 보자. 직원이 주문서의 변경을 작업대에 적어 둔 순간 application은 빠르게 돌아갈 수 있다. 그러나 창고 차량이 출발하고, 창고가 수령을 확인하기 전 정전이 나면 작업대의 변경은 사라질 수 있다.</p>
+        <ul style="margin:0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">write 반환:</strong> 변경 일부 또는 전부가 kernel이 관리하는 경계까지 받아들여졌다는 뜻이지, 항상 durable하다는 뜻은 아니다.</li>
+          <li><strong style="color:#f8fafc;">dirty:</strong> 작업대가 창고보다 최신이라 아직 배송해야 하는 상태다.</li>
+          <li><strong style="color:#f8fafc;">writeback:</strong> 배송을 제출·진행하는 상태다. 이때 application이 직접 기다리지 않을 수도 있다.</li>
+          <li><strong style="color:#f8fafc;">fsync 성공:</strong> 해당 file의 data와 필요한 metadata가 storage의 안정성 계약까지 도달했다고 filesystem/device가 보고한 사건이다.</li>
+        </ul>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: buffered write에서 storage completion까지</h2>
+        <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">Application buffer
+  │ write(fd, buf, len)      ┌─ short write / EINTR / ENOSPC 가능
+  ▼                          │
+VFS → filesystem buffered-write path
+  │ copy from user, allocate/find folio by (inode mapping, file index)
+  ▼
+Page cache: CLEAN → DIRTY ───────────────┐  write()가 여기서 먼저 끝날 수 있음
+  │                                      │
+  ├─ background threshold / age timer    │ dirty accounting
+  ├─ memory reclaim                      │
+  ├─ explicit fsync/fdatasync/msync      │
+  └─ dirty limit → writer throttling ────┘
+                  │
+                  ▼
+Filesystem writepages/write_folio → block I/O → driver → controller/device cache → media
+                  │                               │
+                  └──── completion / EIO / ENOSPC ┘
+
+read() / file-backed mmap fault → 같은 address_space의 cached folio를 재사용 가능
+clean file cache → pressure 시 discard 가능; dirty cache → writeback 전 즉시 discard 불가</pre>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. dirty folio 상태 전이</h2>
+        <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">[ABSENT]
+   │ read miss / write allocation / mmap fault
+   ▼
+[CLEAN CACHED] ── application write or writable mmap store ─→ [DIRTY]
+      ▲                                                    │
+      │                                                    ├─ background flusher
+      │                                                    ├─ dirty throttling path
+      │                                                    ├─ reclaim pressure
+      │                                                    └─ fsync/fdatasync/msync
+      │                                                           │
+      │                                                           ▼
+      └──── I/O completion success ─────────────────────── [WRITEBACK]
+                                                                  │
+                  concurrent modification → redirty ──────────────┤
+                                                                  └─ failure → error recorded
+
+fsync caller: dirty scan/submit → wait for writeback → observe recorded error → success or -1
+주의: state transition과 exact locking/function은 kernel·filesystem version별 구현 세부다.</pre>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. CS·kernel·hardware deep dive</h2>
+        <h3 style="margin:16px 0 8px;color:#f8fafc;font-size:17px;">5.1 page cache의 key는 process VA가 아니라 file object와 offset이다</h3>
+        <p style="margin:0;">Linux의 <code style="color:#fde68a;">address_space</code>는 cacheable object의 folio를 index로 관리한다. 두 process가 같은 inode range를 read하거나 file-backed mmap하면 서로 다른 VA를 쓰더라도 같은 cached file data에 수렴할 수 있다. 따라서 page cache는 Day 25의 process-local address와 다른 전역 kernel 관점이다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.2 read hit는 storage I/O를 피하지만 memory copy까지 항상 피하는 것은 아니다</h3>
+        <p style="margin:0;">buffered <code style="color:#fde68a;">read</code> hit는 page cache에서 user buffer로 copy한다. file-backed mmap은 page fault 뒤 cached folio를 page table에 연결해 반복 read copy를 피할 수 있지만 fault, mapping 관리, lifetime와 random access trade-off가 있다. page cache hit와 CPU cache hit도 서로 다른 층이다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.3 write 성공은 byte count 계약부터 확인한다</h3>
+        <p style="margin:0;">regular file의 write는 요청보다 적은 양을 성공 반환할 수 있다. signal 뒤 일부만 썼거나 공간·quota·resource limit에 걸릴 수 있으므로 caller는 returned byte만큼 pointer/offset을 전진해 반복한다. 전부 page cache에 복사됐더라도 storage commit은 별도다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.4 dirty accounting은 RAM을 무한 write buffer로 쓰지 못하게 한다</h3>
+        <p style="margin:0;">Linux의 <code style="color:#fde68a;">dirty_background_bytes/ratio</code>는 background writeback 시작점이고, <code style="color:#fde68a;">dirty_bytes/ratio</code>는 write를 생성하는 process가 직접 writeback·throttling에 관여할 수 있는 상위 경계다. ratio의 기준은 단순 MemTotal이 아니라 free/reclaimable을 포함한 available memory 관점이다. bytes와 ratio counterpart는 동시에 독립 적용되는 값이 아니다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.5 storage가 느리면 write syscall latency가 뒤늦게 폭발한다</h3>
+        <p style="margin:0;">초기 burst는 RAM에 흡수돼 빠르지만 dirty production rate가 device writeback rate를 계속 넘으면 dirty limit에 접근한다. kernel은 writer를 늦춰 producer와 device 속도를 맞춘다. 그래서 “처음 30초는 빠르고 이후 write p99가 급상승”하는 장애는 CPU가 아니라 dirty throttling·device saturation일 수 있다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.6 PG_Dirty와 PG_Writeback은 겹치는 concurrency를 다룬다</h3>
+        <p style="margin:0;">filesystem writeback이 dirty 상태를 정리하고 writeback을 표시한 뒤 I/O를 제출한다. 그 사이 application이 같은 folio를 다시 수정하면 새 dirty 세대가 생길 수 있다. “I/O 하나 완료=그 page의 모든 미래 write도 clean”이 아니며, kernel은 tag와 locking으로 scan·redirty·completion을 조정한다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.7 writeback error는 원래 write와 시간·fd가 떨어져 보일 수 있다</h3>
+        <p style="margin:0;">page cache는 어느 file description이 각 byte를 dirty했는지 완벽히 보존하지 않는다. Linux generic error tracking은 mapping에 오류 sequence를 기록하고 관련 open file description의 이후 fsync에서 보고한다. 여러 writer가 있으면 자신의 write가 원인이 아니어도 EIO를 받을 수 있으므로 fsync 실패를 “재시도하면 끝”으로 취급하면 안 된다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.8 fsync, fdatasync, directory fsync는 범위가 다르다</h3>
+        <p style="margin:0;"><code style="color:#fde68a;">fsync(file)</code>은 data와 file metadata를, <code style="color:#fde68a;">fdatasync</code>는 data retrieval에 필요한 metadata를 동기화한다. 하지만 새 이름이나 rename 결과가 crash 뒤 directory에 남는지는 directory entry의 durability 문제다. crash-safe replace는 temp write→file fsync→rename→directory fsync처럼 namespace까지 포함해야 한다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.9 sync_file_range는 durability shortcut이 아니다</h3>
+        <p style="margin:0;">Linux 전용 <code style="color:#fde68a;">sync_file_range</code>는 range writeback 제어에 쓰이지만 metadata를 sync하지 않고 volatile disk cache flush도 보장하지 않는다. man-page도 portable data-integrity 용도로 위험하다고 경고한다. 데이터 보존 계약에는 fsync/fdatasync와 filesystem별 보장을 사용한다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.10 clean cache는 reclaim 자산, dirty cache는 I/O 부채다</h3>
+        <p style="margin:0;">clean file cache는 backing file에서 다시 만들 수 있어 pressure 시 discard하기 쉽다. dirty cache는 먼저 storage I/O가 필요하므로 memory pressure와 I/O pressure를 결합한다. writeback이 막히면 reclaim도 지연되고 allocation latency·direct reclaim·service p99까지 번질 수 있다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.11 device completion도 storage stack의 계약을 전제로 한다</h3>
+        <p style="margin:0;">filesystem은 ordering과 flush/FUA 같은 mechanism으로 device cache까지 제어하지만 hardware·virtualization·network storage가 completion을 잘못 보고하면 application의 fsync만으로 거짓말을 고칠 수 없다. 실제 durability는 application protocol, filesystem, block layer, controller power-loss protection의 end-to-end property다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. API가 보장하는 경계 비교</h2>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:13px;">
+          <tr style="background:#15314a;color:#bae6fd;"><td>API/사건</td><td>도달 경계</td><td>놓치기 쉬운 점</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>fflush</code></td><td style="border-top:1px solid #27435d;">stdio → kernel</td><td style="border-top:1px solid #27435d;">storage durability 아님</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>write</code> full return</td><td style="border-top:1px solid #27435d;">요청 byte를 kernel이 수락</td><td style="border-top:1px solid #27435d;">writeback 오류가 나중에 올 수 있음</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">background writeback</td><td style="border-top:1px solid #27435d;">dirty I/O 제출·완료</td><td style="border-top:1px solid #27435d;">application transaction 경계와 무관</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>fdatasync</code></td><td style="border-top:1px solid #27435d;">data + retrieval 필수 metadata</td><td style="border-top:1px solid #27435d;">directory name 보존과 별개</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>fsync(file)</code></td><td style="border-top:1px solid #27435d;">file data + metadata</td><td style="border-top:1px solid #27435d;">containing directory는 별도 fsync</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>fsync(directory)</code></td><td style="border-top:1px solid #27435d;">namespace update</td><td style="border-top:1px solid #27435d;">filesystem/platform 지원 계약 확인</td></tr>
+        </table>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. 실무 best practice</h2>
+        <ul style="margin:0;padding-left:22px;">
+          <li>API 문서에 accepted, visible, durable, replicated의 성공 레벨을 분리하고 응답 시점을 명시한다.</li>
+          <li>write는 short count와 EINTR을 처리하는 loop로 감싸고 0 progress를 무한 retry하지 않는다.</li>
+          <li>durability가 필요한 transaction은 fsync/fdatasync의 return code까지 성공 조건으로 포함한다.</li>
+          <li>atomic file replace는 같은 filesystem의 temp file, file fsync, rename, directory fsync 순서를 사용하고 recovery test를 자동화한다.</li>
+          <li>batch/group commit으로 fsync 비용을 amortize하되 손실 가능 window와 tail latency SLO를 수치로 합의한다.</li>
+          <li>Dirty/Writeback, write latency, fsync latency, device queue/utilization, I/O error, memory pressure를 함께 모니터링한다.</li>
+          <li>producer rate를 bounded queue·backpressure로 제한한다. page cache를 무한 queue로 사용하지 않는다.</li>
+          <li>global dirty sysctl은 workload·RAM·device benchmark 없이 조정하지 않는다. container라면 cgroup writeback/accounting도 함께 본다.</li>
+          <li><code>O_DIRECT</code>는 alignment·coherency·filesystem 지원을 포함한 별도 설계다. “cache가 나쁘다”는 이유만으로 켜지 않는다.</li>
+        </ul>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. error handling runbook</h2>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:13px;">
+          <tr style="background:#15314a;color:#bae6fd;"><td>증상/오류</td><td>해석</td><td>대응</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">short write</td><td style="border-top:1px solid #27435d;">일부 byte만 수락</td><td style="border-top:1px solid #27435d;">정확한 offset을 전진해 남은 byte 반복, zero progress와 deadline 처리</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>EINTR</code></td><td style="border-top:1px solid #27435d;">signal interruption</td><td style="border-top:1px solid #27435d;">return count가 없는 실패만 정책에 따라 재시도, cancellation/deadline 확인</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>ENOSPC/EDQUOT</code></td><td style="border-top:1px solid #27435d;">space 또는 quota 고갈</td><td style="border-top:1px solid #27435d;">쓰기 중지·load shed, partial file 격리, reservation·quota·inode 확인</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>fsync EIO</code></td><td style="border-top:1px solid #27435d;">writeback 실패 기록</td><td style="border-top:1px solid #27435d;">성공 응답 금지, file 범위 불확실로 취급, kernel/device log와 filesystem health 보존</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">write p99 급등 + Dirty 증가</td><td style="border-top:1px solid #27435d;">device보다 producer가 빠르고 throttling 진입</td><td style="border-top:1px solid #27435d;">producer rate 제한, device latency/queue 확인, 무작정 dirty limit 확대 금지</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">Writeback 장기 정체</td><td style="border-top:1px solid #27435d;">device/filesystem/network stall 가능</td><td style="border-top:1px solid #27435d;">I/O path와 hung task 증거 수집, failover/readonly 전환 정책 실행</td></tr>
+          <tr><td style="border-top:1px solid #27435d;"><code>SIGBUS</code> on mmap</td><td style="border-top:1px solid #27435d;">mapping 뒤 file truncate 등</td><td style="border-top:1px solid #27435d;">size/lifetime protocol 수정, concurrent truncate 금지, crash evidence 보존</td></tr>
+        </table>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. 놓치기 쉬운 함정</h2>
+        <ul style="margin:0;padding-left:22px;">
+          <li><strong style="color:#fecaca;">write 성공=durable:</strong> buffered write는 page cache에서 끝날 수 있다.</li>
+          <li><strong style="color:#fecaca;">fflush=fsync:</strong> 전자는 libc buffer, 후자는 storage synchronization 계약이다.</li>
+          <li><strong style="color:#fecaca;">file fsync=rename durable:</strong> directory entry에는 directory fsync가 필요할 수 있다.</li>
+          <li><strong style="color:#fecaca;">close가 모든 오류를 해결:</strong> close 오류만으로 durability protocol을 대체하지 않는다. 명시적 fsync 결과를 확인한다.</li>
+          <li><strong style="color:#fecaca;">Cached가 크면 leak:</strong> clean file cache는 reclaimable할 수 있어 MemAvailable과 pressure를 함께 본다.</li>
+          <li><strong style="color:#fecaca;">drop_caches가 production fix:</strong> 원인·working set을 숨기고 latency를 악화할 수 있는 진단/benchmark 도구이지 치료제가 아니다.</li>
+          <li><strong style="color:#fecaca;">sync_file_range=range fsync:</strong> metadata와 volatile device cache를 포함한 durability 보장이 아니다.</li>
+          <li><strong style="color:#fecaca;">dirty page=dirty CPU cache line:</strong> filesystem backing과 RAM의 차이 vs CPU cache와 RAM의 차이라는 서로 다른 층이다.</li>
+          <li><strong style="color:#fecaca;">dirty limit을 키우면 throughput 해결:</strong> burst를 늦출 뿐 stall 규모와 crash-loss window를 키울 수 있다.</li>
+        </ul>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 30분 실습: buffered write와 fsync 경계 관찰</h2>
+        <p style="margin:0 0 10px;">16MiB temporary file을 full-write loop로 쓰고, Linux라면 <code style="color:#fde68a;">/proc/meminfo</code>의 Dirty/Writeback을 전후 관찰한 뒤 fsync latency와 content를 검증한다. global sysctl과 drop_caches는 건드리지 않는다.</p>
+        <pre style="margin:0;white-space:pre;overflow-x:auto;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;">set -eu
+lab_dir="$(mktemp -d)"
+trap 'rm -rf "$lab_dir"' EXIT
+
+python3 - "$lab_dir/data.bin" &lt;&lt;'PY'
+import errno
+import os
+import sys
+import time
+
+path = sys.argv[1]
+chunk = b"P" * (1024 * 1024)
+total = 16 * len(chunk)
+
+def meminfo():
+    try:
+        rows = {}
+        with open("/proc/meminfo", encoding="ascii") as f:
+            for line in f:
+                key, value = line.split(":", 1)
+                if key in ("Cached", "Dirty", "Writeback"):
+                    rows[key] = value.strip()
+        return " ".join("{}={}".format(k, rows.get(k, "?"))
+                        for k in ("Cached", "Dirty", "Writeback"))
+    except FileNotFoundError:
+        return "proc_meminfo=unavailable(non-Linux host)"
+
+fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+try:
+    print("before", meminfo())
+    started = time.monotonic()
+    written = 0
+    while written &lt; total:
+        view = memoryview(chunk)
+        while view:
+            try:
+                n = os.write(fd, view)
+            except InterruptedError:
+                continue
+            if n == 0:
+                raise RuntimeError("zero-progress write")
+            view = view[n:]
+            written += n
+    write_ms = (time.monotonic() - started) * 1000
+    print("after_write", meminfo())
+
+    started = time.monotonic()
+    os.fsync(fd)
+    fsync_ms = (time.monotonic() - started) * 1000
+    print("after_fsync", meminfo())
+finally:
+    os.close(fd)
+
+st = os.stat(path)
+with open(path, "rb") as f:
+    first = f.read(1)
+    f.seek(-1, os.SEEK_END)
+    last = f.read(1)
+assert st.st_size == total and first == b"P" and last == b"P"
+print("bytes={} write_ms={:.3f} fsync_ms={:.3f} verified=1".format(
+      total, write_ms, fsync_ms))
+
+if os.path.exists("/dev/full"):
+    full = os.open("/dev/full", os.O_WRONLY)
+    try:
+        try:
+            os.write(full, b"failure-injection")
+            raise AssertionError("/dev/full unexpectedly accepted write")
+        except OSError as e:
+            assert e.errno == errno.ENOSPC
+            print("dev_full_errno=ENOSPC handled=1")
+    finally:
+        os.close(full)
+PY</pre>
+        <p style="margin:10px 0 4px;"><strong style="color:#f8fafc;">기대 형태</strong></p>
+        <pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:12px;color:#bfdbfe;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">before Cached=&lt;system value&gt; Dirty=&lt;value&gt; Writeback=&lt;value&gt;
+after_write ...
+after_fsync ...
+bytes=16777216 write_ms=&lt;환경별&gt; fsync_ms=&lt;환경별&gt; verified=1
+dev_full_errno=ENOSPC handled=1   # Linux에서 /dev/full이 있을 때</pre>
+        <ol style="margin:12px 0 0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">0~10분:</strong> write loop가 short write·EINTR·zero progress를 어떻게 처리하는지 설명한다.</li>
+          <li><strong style="color:#f8fafc;">10~20분:</strong> write_ms와 fsync_ms 차이, Dirty/Writeback은 system-wide noisy 지표라는 점을 기록한다.</li>
+          <li><strong style="color:#f8fafc;">20~30분:</strong> /dev/full ENOSPC가 난 partial transaction을 publish하지 않는 rollback 설계를 적는다.</li>
+        </ol>
+        <p style="margin:10px 0 0;padding:10px 12px;background:#13283a;border-left:4px solid #5eead4;color:#c8e5f3;font-size:14px;"><strong>안전 장치:</strong> mktemp 전용 파일 16MiB만 만들고 종료 시 삭제한다. root 권한, sysctl 변경, drop_caches, raw device access를 사용하지 않는다. 결과 수치는 storage와 동시 workload에 따라 달라지므로 절대 성능 기준으로 쓰지 않는다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. Linux 관찰 runbook</h2>
+        <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;"># system-wide cache/dirty/writeback snapshot
+grep -E '^(MemAvailable|Cached|Dirty|Writeback):' /proc/meminfo
+
+# 현재 설정은 읽기만 한다. bytes와 ratio counterpart를 함께 해석
+for f in dirty_background_bytes dirty_background_ratio dirty_bytes dirty_ratio \
+         dirty_expire_centisecs dirty_writeback_centisecs; do
+  printf '%s=' "$f"; cat "/proc/sys/vm/$f"
+done
+
+# workload 단위 latency와 device saturation은 환경 표준 도구로 함께 관찰
+# 예: write/fsync latency histogram, iostat device await/util, PSI io/memory
+cat /proc/pressure/io
+cat /proc/pressure/memory</pre>
+        <p style="margin:10px 0 0;">Dirty 하나만 보고 결론 내리지 않는다. Dirty 증가율, Writeback 정체, application write/fsync p99, device queue latency, memory/IO PSI의 시간축을 맞춰 producer saturation인지 device/filesystem stall인지 분류한다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 실패 시나리오: 로그 수집기는 빨랐지만 재부팅 뒤 40초가 사라짐</h2>
+        <p style="margin:0 0 8px;">service가 append write 성공 직후 “저장 완료”를 응답했다. storage latency가 상승하자 RAM이 dirty burst를 흡수해 처음에는 정상처럼 보였고, 이후 dirty throttling으로 p99가 급등했다. 그 시점에 전원이 끊겨 아직 writeback되지 않은 tail이 사라졌다. 재기동 코드는 마지막 record의 partial frame도 정상으로 읽었다.</p>
+        <p style="margin:0;"><strong style="color:#f8fafc;">대응:</strong> 장애 중 Dirty/Writeback, fsync latency, device error, 마지막 durable sequence를 보존한다. <strong style="color:#f8fafc;">재설계:</strong> record length+checksum, batch fsync 뒤 durable watermark 응답, bounded ingest queue, torn-tail truncation recovery, ENOSPC/EIO 시 read-only·failover 전환을 사용한다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 대기업 면접 질문 3개</h2>
+        <ol style="margin:0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">“write()가 성공했는데 데이터가 사라질 수 있나요?”</strong><br>답변 포인트: buffered write는 page cache의 dirty folio에서 반환할 수 있다. background writeback과 durability는 별도이며 short write·delayed EIO도 있다. transaction은 fsync/fdatasync 결과, rename이면 directory fsync까지 확인한다.</li>
+          <li style="margin-top:10px;"><strong style="color:#f8fafc;">“처음엔 빠른데 연속 write 후 latency가 급등하는 이유는?”</strong><br>답변 포인트: RAM이 burst를 흡수하지만 dirty production rate가 device drain rate를 넘으면 background threshold와 dirty throttling에 도달한다. Dirty/Writeback, write/fsync p99, device await/util, PSI로 증명하고 producer backpressure를 건다.</li>
+          <li style="margin-top:10px;"><strong style="color:#f8fafc;">“page cache가 메모리를 많이 쓰면 memory leak인가요?”</strong><br>답변 포인트: clean file cache는 reclaimable하고 성능 자산이다. MemAvailable, active/inactive file, pressure/reclaim을 봐야 한다. dirty cache는 writeback I/O가 필요한 부채이므로 Dirty 정체와 application allocation leak을 분리한다.</li>
+        </ol>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 퀴즈·누적 리뷰</h2>
+        <ol style="margin:0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">fflush 뒤 전원 손실 안전한가?</strong> 아니다. libc buffer를 kernel로 보낼 뿐이다.</li>
+          <li><strong style="color:#f8fafc;">clean page cache와 dirty page cache 중 reclaim이 쉬운 것은?</strong> backing에서 다시 읽을 수 있는 clean file cache다.</li>
+          <li><strong style="color:#f8fafc;">fsync 실패 후 이미 보낸 성공 응답은 되돌릴 수 있는가?</strong> 없다. durable watermark 전에 성공을 약속한 protocol 결함이다.</li>
+          <li><strong style="color:#f8fafc;">dirty_background_ratio의 분모는 단순 MemTotal인가?</strong> 아니다. kernel 문서의 available memory 관점을 사용한다.</li>
+          <li><strong style="color:#f8fafc;">Day 25 연결:</strong> file-backed mmap store는 어디를 dirty하게 만드는가? 같은 file address_space의 cached folio이며 msync/fsync/lifetime 계약이 필요하다.</li>
+          <li><strong style="color:#f8fafc;">Day 24 연결:</strong> mmap read miss는 무엇을 만들 수 있는가? page fault가 storage read와 page cache folio/PTE 연결을 유발할 수 있다.</li>
+        </ol>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">15. 다음 날 연결</h2>
+        <p style="margin:0;">Day 27은 <strong style="color:#f8fafc;">실패 실습: RSS/VSZ/page fault/OOM 관찰</strong>이다. clean/dirty cache, anonymous memory, virtual reservation이 각 지표에 어떻게 나타나며 memory pressure와 OOM을 어떻게 안전하게 재현·분류하는지 연결한다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">16. 공식·1차 출처</h2>
+        <ul style="margin:0;padding-left:22px;word-break:break-word;">
+          <li><a href="https://docs.kernel.org/mm/page_cache.html" style="color:#7dd3fc;">Linux Kernel — Page Cache</a>: 일반 read/write/mmap과 folio가 page cache를 사용하는 기본 모델.</li>
+          <li><a href="https://docs.kernel.org/filesystems/vfs.html" style="color:#7dd3fc;">Linux Kernel — Overview of the VFS</a>: address_space, Dirty/Writeback tag, write_begin/write_end와 writepages, writeback error tracking.</li>
+          <li><a href="https://docs.kernel.org/admin-guide/sysctl/vm.html" style="color:#7dd3fc;">Linux Kernel — /proc/sys/vm documentation</a>: dirty background/limit bytes·ratio, expire와 periodic writeback tunable.</li>
+          <li><a href="https://docs.kernel.org/admin-guide/cgroup-v2.html" style="color:#7dd3fc;">Linux Kernel — Control Group v2</a>: cgroup writeback과 global dirty tunable 적용 관계.</li>
+          <li><a href="https://man7.org/linux/man-pages/man2/write.2.html" style="color:#7dd3fc;">Linux man-pages — write(2)</a>: partial write, delayed EIO/ENOSPC, successful write와 disk commit의 차이.</li>
+          <li><a href="https://man7.org/linux/man-pages/man2/fsync.2.html" style="color:#7dd3fc;">Linux man-pages — fsync(2)</a>: fsync/fdatasync 범위, directory fsync, delayed writeback errors.</li>
+          <li><a href="https://man7.org/linux/man-pages/man2/sync_file_range.2.html" style="color:#7dd3fc;">Linux man-pages — sync_file_range(2)</a>: range writeback semantics와 data-integrity 경고.</li>
+          <li><a href="https://man7.org/linux/man-pages/man5/proc_meminfo.5.html" style="color:#7dd3fc;">Linux man-pages — proc_meminfo(5)</a>: Cached, Dirty, Writeback, Shmem 필드의 정의.</li>
+          <li><a href="https://man7.org/linux/man-pages/man2/posix_fadvise.2.html" style="color:#7dd3fc;">Linux man-pages — posix_fadvise(2)</a>: DONTNEED, dirty page와 fsync/fdatasync 관계.</li>
+        </ul>
+
+        <p style="margin:28px 0 0;padding-top:18px;border-top:1px solid #27435d;color:#8fb3c9;font-size:13px;">Day 26 완료 기준: write→dirty→throttle/writeback→device completion 흐름을 그리고, accepted와 durable을 구분하며, delayed error·ENOSPC·writeback stall에 대한 관찰 지표와 복구 protocol을 제시할 수 있다.</p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>

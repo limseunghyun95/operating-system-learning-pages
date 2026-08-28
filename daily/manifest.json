@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-08-27T09:18:32+09:00",
+  "updatedAt": "2026-08-28T09:19:15+09:00",
   "lessons": [
     {
       "day": 1,
@@ -230,6 +230,15 @@
       "path": "day-25.html",
       "kind": "lesson",
       "publishedAt": "2026-08-27T09:18:32+09:00"
+    },
+    {
+      "day": 26,
+      "week": 4,
+      "title": "page cache, dirty page, writeback",
+      "summary": "buffered write가 page cache를 dirty하게 만드는 흐름부터 writeback·dirty throttling·delayed error·fsync·directory durability까지 production 장애 대응으로 연결합니다.",
+      "path": "day-26.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-28T09:19:15+09:00"
     }
   ]
 }
