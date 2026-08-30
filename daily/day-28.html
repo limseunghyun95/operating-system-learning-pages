@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operating System 심화 커리큘럼 Day 28 - 리뷰: memory leak과 memory pressure 구분</title>
+</head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.72;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#07111f;">
+    <tr><td align="center" style="padding:24px 12px;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:680px;background:#0f1d2e;border:1px solid #23415d;border-radius:18px;overflow:hidden;">
+        <tr><td style="padding:30px 28px 22px;background:#102a43;border-bottom:1px solid #28506f;">
+          <div style="font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:#5eead4;font-weight:800;">Operating System · Day 28 / 63 · Week 4 Review</div>
+          <h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">리뷰: memory leak과 memory pressure 구분</h1>
+          <p style="margin:0;color:#b9d6eb;">한 줄 요약: <strong style="color:#f8fafc;">leak은 application이 필요 없는 memory를 계속 reachable하게 보유하는 원인 가설이고, pressure는 workload가 memory 확보를 기다리는 system/cgroup 상태</strong>다. RSS 증가 하나로 둘을 동일시하지 말고 live bytes·mapping 구성·cgroup events·PSI를 같은 시간축에서 교차 검증한다.</p>
+        </td></tr>
+        <tr><td style="padding:26px 28px 34px;">
+
+        <h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:14px;">
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;width:31%;">memory leak</td><td style="border-bottom:1px solid #27435d;">업무상 더는 필요하지 않은 memory가 reference·pointer·resource owner에 남아 회수되지 않고 반복 요청마다 증가하는 결함. 언어 runtime이 도달 가능하다고 판단하면 GC도 회수하지 못한다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">reachable / live</td><td style="border-bottom:1px solid #27435d;">root(global, stack, register 등)에서 reference를 따라 접근할 수 있어 allocator/runtime 관점에서 살아 있는 object 또는 byte.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">retained memory</td><td style="border-bottom:1px solid #27435d;">application 또는 allocator가 재사용하려고 보유하는 memory. 의도된 cache일 수도, 실수로 붙잡힌 leak일 수도 있으므로 owner와 bound를 확인한다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">working set</td><td style="border-bottom:1px solid #27435d;">관찰 구간에 실제로 자주 접근하는 page 집합. service가 지연 없이 동작하는 데 필요한 active footprint에 가깝다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">memory pressure</td><td style="border-bottom:1px solid #27435d;">memory 부족으로 task가 reclaim·writeback·swap·compaction을 기다려 latency와 throughput 손실을 겪는 상태. leak 없이도 load spike나 낮은 cgroup limit로 발생한다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">RSS / PSS</td><td style="border-bottom:1px solid #27435d;">RSS는 process에 resident한 page 근사치, PSS는 shared page 비용을 공유 process 수로 나눈 값. 둘 다 object 생존 이유를 직접 설명하지 않는다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">arena / tcache</td><td style="border-bottom:1px solid #27435d;">allocator가 contention을 줄이고 재사용을 빠르게 하려고 관리하는 heap 영역과 thread-local cache. free된 chunk가 있어도 process가 OS에 page를 즉시 돌려주지 않을 수 있다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">fragmentation</td><td style="border-bottom:1px solid #27435d;">총 free 공간은 있어도 원하는 크기·정렬로 연속 사용하기 어렵거나 page 안에 live chunk가 섞여 page 전체를 반환할 수 없는 상태.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">high watermark</td><td style="border-bottom:1px solid #27435d;">과거 최고 사용량. <code style="color:#fde68a;">VmHWM</code>·<code style="color:#fde68a;">ru_maxrss</code> 같은 peak는 현재 사용량이 내려가도 감소하지 않는다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">slope</td><td style="border-bottom:1px solid #27435d;">시간당 증가량. leak 판별은 순간값보다 동일 traffic·GC phase에서 live bytes와 owner cardinality가 계속 양의 기울기를 갖는지 본다.</td></tr>
+          <tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">cardinality</td><td style="border-bottom:1px solid #27435d;">cache key, tenant, request ID처럼 서로 다른 값의 수. bound 없는 key 수가 memory 증가를 만드는 흔한 원인이다.</td></tr>
+          <tr><td style="color:#7dd3fc;font-weight:700;">PSI</td><td>Pressure Stall Information. resource 부족 때문에 task가 실제로 멈춘 시간의 비율과 누적 시간을 보여 주는 Linux 지표.</td></tr>
+        </table>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 물탱크의 수위와 막힌 수도관을 분리한다</h2>
+        <p style="margin:0 0 10px;">process RSS는 물탱크의 현재 수위에 가깝다. 수위가 높은 이유는 여러 가지다. 사용 중인 물(live object), 재사용하려고 저장한 물(cache/allocator retention), 이웃과 공유하는 물(shared/file page), 배출구 사이에 남은 물(fragmentation)이 모두 섞인다.</p>
+        <ul style="margin:0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">leak:</strong> 사용이 끝난 물통의 소유권 표를 지우지 않아 새 요청마다 보관량이 증가한다.</li>
+          <li><strong style="color:#f8fafc;">pressure:</strong> 건물 전체나 특정 층(cgroup)의 공급이 부족해 수도를 기다린다. 어느 한 탱크가 새지 않아도 발생한다.</li>
+          <li><strong style="color:#f8fafc;">allocator retention:</strong> 사용한 물통을 다음 요청에 재사용하려고 창고에 둔다. application live bytes는 줄어도 RSS가 즉시 줄지 않을 수 있다.</li>
+          <li><strong style="color:#f8fafc;">핵심 질문:</strong> “수위가 높은가?” 다음에 반드시 “누가 왜 보유하는가?”와 “누가 얼마나 기다리는가?”를 묻는다.</li>
+        </ul>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: 네 관찰 계층을 같은 시간축에 놓는다</h2>
+        <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">request / job / tenant / cache key
+            │ owner·lifetime·cardinality
+            ▼
+application/runtime ─ live objects, heap profile, GC, cache size
+            │ allocate/free
+            ▼
+allocator ─ arenas, bins, tcache, retained/free chunks, fragmentation
+            │ brk/mmap/munmap/madvise
+            ▼
+process mappings ─ RssAnon/RssFile/RssShmem, PSS, VmSwap, faults
+            │ page charge / reclaim
+            ▼
+cgroup + kernel ─ memory.current/stat/events, PSI, reclaim, OOM
+            │
+            └─ SLO: latency, timeout, throughput, restart
+
+결론은 한 계층의 숫자가 아니라 위아래 신호가 함께 움직이는 인과 사슬로 낸다.</pre>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. 진단 상태 전이와 의사결정 트리</h2>
+        <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">[RSS/cgroup usage 증가]
+          │
+          ├─ heap live bytes·owner count도 요청당 계속 증가?
+          │       ├─ yes → [retention/leak 가설] → allocation stack·owner path 증명
+          │       └─ no
+          │
+          ├─ RssFile/Shmem 또는 bounded cache가 증가?
+          │       └─ yes → [cache/mapping 가설] → hit rate·bound·reclaimability 확인
+          │
+          ├─ free 뒤 allocator retained/arena가 크고 RSS가 유지?
+          │       └─ yes → [fragmentation/retention 가설] → size class·arena 실험
+          │
+          └─ memory PSI/reclaim/swap/memory.events가 증가?
+                  ├─ yes → [pressure 확인] → limit·working set·neighbors·I/O 분해
+                  └─ no  → 높은 footprint일 수 있으나 현재 pressure 증거는 부족
+
+[조치] load shed / bound 적용 / rollback / heap dump
+   │
+   ├─ live slope와 SLO 회복 → 원인 가설 강화
+   └─ RSS만 변함 → allocator/cache/kernel 계층을 다시 분해</pre>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. CS·kernel·allocator deep dive</h2>
+        <h3 style="margin:16px 0 8px;color:#f8fafc;font-size:17px;">5.1 leak은 “할당 후 free 누락”보다 넓다</h3>
+        <p style="margin:0;">C에서는 ownership을 잃은 allocation이 전형적이지만 GC 언어에서는 global map, listener, goroutine/thread, closure, timer가 object graph의 root가 되어 논리적으로 필요 없는 object를 reachable하게 만들 수 있다. heap profiler의 dominator/retained size와 allocation stack으로 “어떤 owner가 생존을 지배하는가”를 찾아야 한다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.2 RSS는 heap live bytes가 아니다</h3>
+        <p style="margin:0;">Linux <code style="color:#fde68a;">VmRSS</code>는 RssAnon+RssFile+RssShmem이다. executable·shared library·mapped file·shared memory도 포함하고, shared page는 여러 process RSS에 중복될 수 있다. <code style="color:#fde68a;">smaps_rollup</code>의 PSS와 anonymous/file/private/shared 구성을 함께 봐야 한다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.3 free는 ownership 반환이지 OS page 반환 보장이 아니다</h3>
+        <p style="margin:0;">allocator는 free chunk를 bin/tcache/arena에 두고 다음 allocation에 재사용할 수 있다. page 안에 작은 live chunk가 하나라도 남으면 page 전체를 unmap하기 어렵다. glibc의 <code style="color:#fde68a;">malloc_trim</code>은 free heap memory를 system에 반환하려 시도하지만 구현·layout에 따라 효과가 다르고, hot path에서 반복 호출하면 성능 비용이 생길 수 있다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.4 pressure는 “남은 byte”가 아니라 stall이다</h3>
+        <p style="margin:0;">kernel은 clean file cache drop, dirty writeback, anonymous swap, compaction으로 page를 확보한다. 확보에 성공해 OOM이 없어도 task가 기다리면 SLO가 무너진다. PSI <code style="color:#fde68a;">some</code>은 일부 task, <code style="color:#fde68a;">full</code>은 모든 non-idle task가 동시에 stall한 시간을 나타내므로 pressure의 직접 증거다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.5 leak과 pressure는 독립 축이지만 연결된다</h3>
+        <p style="margin:0;">작은 leak은 충분한 headroom에서 당장 pressure를 만들지 않을 수 있다. 반대로 leak 없는 workload도 traffic burst, 큰 working set, 낮은 limit, noisy neighbor 때문에 pressure를 겪는다. 장기 leak은 결국 headroom을 소모해 pressure와 OOM 확률을 높이므로 “현재 영향”과 “미래 위험”을 나눠 보고한다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.6 page cache는 사용 가능한 memory이면서 charge다</h3>
+        <p style="margin:0;">file cache는 필요하면 reclaim될 수 있지만 재접근하면 refault와 I/O가 발생한다. container의 <code style="color:#fde68a;">memory.current</code>에는 anonymous뿐 아니라 file/kernel 계열 사용량이 포함될 수 있으므로 process heap만 보고 limit 도달을 설명하면 안 된다. <code style="color:#fde68a;">memory.stat</code>의 anon/file/kernel과 workingset/refault 계열을 분해한다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.7 plateau는 정상일 수도, 느린 leak일 수도 있다</h3>
+        <p style="margin:0;">bounded cache와 warm-up은 상한에 도달한 뒤 plateau를 만든다. 그러나 짧은 window, 주기적 restart, GC 직전 snapshot은 느린 leak을 가릴 수 있다. traffic·tenant cardinality·GC cycle을 정규화하고 여러 주기의 post-GC baseline slope를 본다.</p>
+
+        <h3 style="margin:18px 0 8px;color:#f8fafc;font-size:17px;">5.8 heap dump는 증거이자 부하다</h3>
+        <p style="margin:0;">heap dump/profile은 stop-the-world, CPU, disk, network, 추가 allocation을 유발할 수 있고 개인정보를 포함할 수 있다. replica 하나를 격리하고 headroom·보존 위치·암호화·접근권한·삭제 정책을 확인한 뒤 수집한다. OOM 직전 무조건 full dump는 장애를 악화할 수 있다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. 증거 매트릭스: 한 지표로 결론내리지 않는다</h2>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:13px;">
+          <tr style="background:#15314a;color:#bae6fd;"><td>관찰</td><td>강해지는 가설</td><td>추가 확인</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">post-GC live bytes와 owner count가 traffic 보정 후 계속 증가</td><td style="border-top:1px solid #27435d;">application retention/leak</td><td style="border-top:1px solid #27435d;">dominator, allocation stack, request/tenant owner</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">live bytes는 안정, RSS/RssAnon만 높음</td><td style="border-top:1px solid #27435d;">allocator retention·fragmentation·native memory</td><td style="border-top:1px solid #27435d;">arena/size class, native stack, mmap, trim 실험</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">RssFile·cgroup file 증가, hit rate도 상승</td><td style="border-top:1px solid #27435d;">page/application cache</td><td style="border-top:1px solid #27435d;">bound, eviction, refault, cold-start 비용</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">PSI·reclaim·swap 증가, live slope는 0</td><td style="border-top:1px solid #27435d;">working set/limit/neighbor pressure</td><td style="border-top:1px solid #27435d;">memory.current/stat/events, node MemAvailable, peers</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">exit 137만 관찰</td><td style="border-top:1px solid #27435d;">SIGKILL 결과</td><td style="border-top:1px solid #27435d;">oom_kill delta, kernel log, orchestrator reason</td></tr>
+          <tr><td style="border-top:1px solid #27435d;">restart 뒤 RSS가 초기화되고 같은 시간/요청 수에 재발</td><td style="border-top:1px solid #27435d;">process lifetime 누적 원인</td><td style="border-top:1px solid #27435d;">heap diff와 allocation rate; restart는 완화일 뿐</td></tr>
+        </table>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. 실무 best practice</h2>
+        <ul style="margin:0;padding-left:22px;">
+          <li>RSS alert를 단독 사용하지 않고 application live bytes, cgroup usage/limit, PSI, SLO를 함께 대시보드에 배치한다.</li>
+          <li>cache·queue·batch·subscriber registry에는 최대 entry/byte/age와 eviction 정책을 명시하고 현재 cardinality를 노출한다.</li>
+          <li>heap profile은 두 시점의 diff를 traffic과 GC phase에 맞춰 비교한다. 큰 object 목록 하나만 보고 결론내리지 않는다.</li>
+          <li>process RSS 합 대신 PSS/cgroup/system accounting을 사용해 shared memory와 page cache의 중복 계산을 줄인다.</li>
+          <li>memory limit은 steady working set+native/runtime+page cache+burst headroom으로 산정하고 <code>memory.high</code>·load shedding으로 hard OOM 전에 제어한다.</li>
+          <li>rollback·restart는 즉시 SLO를 살리는 완화책으로 쓰되 restart interval, requests-to-failure, live slope 증거를 보존한다.</li>
+          <li>allocator tunable은 canary에서 latency·CPU·RSS·fragmentation을 함께 비교한다. 전역 변경이나 “RSS 감소” 하나만으로 채택하지 않는다.</li>
+          <li>heap dump·core·profile에는 secret/PII가 들어갈 수 있으므로 접근 제어, 암호화, retention, 삭제 절차를 운영한다.</li>
+        </ul>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. error handling runbook</h2>
+        <ol style="margin:0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">영향 제한:</strong> admission control, batch pause, traffic shift, safe replica restart로 OOM loop와 cascading failure를 막는다.</li>
+          <li><strong style="color:#f8fafc;">시각·범위 고정:</strong> process PID/start time, cgroup path, pod/node, deploy SHA, traffic, limit, OOM event timestamp를 기록한다.</li>
+          <li><strong style="color:#f8fafc;">네 계층 snapshot:</strong> heap/live/cache, allocator/native, proc smaps/status, cgroup current/stat/events/pressure와 SLO를 수집한다.</li>
+          <li><strong style="color:#f8fafc;">가설 분기:</strong> live slope, RSS composition, PSI/event를 기준으로 leak·cache·fragmentation·pressure 가설을 순위화한다.</li>
+          <li><strong style="color:#f8fafc;">작은 실험:</strong> traffic 고정, cache bound 축소, heap diff, replica별 allocator 설정처럼 한 변수만 바꿔 반증한다.</li>
+          <li><strong style="color:#f8fafc;">복구 검증:</strong> live slope와 PSI/SLO가 모두 정상화되는지 확인하고, 단순 RSS 하락만 성공 기준으로 삼지 않는다.</li>
+        </ol>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. 놓치기 쉬운 함정</h2>
+        <ul style="margin:0;padding-left:22px;">
+          <li><strong style="color:#fecaca;">RSS 증가=leak:</strong> file cache, shared page, allocator retention, native stack도 포함된다.</li>
+          <li><strong style="color:#fecaca;">free 후 RSS 유지=free 실패:</strong> allocator 재사용·fragmentation 때문에 OS 반환이 늦을 수 있다.</li>
+          <li><strong style="color:#fecaca;">GC가 있으니 leak 없음:</strong> 불필요한 object가 reachable하면 GC가 정확히 보존한다.</li>
+          <li><strong style="color:#fecaca;">OOM이 없으니 pressure 없음:</strong> reclaim stall과 thrashing은 OOM 전에 SLO를 무너뜨린다.</li>
+          <li><strong style="color:#fecaca;">container RSS=memory.current:</strong> metric 정의와 kernel/container runtime accounting을 확인해야 한다.</li>
+          <li><strong style="color:#fecaca;">heap dump 하나로 원인 확정:</strong> 정상 warm-up·traffic mix와 비교한 diff 및 owner path가 필요하다.</li>
+          <li><strong style="color:#fecaca;">restart로 해결:</strong> 회복은 되지만 증거가 사라지고 같은 lifetime 뒤 재발할 수 있다.</li>
+          <li><strong style="color:#fecaca;">malloc_trim을 주기 호출:</strong> allocator·workload별 latency/CPU trade-off를 검증하지 않으면 성능을 악화한다.</li>
+        </ul>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 30분 실습: retained와 bounded를 숫자로 분리</h2>
+        <p style="margin:0 0 10px;">각각 별도 process에서 4MiB block을 touch한다. <code style="color:#fde68a;">retained</code>는 모든 block을 list에 보존하고, <code style="color:#fde68a;">bounded</code>는 최대 2개만 보존한다. logical live bytes와 현재 RSS를 함께 기록한다. 총 할당 peak는 작고 system/cgroup 설정을 변경하지 않는다.</p>
+        <pre style="margin:0;white-space:pre;overflow-x:auto;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;">set -eu
+lab_dir="$(mktemp -d)"
+trap 'rm -rf "$lab_dir"' EXIT
+
+cat &gt; "$lab_dir/memory_review.py" &lt;&lt;'PY'
+import gc, os, subprocess, sys, time
+
+mode = sys.argv[1]
+if mode not in {"retained", "bounded"}:
+    raise SystemExit("mode must be retained or bounded")
+
+block_size = 4 * 1024 * 1024
+keep = []
+
+def rss_kib():
+    out = subprocess.check_output(
+        ["ps", "-o", "rss=", "-p", str(os.getpid())], text=True
+    )
+    return int(out.strip())
+
+print("mode,step,live_bytes,rss_kib")
+for step in range(1, 9):
+    block = bytearray(block_size)       # allocate and touch real pages
+    for offset in range(0, block_size, 4096):
+        block[offset] = step
+    keep.append(block)
+    if mode == "bounded" and len(keep) &gt; 2:
+        del keep[0]
+        gc.collect()
+    print(f"{mode},{step},{len(keep) * block_size},{rss_kib()}", flush=True)
+    time.sleep(0.05)
+
+keep.clear()
+gc.collect()
+time.sleep(0.1)
+print(f"{mode},released,0,{rss_kib()}", flush=True)
+PY
+
+python3 "$lab_dir/memory_review.py" retained &gt; "$lab_dir/retained.csv"
+python3 "$lab_dir/memory_review.py" bounded &gt; "$lab_dir/bounded.csv"
+cat "$lab_dir/retained.csv"
+cat "$lab_dir/bounded.csv"
+
+python3 - "$lab_dir/retained.csv" "$lab_dir/bounded.csv" &lt;&lt;'PY'
+import csv, sys
+def rows(path):
+    with open(path, newline="") as f:
+        return list(csv.DictReader(f))
+r, b = rows(sys.argv[1]), rows(sys.argv[2])
+assert int(r[-2]["live_bytes"]) == 32 * 1024 * 1024
+assert int(b[-2]["live_bytes"]) == 8 * 1024 * 1024
+assert int(r[-1]["live_bytes"]) == int(b[-1]["live_bytes"]) == 0
+print("logical_bounds_verified=1 rss_release_is_allocator_dependent=1")
+PY</pre>
+        <ol style="margin:12px 0 0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">0~10분:</strong> 두 CSV의 live_bytes slope와 RSS slope를 그려 retained는 owner가 계속 증가하고 bounded는 상한이 있음을 확인한다.</li>
+          <li><strong style="color:#f8fafc;">10~20분:</strong> released 행에서 live_bytes=0인데 RSS가 baseline으로 즉시 돌아오지 않을 수 있는 arena·fragmentation 이유를 설명한다.</li>
+          <li><strong style="color:#f8fafc;">20~30분:</strong> production이라면 cache hit rate, post-GC heap, smaps, memory.stat, PSI 중 무엇을 더 수집할지 진단표를 작성한다.</li>
+        </ol>
+        <p style="margin:10px 0 0;padding:10px 12px;background:#13283a;border-left:4px solid #5eead4;color:#c8e5f3;font-size:14px;"><strong>해석 안전장치:</strong> 이 실습의 retained mode는 의도적으로 reference를 보유한 모델이지 자동으로 업무상 leak이라는 뜻은 아니다. bounded mode의 RSS 감소 정도는 Python/allocator/OS마다 다르다. 판정 기준은 “RSS가 반드시 내려간다”가 아니라 logical owner의 bound가 검증된다는 점이다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. Linux production 관찰 명령</h2>
+        <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">pid=&lt;TARGET_PID&gt;
+date -Ins
+grep -E '^(VmPeak|VmSize|VmHWM|VmRSS|RssAnon|RssFile|RssShmem|VmSwap|Threads):' \
+  "/proc/$pid/status"
+grep -E '^(Rss|Pss|Pss_Anon|Pss_File|Pss_Shmem|Private_|Shared_|Anonymous|Swap):' \
+  "/proc/$pid/smaps_rollup"
+
+cat "/proc/$pid/cgroup"                # 0::/path 에서 cgroup v2 path 확인
+cat &lt;CGROUP_PATH&gt;/memory.current
+cat &lt;CGROUP_PATH&gt;/memory.peak
+grep -E '^(anon|file|kernel|pagetables|slab|workingset_|pgscan|pgsteal|swapcached) ' \
+  &lt;CGROUP_PATH&gt;/memory.stat
+cat &lt;CGROUP_PATH&gt;/memory.events
+cat &lt;CGROUP_PATH&gt;/memory.pressure
+cat /proc/pressure/memory
+
+# glibc process라면 application이 안전한 endpoint/signal로 수집하도록 설계
+# malloc_info() XML, heap profiler, LeakSanitizer는 구현/성능/보안 조건을 검토한다.</pre>
+        <p style="margin:10px 0 0;">두 snapshot은 PID 재사용을 피하려고 process start time과 함께 저장한다. <code style="color:#fde68a;">memory.events</code>는 subtree를 포함할 수 있고 <code style="color:#fde68a;">memory.events.local</code>은 local 사건이므로 의미를 구분한다. <code style="color:#fde68a;">smaps</code>는 권한과 scan 비용을 고려한다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 실패 시나리오: RSS만 보고 limit을 두 배로 늘린 사고</h2>
+        <p style="margin:0 0 8px;">API pod의 RSS가 매일 올라 OOMKilled 되자 팀은 “트래픽이 늘었다”며 limit만 두 배로 올렸다. OOM 간격은 길어졌지만 노드 pressure와 다른 pod의 latency가 악화됐다. post-GC heap diff에서는 tenant별 listener map의 entry가 줄지 않았고, deploy 이후 처리한 고유 tenant 수와 retained bytes가 선형 관계였다.</p>
+        <p style="margin:0;"><strong style="color:#f8fafc;">올바른 대응:</strong> traffic을 건전한 replica로 이동하고 failing replica의 heap profile·cgroup events·PSI를 보존한다. listener lifecycle에 unregister를 추가하고 tenant cardinality cap을 적용한다. canary에서 동일 request 수당 live slope=0, memory.current plateau, PSI/SLO 회복을 확인한다. limit 증가는 배포 여유를 만드는 임시 완화책으로만 기록한다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 대기업 면접 질문 3개</h2>
+        <ol style="margin:0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">“RSS가 계속 증가하면 memory leak이라고 판단할 수 있나요?”</strong><br>답변 포인트: RSS는 anonymous/file/shared와 allocator retention이 섞인 resident snapshot이다. post-GC live bytes·owner cardinality·PSS/smaps·cgroup stat을 같은 시간축에서 비교하고, allocation stack/dominator로 불필요한 생존 경로를 증명해야 한다.</li>
+          <li style="margin-top:10px;"><strong style="color:#f8fafc;">“free했는데 RSS가 줄지 않는 이유는 무엇인가요?”</strong><br>답변 포인트: allocator arena/tcache 재사용, size-class fragmentation, page 안의 live chunk, OS reclaim 정책 때문이다. free는 application ownership 반환이며 munmap/page 반환 계약이 아니다. trim/tunable은 canary에서 CPU·latency trade-off를 검증한다.</li>
+          <li style="margin-top:10px;"><strong style="color:#f8fafc;">“leak과 memory pressure를 어떻게 구분하고 대응합니까?”</strong><br>답변 포인트: leak은 lifetime/owner 결함, pressure는 reclaim stall 상태다. live slope와 heap diff로 leak을, PSI·memory.events·swap/reclaim과 SLO로 pressure를 확인한다. load shed/rollback으로 영향 제한 후 root cause를 고치고 두 축의 회복을 모두 검증한다.</li>
+        </ol>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 퀴즈·누적 리뷰</h2>
+        <ol style="margin:0;padding-left:22px;">
+          <li><strong style="color:#f8fafc;">GC 뒤 live bytes는 안정적인데 RSS만 높다. leak 확정인가?</strong> 아니다. allocator retention, fragmentation, native/mapped memory를 분해한다.</li>
+          <li><strong style="color:#f8fafc;">memory PSI full이 상승했다. 무엇을 뜻하는가?</strong> 모든 non-idle task가 동시에 memory stall인 시간이 생겨 thrashing에 가까운 생산성 손실이 있다는 뜻이다.</li>
+          <li><strong style="color:#f8fafc;">bounded cache는 leak이 아닌가?</strong> 명시된 byte/entry/age bound와 eviction이 지켜지고 가치가 검증되면 의도된 retention이다. bound가 traffic cardinality에 따라 무한히 커지면 다시 의심한다.</li>
+          <li><strong style="color:#f8fafc;">Day 27 연결:</strong> VSZ와 RSS 중 object lifetime을 직접 보여 주는 것은? 둘 다 아니다. runtime/heap owner 증거가 필요하다.</li>
+          <li><strong style="color:#f8fafc;">Day 26 연결:</strong> file cache가 dirty할 때 pressure가 심해지는 이유는? reclaim 전에 writeback I/O가 필요해 stall이 길어질 수 있다.</li>
+          <li><strong style="color:#f8fafc;">Week 4 회상:</strong> VA 예약→first touch→RSS→reclaim/OOM 흐름을 leak 진단에 연결해 60초 안에 설명해 본다.</li>
+        </ol>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">15. 다음 날 연결</h2>
+        <p style="margin:0;">Day 29는 Week 5의 시작인 <strong style="color:#f8fafc;">allocator, arena, free list, fragmentation</strong>이다. 오늘 “free했는데 RSS가 유지되는 이유”를 allocator metadata, bin/size class, split/coalesce, internal/external fragmentation의 구체적 구조로 내려가 설명한다.</p>
+
+        <h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">16. 공식·1차 출처</h2>
+        <ul style="margin:0;padding-left:22px;word-break:break-word;">
+          <li><a href="https://docs.kernel.org/admin-guide/cgroup-v2.html" style="color:#7dd3fc;">Linux Kernel — Control Group v2</a>: memory.current/stat/events/pressure, limit·reclaim·OOM의 계층적 의미.</li>
+          <li><a href="https://docs.kernel.org/accounting/psi.html" style="color:#7dd3fc;">Linux Kernel — Pressure Stall Information</a>: memory some/full stall과 load shedding 신호.</li>
+          <li><a href="https://docs.kernel.org/admin-guide/mm/concepts.html" style="color:#7dd3fc;">Linux Kernel — Memory Management Concepts</a>: virtual memory, reclaim, compaction, OOM 개요.</li>
+          <li><a href="https://man7.org/linux/man-pages/man5/proc_pid_status.5.html" style="color:#7dd3fc;">Linux man-pages — proc_pid_status(5)</a>: VmRSS, RssAnon/File/Shmem, VmHWM와 snapshot 정확도.</li>
+          <li><a href="https://man7.org/linux/man-pages/man5/proc_pid_smaps.5.html" style="color:#7dd3fc;">Linux man-pages — proc_pid_smaps(5)</a>: mapping별 RSS/PSS/private/shared/anonymous/swap.</li>
+          <li><a href="https://man7.org/linux/man-pages/man3/malloc_info.3.html" style="color:#7dd3fc;">Linux man-pages — malloc_info(3)</a>: glibc allocator 상태를 XML로 내보내는 인터페이스.</li>
+          <li><a href="https://man7.org/linux/man-pages/man3/malloc_trim.3.html" style="color:#7dd3fc;">Linux man-pages — malloc_trim(3)</a>: free heap memory를 system에 반환하려는 동작과 제한.</li>
+          <li><a href="https://sourceware.org/glibc/manual/latest/html_node/Memory-Allocation-Tunables.html" style="color:#7dd3fc;">GNU C Library — Memory Allocation Tunables</a>: trim threshold, mmap threshold, arena, tcache의 구현별 조정점.</li>
+          <li><a href="https://clang.llvm.org/docs/LeakSanitizer.html" style="color:#7dd3fc;">Clang — LeakSanitizer</a>: native code leak 검출의 공식 사용법과 platform 조건.</li>
+        </ul>
+
+        <p style="margin:28px 0 0;padding-top:18px;border-top:1px solid #27435d;color:#8fb3c9;font-size:13px;">Day 28 완료 기준: RSS 증가를 leak으로 단정하지 않고, owner/live bytes·allocator·mapping·cgroup/PSI의 네 계층 증거로 원인과 현재 pressure를 분리한 뒤 안전한 완화·검증 계획을 설명할 수 있다.</p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>
