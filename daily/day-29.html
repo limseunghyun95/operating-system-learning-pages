@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Operating System 심화 커리큘럼 Day 29 - allocator, arena, free list, fragmentation</title></head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.72;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#07111f;"><tr><td align="center" style="padding:24px 12px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:680px;background:#0f1d2e;border:1px solid #23415d;border-radius:18px;overflow:hidden;">
+<tr><td style="padding:30px 28px 22px;background:#102a43;border-bottom:1px solid #28506f;">
+<div style="font-size:13px;letter-spacing:.12em;color:#5eead4;font-weight:800;">OPERATING SYSTEM · DAY 29 / 63 · ALLOCATION</div>
+<h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">allocator, arena, free list, fragmentation</h1>
+<p style="margin:0;color:#b9d6eb;">한 줄 요약: <strong style="color:#f8fafc;">allocator는 매 요청마다 kernel에서 page를 받지 않고 큰 영역을 arena로 관리하며, 크기별 free list에서 chunk를 재사용·분할·병합한다.</strong> 이 속도 최적화는 metadata·retention·내부/외부 fragmentation·arena contention이라는 비용을 만든다.</p>
+</td></tr><tr><td style="padding:26px 28px 34px;">
+
+<h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:14px;">
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;width:30%;">allocator</td><td style="border-bottom:1px solid #27435d;">malloc/new 요청에 block을 주고 free/delete된 block을 재사용하는 runtime/library 구성요소.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">arena</td><td style="border-bottom:1px solid #27435d;">allocator가 독립 관리하는 memory 영역과 metadata 집합. 여러 arena는 lock contention을 줄이지만 빈 공간을 고립시킬 수 있다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">chunk / block</td><td style="border-bottom:1px solid #27435d;">allocator 관리 단위. user payload 외에 size·상태 metadata와 alignment padding이 붙을 수 있다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">free list / bin</td><td style="border-bottom:1px solid #27435d;">사용 가능한 chunk를 연결하거나 size class별로 분류한 자료구조.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">size class</td><td style="border-bottom:1px solid #27435d;">요청을 8, 16, 32… 같은 bucket으로 반올림해 빠르게 재사용하는 분류.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">split / coalesce</td><td style="border-bottom:1px solid #27435d;">큰 free chunk를 요청과 remainder로 나누는 동작 / 주소상 이웃한 free chunk를 합치는 동작.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">internal fragmentation</td><td style="border-bottom:1px solid #27435d;">할당 chunk 내부에서 alignment·size class·metadata로 생기는 미사용 공간.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">external fragmentation</td><td style="border-bottom:1px solid #27435d;">총 free byte는 충분하지만 작은 hole로 흩어져 큰 연속 요청을 만족하지 못하는 상태.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">alignment</td><td style="border-bottom:1px solid #27435d;">주소를 특정 byte 배수에 맞추는 ABI/CPU 조건. padding을 만들 수 있다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">tcache</td><td style="border-bottom:1px solid #27435d;">작은 free chunk를 thread별로 보관해 lock 없이 재사용하는 cache. 속도 대신 retained memory가 늘 수 있다.</td></tr>
+<tr><td style="color:#7dd3fc;font-weight:700;">brk / mmap</td><td>allocator가 OS에서 주소 공간을 얻는 대표 경로. 구현·크기 정책에 따라 선택한다.</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 물류창고의 박스 재사용</h2>
+<p style="margin:0;">매 주문마다 공장(kernel)에 박스를 새로 만들게 하면 느리다. allocator는 큰 창고(arena)를 빌려 반납된 박스(free chunk)를 크기별 선반(bin)에 둔다. 13짜리 물건을 16짜리 박스에 넣어 남는 3은 <strong style="color:#f8fafc;">내부 fragmentation</strong>, 빈 공간 합은 48인데 16짜리 hole 셋으로 흩어져 24짜리를 못 넣는 것은 <strong style="color:#f8fafc;">외부 fragmentation</strong>이다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: malloc fast path와 slow path</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">application malloc(request)
+  │ overflow 검사 → alignment/metadata 포함 size class 계산
+  ▼
+thread cache ─ hit → pop chunk → user pointer
+  │ miss
+  ▼
+arena 선택/lock → segregated free lists 탐색
+  ├─ exact chunk → unlink
+  ├─ larger chunk → split → remainder 재등록
+  └─ 없음 → arena extend 또는 large mmap → user pointer
+
+free(pointer)
+  → metadata/owner 확인 → tcache/bin 등록 → 인접 free면 coalesce
+  → top/extent 반환 조건이면 brk 축소·munmap·madvise 가능
+
+POSIX가 보장하는 것은 API 계약이며 arena/bin/tcache는 구현 세부다.</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. chunk 상태 전이</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">[OS/arena free extent] ─ split ─→ [ALLOCATED: metadata|payload|padding]
+                                    │ free exactly once
+                                    ▼
+[OS 반환] ← trim/unmap 조건 ← [CACHED/FREE] ─ adjacent free → [COALESCED]
+                                │ reuse
+                                └──────────────────────────→ [ALLOCATED]
+
+금지 전이: FREE 후 접근(use-after-free), 두 번 free, payload overflow로 metadata 훼손,
+realloc 실패 결과를 원본 pointer에 덮어써 allocation을 잃는 것. 모두 undefined behavior다.</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. CS·allocator·kernel deep dive</h2>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.1 왜 malloc마다 syscall하지 않는가</h3><p style="margin:0;">syscall, VMA 변경, page-table 준비와 synchronization은 작은 object보다 비쌀 수 있다. allocator는 OS에서 큰 단위로 확보해 user-space metadata만으로 대부분 요청을 처리한다. malloc이 kernel 진입 없이 끝나도 first touch page fault는 나중에 발생할 수 있다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.2 size class는 탐색 시간을 공간으로 산다</h3><p style="margin:0;">제한된 class는 빠른 pop/push와 높은 재사용률을 주지만 request 17을 class 32로 반올림하는 내부 낭비를 만든다. 요청 크기와 allocator usable size를 구분해야 한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.3 fit policy는 시간·공간·locality trade-off다</h3><p style="margin:0;">first-fit은 탐색이 짧지만 앞쪽에 hole을 남길 수 있고 best-fit은 더 탐색하며 tiny remainder를 만들 수 있다. segregated fit, buddy, slab은 workload의 size/lifetime 분포에 맞춰 다른 균형을 택한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.4 coalescing에도 metadata가 필요하다</h3><p style="margin:0;">앞뒤 chunk의 size/free 상태를 알아야 병합할 수 있다. boundary tag 같은 metadata는 빠른 이웃 탐색을 주지만 공간을 쓰고 overflow 공격면이 된다. integrity check가 있어도 memory-safety bug가 안전해지는 것은 아니다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.5 arena는 contention을 fragmentation으로 교환한다</h3><p style="margin:0;">global heap lock 하나는 multicore에서 병목이다. 여러 arena와 tcache는 hot path lock 경쟁을 줄이지만 arena마다 free 공간과 cache가 고립된다. arena 수를 줄이면 RSS는 낮아져도 allocation p99가 나빠질 수 있다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.6 large allocation은 별도 mapping이 유리할 수 있다</h3><p style="margin:0;">큰 object를 작은 chunk와 섞지 않고 mmap extent로 분리하면 free 시 독립 unmap하기 쉽다. 대신 page alignment 낭비, VMA 수, syscall·TLB 비용이 늘 수 있다. threshold는 구현·버전별 정책이다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.7 total free와 largest free는 다르다</h3><p style="margin:0;">외부 fragmentation은 total_free보다 largest_free와 요청 크기의 관계다. 실제 allocator는 새 extent를 얻어 성공할 수 있지만 RSS/VA가 늘고 기존 hole은 남는다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.8 free와 OS 반환은 다른 계약이다</h3><p style="margin:0;">free는 allocator 재사용 가능 상태로 돌린다. OS 반환은 page/extent 경계, top chunk, decay/trim 정책에 달렸다. malloc_trim과 tunable은 correctness API가 아닌 구현별 최적화 수단이다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.9 lifetime interleaving이 fragmentation을 만든다</h3><p style="margin:0;">long-lived 작은 object 사이에 short-lived 큰 object가 반복되면 page 전체 반환이 막힌다. 평균 크기만 보지 말고 size×lifetime×thread 분포와 cross-thread free를 profile한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. 수치로 구분하기</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:13px;">
+<tr style="background:#15314a;color:#bae6fd;"><td>질문</td><td>예시</td><td>해석</td></tr>
+<tr><td style="border-top:1px solid #27435d;">내부 낭비</td><td style="border-top:1px solid #27435d;">17→class 32: 15B</td><td style="border-top:1px solid #27435d;">chunk 안의 round-up</td></tr>
+<tr><td style="border-top:1px solid #27435d;">외부 낭비</td><td style="border-top:1px solid #27435d;">total 48, largest 16, request 24 실패</td><td style="border-top:1px solid #27435d;">hole 분산</td></tr>
+<tr><td style="border-top:1px solid #27435d;">allocator 증폭</td><td style="border-top:1px solid #27435d;">reserved 300/live 100=3×</td><td style="border-top:1px solid #27435d;">metadata·cache·hole 포함, 정의 명시</td></tr>
+<tr><td style="border-top:1px solid #27435d;">OS 증폭</td><td style="border-top:1px solid #27435d;">RSS 240/live 100=2.4×</td><td style="border-top:1px solid #27435d;">stack/file/shared도 분해</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. 실무 best practice</h2>
+<ul style="margin:0;padding-left:22px;"><li>allocation rate, live bytes, size/lifetime/thread 분포, allocator retained, RSS를 같은 시간축에 둔다.</li><li>pool·cache에는 byte/count bound를 두고 임시 allocation은 batching/region/stack 가능성을 검토한다.</li><li>allocator 교체와 arena/tcache/decay 조정은 canary에서 throughput·p99·CPU·RSS를 함께 비교한다.</li><li>size multiplication overflow를 먼저 검사하고 C에서는 calloc/reallocarray 같은 checked 경로를 고려한다.</li><li>realloc 결과는 임시 pointer에 받고 성공했을 때만 원본을 교체한다.</li><li>ENOMEM은 partial rollback, backpressure, bounded retry, graceful degradation으로 처리한다.</li><li>ASan/LSan·fuzzing을 CI/staging에 사용하고 production overhead와 platform 조건을 확인한다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. error handling runbook</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;">NULL/ENOMEM:</strong> request size·overflow·limit을 기록하고 partial state를 rollback한다.</li><li><strong style="color:#f8fafc;">realloc 실패:</strong> 원본 pointer를 보존하고 cleanup 또는 작은 대체 경로로 간다.</li><li><strong style="color:#f8fafc;">live 안정·RSS 증가:</strong> arena/bin/size class, allocator retained, thread 수, PSS를 분해한다.</li><li><strong style="color:#f8fafc;">heap corruption:</strong> traffic 격리·rollback 후 core/ASan stack을 보존한다. 손상 process를 계속 쓰지 않는다.</li><li><strong style="color:#f8fafc;">allocation p99 증가:</strong> arena mutex, cache miss, syscall/fault, profile overhead를 나눠 한 변수씩 canary한다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. 놓치기 쉬운 함정</h2>
+<ul style="margin:0;padding-left:22px;"><li><strong style="color:#fecaca;">free 합이 충분하면 성공:</strong> largest contiguous chunk가 작을 수 있다.</li><li><strong style="color:#fecaca;">free 즉시 RSS 감소:</strong> allocator 보관과 OS 반환은 별개다.</li><li><strong style="color:#fecaca;">arena가 많을수록 빠름:</strong> contention은 줄지만 memory overhead가 커진다.</li><li><strong style="color:#fecaca;">best-fit이면 해결:</strong> tiny remainder와 lifetime 문제가 남는다.</li><li><strong style="color:#fecaca;">realloc을 원본에 바로 대입:</strong> 실패 시 pointer를 잃는다.</li><li><strong style="color:#fecaca;">allocator metric을 구현 간 동일시:</strong> allocated/active/resident/retained 정의가 다르다.</li><li><strong style="color:#fecaca;">tunable fleet 즉시 적용:</strong> 안정 ABI가 아니며 latency 회귀가 가능하다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 30분 실습: split·hole·coalesce simulator</h2>
+<p style="margin:0 0 10px;">64-unit arena에 A16, B8, C16, D8을 할당한다. A와 C를 free하면 총 free 48, largest 16이라 request 24가 실패한다. B를 free해 coalesce하면 largest 40이 되어 성공한다.</p>
+<pre style="margin:0;white-space:pre;overflow-x:auto;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;">set -eu
+lab_dir="$(mktemp -d)"; trap 'rm -rf "$lab_dir"' EXIT
+cat &gt; "$lab_dir/lab.py" &lt;&lt;'PY'
+class Arena:
+    def __init__(self, size): self.blocks = [[0, size, None]]
+    def alloc(self, owner, need):
+        for i, (start, size, used) in enumerate(self.blocks):
+            if used is None and size &gt;= need:
+                self.blocks[i] = [start, need, owner]
+                if size &gt; need: self.blocks.insert(i+1,[start+need,size-need,None])
+                return start
+        return None
+    def free(self, owner):
+        for b in self.blocks:
+            if b[2] == owner: b[2] = None; self.coalesce(); return
+        raise KeyError(owner)
+    def coalesce(self):
+        out=[]
+        for b in self.blocks:
+            if out and out[-1][2] is None and b[2] is None: out[-1][1]+=b[1]
+            else: out.append(b[:])
+        self.blocks=out
+    def stats(self):
+        holes=[size for _,size,used in self.blocks if used is None]
+        return sum(holes),max(holes,default=0),len(holes)
+    def show(self):
+        return " | ".join(f"{s}:{n}:{o or 'FREE'}" for s,n,o in self.blocks)
+a=Arena(64)
+for owner,size in [("A",16),("B",8),("C",16),("D",8)]: assert a.alloc(owner,size) is not None
+a.free("A"); a.free("C")
+assert a.stats()==(48,16,3) and a.alloc("X",24) is None
+print("before=FAIL total_free=48 largest_free=16",a.show())
+a.free("B")
+assert a.stats()==(56,40,2) and a.alloc("X",24) is not None
+print("after=SUCCESS",a.show())
+requests=[1,9,17,33]; classes=[8,16,32,64]
+print("internal_requested=60 reserved=120 waste=60")
+assert sum(requests)==60 and sum(classes)==120
+PY
+python3 "$lab_dir/lab.py"</pre>
+<ol style="margin:12px 0 0;padding-left:22px;"><li><strong style="color:#f8fafc;">0~10분:</strong> block map과 split 주소를 손으로 그린다.</li><li><strong style="color:#f8fafc;">10~20분:</strong> first-fit을 best-fit으로 바꿔 hole 분포를 비교한다.</li><li><strong style="color:#f8fafc;">20~30분:</strong> arena를 둘로 나누면 free 공간이 왜 합쳐지지 않는지 latency/RSS trade-off로 설명한다.</li></ol>
+<p style="margin:10px 0 0;padding:10px 12px;background:#13283a;border-left:4px solid #5eead4;color:#c8e5f3;font-size:14px;"><strong>모델 한계:</strong> 실제 glibc·jemalloc 구조를 복제한 것이 아니라 split/coalesce와 fragmentation 불변식을 이해하는 결정적 모델이다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. production 관찰</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">pid=&lt;TARGET_PID&gt;
+grep -E '^(VmSize|VmRSS|RssAnon|RssFile|RssShmem|VmData|VmSwap|Threads):' "/proc/$pid/status"
+grep -E '^(Rss|Pss|Pss_Anon|Pss_File|Private_|Anonymous|Swap):' "/proc/$pid/smaps_rollup"
+
+# glibc application의 안전한 debug endpoint: malloc_info(0, stream)
+# allocator exporter는 정의를 기록: allocated / active / resident / retained
+# 함께 볼 것: heap live bytes, allocation rate/p99, cache/queue bytes, thread 수</pre>
+<p style="margin:10px 0 0;">통계 수집 자체가 lock·I/O·큰 응답을 만들 수 있으므로 incident 중 호출 주기를 제한하고 allocator 종류·버전, traffic, GC phase와 함께 저장한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 실패 시나리오</h2>
+<p style="margin:0;">live heap은 2GiB인데 retained가 6GiB인 multi-threaded service에서 arena 수를 1로 줄이자 RSS는 감소했지만 arena mutex contention으로 allocation p99와 request latency가 급증했다. 즉시 rollback하고 size×lifetime×thread profile을 수집한다. buffer pool에 byte bound를 두고 worker 수를 검토한 뒤 arena 후보를 canary해 RSS, mutex wait, CPU, p99를 함께 비교한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 대기업 면접 질문 3개</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;">malloc은 어떻게 빠른가?</strong><br>답변 포인트: arena 확보, size class, tcache/bin fast path, split/coalesce, 부족 시 brk/mmap slow path. POSIX 계약과 구현 세부를 구분한다.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">internal/external fragmentation 차이는?</strong><br>답변 포인트: chunk 내부 round-up 대 free hole 분산. requested/usable과 total/largest free로 측정한다.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">arena를 늘리는 trade-off는?</strong><br>답변 포인트: lock contention 감소 대 metadata/cache/free-space 고립, RSS 증가. canary에서 p99·CPU·RSS를 함께 본다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 퀴즈·누적 리뷰</h2>
+<ol style="margin:0;padding-left:22px;"><li>total free 1GiB인데 64MiB 요청이 실패할 수 있는가? largest suitable chunk가 작고 새 extent도 못 얻으면 가능하다.</li><li>17-byte 요청에 32-byte class면? 최소 15-byte internal fragmentation이다.</li><li>free는 munmap과 같은가? 아니다. allocator 재사용과 OS 반환은 별도 전이다.</li><li>Day 28 연결: live 안정·RSS 증가 원인에 arena/tcache retention과 fragmentation을 추가한다.</li><li>Day 25 연결: OS 확보 경로는 brk 기반 heap과 mmap이며 구현 정책에 따라 다르다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">15. 다음 날 연결</h2>
+<p style="margin:0;">Day 30은 <strong style="color:#f8fafc;">slab/slub과 kernel object allocation</strong>이다. user-space size class 재사용을 kernel이 inode·dentry·task 같은 typed object와 per-CPU cache에 어떻게 적용하는지 비교한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">16. 공식·1차 출처</h2>
+<ul style="margin:0;padding-left:22px;word-break:break-word;"><li><a href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/malloc.html" style="color:#7dd3fc;">POSIX malloc</a>: allocation·alignment·lifetime·failure 계약.</li><li><a href="https://man7.org/linux/man-pages/man3/malloc.3.html" style="color:#7dd3fc;">malloc(3)</a>: malloc/calloc/realloc/free와 overflow·errno.</li><li><a href="https://sourceware.org/glibc/manual/latest/html_node/Memory-Allocation-Tunables.html" style="color:#7dd3fc;">glibc Memory Allocation Tunables</a>: arena, tcache, mmap/trim threshold.</li><li><a href="https://sourceware.org/glibc/manual/latest/html_node/Memory-Allocation-Probes.html" style="color:#7dd3fc;">glibc Memory Allocation Probes</a>: arena 생성·재사용·wait·retry.</li><li><a href="https://man7.org/linux/man-pages/man3/malloc_info.3.html" style="color:#7dd3fc;">malloc_info(3)</a>: arena XML 관찰.</li><li><a href="https://man7.org/linux/man-pages/man3/mallinfo.3.html" style="color:#7dd3fc;">mallinfo2(3)</a>: in-use/free/mmap field와 한계.</li><li><a href="https://man7.org/linux/man-pages/man3/malloc_trim.3.html" style="color:#7dd3fc;">malloc_trim(3)</a>: free heap의 OS 반환 시도.</li><li><a href="https://man7.org/linux/man-pages/man3/mallopt.3.html" style="color:#7dd3fc;">mallopt(3)</a>: trim/mmap/arena trade-off.</li><li><a href="https://jemalloc.net/jemalloc.3.html" style="color:#7dd3fc;">jemalloc(3)</a>: multiple arena와 fragmentation/통계.</li></ul>
+<p style="margin:28px 0 0;padding-top:18px;border-top:1px solid #27435d;color:#8fb3c9;font-size:13px;">Day 29 완료 기준: malloc/free의 fast/slow path를 그리고 size class·split·coalesce·arena가 latency와 fragmentation에 미치는 영향을 수치와 production 지표로 설명할 수 있다.</p>
+</td></tr></table></td></tr></table>
+</body></html>
