@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-08-31T09:01:40+09:00",
+  "updatedAt": "2026-09-01T09:01:15+09:00",
   "lessons": [
     {
       "day": 1,
@@ -266,6 +266,15 @@
       "path": "day-29.html",
       "kind": "lesson",
       "publishedAt": "2026-08-31T09:01:40+09:00"
+    },
+    {
+      "day": 30,
+      "week": 5,
+      "title": "slab/slub과 kernel object allocation",
+      "summary": "buddy가 공급한 page를 SLUB이 typed object와 per-CPU freelist로 재사용하는 경로부터 GFP context, partial slab, reclaim·NUMA·실패 처리까지 연결합니다.",
+      "path": "day-30.html",
+      "kind": "lesson",
+      "publishedAt": "2026-09-01T09:01:15+09:00"
     }
   ]
 }

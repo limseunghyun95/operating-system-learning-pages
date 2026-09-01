@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Operating System 심화 커리큘럼 Day 30 - slab/slub과 kernel object allocation</title></head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.72;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#07111f;"><tr><td align="center" style="padding:24px 12px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:680px;background:#0f1d2e;border:1px solid #23415d;border-radius:18px;overflow:hidden;">
+<tr><td style="padding:30px 28px 22px;background:#102a43;border-bottom:1px solid #28506f;">
+<div style="font-size:13px;letter-spacing:.12em;color:#5eead4;font-weight:800;">OPERATING SYSTEM · DAY 30 / 63 · KERNEL MEMORY</div>
+<h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">slab/slub과 kernel object allocation</h1>
+<p style="margin:0;color:#b9d6eb;">한 줄 요약: <strong style="color:#f8fafc;">buddy allocator가 page를 공급하면 SLUB은 이를 고정 크기 object로 잘라 per-CPU freelist에서 재사용한다.</strong> 빠른 할당의 대가는 partial slab 단편화·NUMA locality·GFP context·reclaim 가능성까지 함께 관리해야 한다는 것이다.</p>
+</td></tr><tr><td style="padding:26px 28px 34px;">
+
+<h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:14px;">
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;width:30%;">page allocator / buddy</td><td style="border-bottom:1px solid #27435d;">물리 page를 2의 거듭제곱 묶음(order)으로 주고 합치는 하위 allocator. SLUB이 새 slab을 만들 때 page를 여기서 받는다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">slab</td><td style="border-bottom:1px solid #27435d;">하나 이상의 page를 같은 종류·크기의 kernel object 여러 개로 나눈 저장 단위.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">cache / kmem_cache</td><td style="border-bottom:1px solid #27435d;">특정 object의 크기·정렬·생성 정책과 slab 목록을 관리하는 typed object cache.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">object</td><td style="border-bottom:1px solid #27435d;">inode·dentry·task_struct 같은 kernel 자료구조 한 개. 같은 cache의 object는 같은 allocation size를 쓴다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">kmalloc</td><td style="border-bottom:1px solid #27435d;">임의 byte 크기를 요청하면 알맞은 generic size-class cache에서 object를 주는 kernel API.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">SLAB / SLUB</td><td style="border-bottom:1px solid #27435d;">서로 위아래 계층이 아니라 kernel build에서 선택하는 slab allocator 구현들. 현대 Linux는 보통 SLUB을 사용하지만 설정을 확인해야 한다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">freelist</td><td style="border-bottom:1px solid #27435d;">free object 주소를 잇는 목록. SLUB의 per-CPU fast path는 공용 lock 경쟁을 줄인다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">partial / full slab</td><td style="border-bottom:1px solid #27435d;">free와 in-use object가 섞인 slab / 모든 object가 사용 중인 slab. object 하나만 살아도 page 전체 반환이 막힐 수 있다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">GFP flags</td><td style="border-bottom:1px solid #27435d;">할당자가 sleep·reclaim·I/O를 허용하는지, 어느 memory 영역을 쓸지 표현하는 allocation context 계약.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">reclaim / shrinker</td><td style="border-bottom:1px solid #27435d;">memory pressure 때 재생성 가능한 cache object를 버리는 과정 / subsystem이 회수 후보를 알리는 callback 체계.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">red zone / poison</td><td style="border-bottom:1px solid #27435d;">경계 침범·use-after-free 탐지를 위해 guard pattern을 넣는 debug 기법. 메모리·CPU 비용이 있다.</td></tr>
+<tr><td style="color:#7dd3fc;font-weight:700;">memcg accounting</td><td>allocation을 memory cgroup 사용량에 청구하는 것. kernel memory도 container limit과 OOM에 영향을 줄 수 있다.</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 부품 전용 트레이</h2>
+<p style="margin:0;">buddy는 창고에서 page 단위 선반을 준다. SLUB은 선반을 inode 전용, dentry 전용처럼 같은 크기의 칸(object)으로 나눈 트레이(slab)로 만든다. 현재 CPU의 트레이에 빈 칸이 있으면 lock 없이 빠르게 꺼내고, 없으면 node의 partial 목록이나 buddy까지 내려간다. 단, 트레이마다 부품 하나씩만 남으면 총 live object는 적어도 많은 page가 고정된다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: API에서 물리 page까지</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">kernel subsystem
+  ├─ kmem_cache_alloc(cache, GFP_*)  typed object
+  └─ kmalloc(bytes, GFP_*)           generic size cache
+                 │
+                 ▼
+        CPU-local freelist ─ hit → object 반환       FAST PATH
+                 │ empty
+                 ▼
+        node partial slab → freelist refill
+                 │ 없음
+                 ▼
+        page allocator / buddy → 새 slab 구성        SLOW PATH
+                 │ pressure
+                 ├─ direct/kswapd reclaim, compaction (flag에 따라)
+                 └─ 실패 → NULL 또는 호출 계약에 따른 치명적 결과
+
+kfree / kmem_cache_free → CPU/node freelist → slab이 완전히 비면 page 반환 후보
+
+중요: SLUB은 buddy 위의 object allocator다. SLAB과 SLUB은 순차 계층이 아니라 대체 구현이다.</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. object·slab 상태 전이</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">[EMPTY slab: all FREE]
+       │ allocate object
+       ▼
+[PARTIAL: FREE + IN-USE] ─ 마지막 FREE 사용 → [FULL: all IN-USE]
+       ▲                                      │ free one
+       └──────────────────────────────────────┘
+       │ 마지막 IN-USE free
+       ▼
+[EMPTY] ─ allocator 정책·cache 상태 → buddy에 page 반환 가능
+
+금지 전이: FREE 후 접근, 다른 cache/API로 free, 두 번 free, cache destroy 전 live object 잔존.
+주의: free object가 생겼다는 것과 물리 page가 즉시 회수됐다는 것은 다르다.</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. CS·kernel·hardware deep dive</h2>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.1 왜 typed object cache인가</h3><p style="margin:0;">같은 크기·정렬의 object를 반복 사용하면 매번 page를 쪼개고 metadata를 찾는 비용이 줄고, 최근 사용한 cache line과 초기화된 구조를 재사용할 수 있다. custom cache는 constructor·alignment·debug 정책도 묶지만, 생성 자체가 공짜는 아니므로 generic kmalloc이면 충분한 작은 수요에 남발하지 않는다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.2 fast path의 핵심은 per-CPU locality</h3><p style="margin:0;">현재 CPU freelist의 head를 갱신하는 경로는 공유 lock·remote cache-line bouncing을 줄인다. 하지만 CPU별 free object가 분산되면 다른 CPU가 새 slab을 요청하는 동안 전체로는 빈 object가 남을 수 있다. 성능과 memory footprint의 교환이다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.3 kmalloc은 generic slab cache를 고른다</h3><p style="margin:0;">요청 byte는 정렬과 size class에 맞는 실제 allocation 크기로 반올림된다. Linux의 <code style="color:#bae6fd;">kmalloc_size_roundup()</code> 같은 helper로 반복 요청 크기를 맞출 수 있지만, class 경계는 architecture·설정·버전 세부이므로 숫자를 ABI처럼 가정하면 안 된다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.4 두 종류의 공간 낭비</h3><p style="margin:0;">요청보다 큰 object slot·정렬·debug metadata는 내부 낭비다. live object가 여러 partial slab에 흩어져 page 반환을 막는 것은 slab-level 단편화다. <code style="color:#bae6fd;">active_objs × objsize</code>만으로 실제 page·metadata 비용을 정확히 계산할 수 없다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.5 GFP flag는 성능 hint가 아니라 실행 문맥 계약</h3><p style="margin:0;"><code style="color:#bae6fd;">GFP_KERNEL</code>은 일반적으로 sleep과 direct reclaim을 허용한다. atomic/interrupt 또는 lock 제약 문맥에서는 잠들 수 없는 flag가 필요하지만 <code style="color:#bae6fd;">GFP_NOWAIT</code>·<code style="color:#bae6fd;">GFP_ATOMIC</code>은 더 쉽게 실패하고 reserve를 소모할 수 있다. flag로 설계 결함을 숨기지 말고 preallocation·mempool·workqueue 전환을 검토한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.6 reclaim recursion과 deadlock</h3><p style="margin:0;">filesystem·block layer가 lock을 잡고 allocation했는데 reclaim이 같은 경로로 재진입하면 deadlock이 생길 수 있다. Linux는 scoped nofs/noio API로 현재 문맥의 reclaim 범위를 제한하는 방식을 권장한다. 무작정 더 강한 flag로 바꾸는 대신 lock graph와 reclaim call chain을 확인한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.7 NUMA에서는 어느 node의 slab인지도 성능이다</h3><p style="margin:0;">local node의 object는 remote memory보다 latency와 interconnect traffic이 낮다. allocating CPU와 consuming CPU가 다르거나 object가 오래 이동하면 locality가 깨진다. 단순 cache hit율뿐 아니라 NUMA placement, remote access, cross-CPU free를 함께 본다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.8 reclaimable은 즉시 free라는 뜻이 아니다</h3><p style="margin:0;"><code style="color:#bae6fd;">SReclaimable</code>은 압박 시 회수 가능성이 있는 slab이고 <code style="color:#bae6fd;">SUnreclaim</code>은 그렇지 않은 영역이다. reclaimable object도 참조·dirty state·shrinker 비용 때문에 바로 사라지지 않는다. cache별 growth와 reclaim throughput을 시간축으로 확인한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.9 안전성 debug는 layout과 timing을 바꾼다</h3><p style="margin:0;">redzone, poisoning, user tracking, sanity check는 overflow·double free의 단서를 주지만 object 크기와 page당 object 수, latency를 바꾼다. 재현 환경·canary에서 목적에 맞게 켜고 결과에 debug overhead를 기록한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. 수치로 읽는 slab pressure</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:13px;">
+<tr style="background:#15314a;color:#bae6fd;"><td>지표</td><td>질문</td><td>주의</td></tr>
+<tr><td style="border-top:1px solid #27435d;">active_objs / num_objs</td><td style="border-top:1px solid #27435d;">slot 활용률은?</td><td style="border-top:1px solid #27435d;">byte·page 비용과 정확히 같지 않다.</td></tr>
+<tr><td style="border-top:1px solid #27435d;">objsize / objperslab / pagesperslab</td><td style="border-top:1px solid #27435d;">object packing은?</td><td style="border-top:1px solid #27435d;">정렬·metadata·debug 설정 반영.</td></tr>
+<tr><td style="border-top:1px solid #27435d;">SReclaimable / SUnreclaim</td><td style="border-top:1px solid #27435d;">회수 가능성이 있는가?</td><td style="border-top:1px solid #27435d;">즉시 회수량 보장은 아니다.</td></tr>
+<tr><td style="border-top:1px solid #27435d;">bytes_req / bytes_alloc</td><td style="border-top:1px solid #27435d;">kmalloc round-up은?</td><td style="border-top:1px solid #27435d;">trace overhead와 sampling 기간 명시.</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. 실무 best practice</h2>
+<ul style="margin:0;padding-left:22px;"><li><code style="color:#bae6fd;">kmalloc/kfree</code>, <code style="color:#bae6fd;">kmem_cache_alloc/free</code>, <code style="color:#bae6fd;">vmalloc/vfree</code>처럼 allocator와 free API를 정확히 짝짓는다.</li><li>수량×크기는 <code style="color:#bae6fd;">kmalloc_array</code>·<code style="color:#bae6fd;">kcalloc</code>, flexible array는 <code style="color:#bae6fd;">struct_size</code> 계열로 overflow를 막는다.</li><li>초기화가 계약이면 <code style="color:#bae6fd;">kzalloc</code>을 쓰고, 성능 때문에 생략할 때 모든 field의 초기화 증거를 남긴다.</li><li>allocation 실패는 정상 분기로 설계한다. partial object graph를 역순 rollback하고 bounded retry·backpressure·degradation을 둔다.</li><li>forward progress가 꼭 필요한 제한된 경로는 미리 할당한 pool/mempool을 검토하며 pool 고갈 정책도 테스트한다.</li><li>untrusted request로 만든 kernel memory는 적절히 account하고 per-tenant quota·상한을 둔다.</li><li>custom cache destroy 전 모든 object가 반환됐음을 refcount·drain 순서로 보장한다.</li><li>tuning 전 cache별 active/total, slab bytes, allocation latency, reclaim/PSI, cgroup events를 같은 시간축에 수집한다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. error handling runbook</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;">NULL:</strong> 요청 크기·GFP·call context를 기록하고 부분 생성 자원을 역순 해제한다. 무한 retry하지 않는다.</li><li><strong style="color:#f8fafc;">atomic allocation 반복 실패:</strong> interrupt/lock 경로를 줄이고 preallocation, mempool, deferred work가 가능한지 검토한다.</li><li><strong style="color:#f8fafc;">Slab 지속 증가:</strong> <code style="color:#bae6fd;">slabtop</code>으로 cache를 좁히고 active/total·object lifetime·reference leak을 추적한다.</li><li><strong style="color:#f8fafc;">SReclaimable인데 pressure:</strong> shrinker가 등록·진행되는지, ref pin·dirty dependency·reclaim recursion을 확인한다.</li><li><strong style="color:#f8fafc;">corruption 경고:</strong> node 격리와 증거 보존 후 해당 cache의 debug 옵션·KASAN·fault injection을 staging에서 재현한다.</li><li><strong style="color:#f8fafc;">tuning:</strong> 한 변수씩 canary하고 allocation p99·CPU·memory·reclaim stall을 함께 비교한다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. 놓치기 쉬운 함정</h2>
+<ul style="margin:0;padding-left:22px;"><li><strong style="color:#fecaca;">SLAB 위에 SLUB이 있다:</strong> 아니다. 대체 allocator 구현이다.</li><li><strong style="color:#fecaca;">GFP_ATOMIC은 더 빠르다:</strong> sleep하지 않는 대신 제한된 reserve를 쓰며 실패 가능성이 높다.</li><li><strong style="color:#fecaca;">kfree 후 page가 즉시 줄어든다:</strong> object는 cache로 돌아가며 slab 전체가 비어야 page 반환 후보가 된다.</li><li><strong style="color:#fecaca;">SReclaimable은 여유 memory다:</strong> 회수 비용·참조·속도 제한이 있다.</li><li><strong style="color:#fecaca;">active_objs×objsize가 총비용이다:</strong> free slot, padding, metadata, partial slab page를 빠뜨린다.</li><li><strong style="color:#fecaca;">큰 kmalloc도 vmalloc과 같다:</strong> kmalloc memory는 물리적으로 연속인 성질을 기대할 수 있지만 큰 연속 allocation은 실패하기 쉽고, vmalloc은 가상 연속이다.</li><li><strong style="color:#fecaca;">custom cache는 항상 빠르다:</strong> 작은 사용량에서는 관리·fragmentation 비용이 이득보다 클 수 있다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 30분 실습: partial slab 단편화 simulator</h2>
+<p style="margin:0 0 10px;">object 8개짜리 slab 두 개를 채운 뒤 각 slab에 하나만 남긴다. live object는 2개뿐이지만 두 slab 모두 page를 고정한다. 교육용 compaction 모델은 object를 한 slab에 모아 하나를 비운다.</p>
+<pre style="margin:0;white-space:pre;overflow-x:auto;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;">set -eu
+lab_dir="$(mktemp -d)"; trap 'rm -rf "$lab_dir"' EXIT
+cat &gt; "$lab_dir/slab_lab.py" &lt;&lt;'PY'
+CAPACITY = 8
+slabs = [set(range(0, 8)), set(range(8, 16))]
+for object_id in list(range(1, 8)) + list(range(9, 16)):
+    for slab in slabs:
+        slab.discard(object_id)
+
+def stats(label):
+    live = sum(map(len, slabs)); capacity = len(slabs) * CAPACITY
+    reclaimable = sum(not slab for slab in slabs)
+    print(f"{label} live={live} slabs={len(slabs)} capacity={capacity} "
+          f"utilization={100*live/capacity:.1f}% reclaimable={reclaimable}")
+
+stats("before")
+assert slabs == [{0}, {8}]
+# 교육용 이동 모델: 실제 generic slab object는 임의 이동 불가일 수 있다.
+slabs[0].add(slabs[1].pop())
+slabs[:] = [slab for slab in slabs if slab]
+stats("after_model_compaction")
+assert slabs == [{0, 8}]
+PY
+python3 "$lab_dir/slab_lab.py"
+# expected:
+# before live=2 slabs=2 capacity=16 utilization=12.5% reclaimable=0
+# after_model_compaction live=2 slabs=1 capacity=8 utilization=25.0% reclaimable=0</pre>
+<ol style="margin:12px 0 0;padding-left:22px;"><li><strong style="color:#f8fafc;">0~10분:</strong> allocate/free 후 각 slab의 empty·partial·full 상태를 그린다.</li><li><strong style="color:#f8fafc;">10~20분:</strong> capacity를 4·16으로 바꿔 pinned capacity와 내부 낭비를 비교한다.</li><li><strong style="color:#f8fafc;">20~30분:</strong> 실제 kernel이 임의 object를 이동하기 어려운 이유를 pointer 안정성·동시성·subsystem 계약으로 설명한다.</li></ol>
+<p style="margin:10px 0 0;padding:10px 12px;background:#13283a;border-left:4px solid #5eead4;color:#c8e5f3;font-size:14px;"><strong>모델 한계:</strong> generic live slab object를 kernel이 마음대로 옮길 수 있다는 뜻이 아니다. 이 simulator는 “object 하나가 slab page를 pin한다”는 packing 문제만 보여준다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. production 관찰</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">grep -E '^(Slab|SReclaimable|SUnreclaim):' /proc/meminfo
+sudo slabtop -o
+sudo head -n 20 /proc/slabinfo
+
+# tracefs가 mount되고 권한·kernel 설정이 허용할 때만 짧게 관찰
+sudo sh -c 'echo 1 &gt; /sys/kernel/tracing/events/kmem/kmalloc/enable'
+# 짧은 구간 수집 후 반드시 disable; bytes_req와 bytes_alloc 차이를 확인
+sudo sh -c 'echo 0 &gt; /sys/kernel/tracing/events/kmem/kmalloc/enable'</pre>
+<p style="margin:10px 0 0;">cache 이름·active/total·object size를 시계열로 남기고 workload/QPS, cgroup memory.events, PSI, reclaim과 겹쳐 본다. tracepoint와 slab debug는 hot path 비용이 있으므로 production에서는 승인된 짧은 window와 rollback을 준비한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 실패 시나리오</h2>
+<p style="margin:0;">metadata service의 kernel memory가 증가해 cgroup OOM이 발생했다. 팀은 <code style="color:#bae6fd;">SReclaimable</code>이 크므로 안전하다고 판단했지만, slabtop에서 특정 dentry/inode 계열 cache의 active object와 partial slab가 계속 늘었고 PSI와 reclaim stall도 상승했다. traffic을 제한한 뒤 mount·namespace·open file reference를 추적해 ref leak을 수정하고, canary에서 cache growth·reclaim throughput·request p99를 함께 확인한다. 단순 drop_caches 반복은 원인을 고치지 못하고 latency만 만든다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 대기업 면접 질문 3개</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;">buddy와 SLUB의 역할을 연결해 보세요.</strong><br>답변 포인트: buddy는 page/order, SLUB은 page를 typed fixed-size object로 분할·재사용, per-CPU fast path와 node partial slow path, 완전 empty일 때 page 반환 후보.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">GFP_KERNEL과 GFP_ATOMIC 차이는?</strong><br>답변 포인트: sleep/reclaim 가능 문맥 대 non-sleeping 문맥, reserve와 실패 확률, 무한 retry 금지, preallocation/mempool/deferred work 설계.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">Slab 증가를 어떻게 진단합니까?</strong><br>답변 포인트: SReclaimable/Unerclaim 분리, slabtop cache ranking, active/total과 object lifetime/ref leak, cgroup/PSI/reclaim 상관, debug/trace canary.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 퀴즈·누적 리뷰</h2>
+<ol style="margin:0;padding-left:22px;"><li>object 1개만 남은 partial slab의 page를 바로 반환할 수 있는가? 일반적으로 아니다. live pointer가 그 page를 사용한다.</li><li>SLAB과 SLUB은 위아래 계층인가? 아니다. 같은 목적의 대체 구현이다.</li><li>GFP_ATOMIC이면 allocation 성공이 보장되는가? 아니다. 제한된 reserve가 있어도 실패를 처리해야 한다.</li><li>Day 29 연결: user allocator의 size class·thread cache·fragmentation을 kernel의 kmalloc cache·per-CPU freelist·partial slab와 비교한다.</li><li>Day 22~24 연결: SLUB이 새 slab을 요청하면 buddy가 물리 page를 제공하며 pressure 시 reclaim·compaction·fault/OOM 경로와 경쟁한다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">15. 다음 날 연결</h2>
+<p style="margin:0;">Day 31은 <strong style="color:#f8fafc;">NUMA, locality, cache line, false sharing</strong>이다. per-CPU freelist가 줄인 contention을 hardware cache coherence와 remote NUMA access 관점에서 더 깊게 해부한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">16. 공식·1차 출처</h2>
+<ul style="margin:0;padding-left:22px;word-break:break-word;"><li><a href="https://docs.kernel.org/core-api/memory-allocation.html" style="color:#7dd3fc;">Linux Kernel Memory Allocation Guide</a>: kmalloc·vmalloc·alloc_pages 선택, GFP 문맥, size helper, kmem_cache API.</li><li><a href="https://docs.kernel.org/core-api/mm-api.html" style="color:#7dd3fc;">Linux Kernel Memory Management APIs</a>: GFP flag·kmalloc alignment·accounting·reclaim semantics.</li><li><a href="https://docs.kernel.org/core-api/gfp_mask-from-fs-io.html" style="color:#7dd3fc;">GFP masks used from FS/IO context</a>: scoped nofs/noio와 reclaim recursion 회피.</li><li><a href="https://docs.kernel.org/trace/events-kmem.html" style="color:#7dd3fc;">Linux kmem tracepoints</a>: kmalloc·kmem_cache·page allocation 관찰과 fragmentation 단서.</li><li><a href="https://man7.org/linux/man-pages/man5/slabinfo.5.html" style="color:#7dd3fc;">slabinfo(5)</a>: /proc/slabinfo field, active/total object와 slab page 계산의 의미.</li><li><a href="https://docs.kernel.org/admin-guide/mm/slab.html" style="color:#7dd3fc;">Linux slab allocator administration</a>: SLUB debug·slabinfo 도구와 운영상 비용.</li></ul>
+<p style="margin:28px 0 0;padding-top:18px;border-top:1px solid #27435d;color:#8fb3c9;font-size:13px;">Day 30 완료 기준: kmalloc 요청이 per-CPU freelist에서 buddy page까지 내려가는 경로를 그리고, GFP context·partial slab·reclaim·NUMA trade-off를 장애 지표와 실패 처리까지 설명할 수 있다.</p>
+</td></tr></table></td></tr></table>
+</body></html>
