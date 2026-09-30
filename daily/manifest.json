@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-09-01T09:01:15+09:00",
+  "updatedAt": "2026-09-30T09:43:03+09:00",
   "lessons": [
     {
       "day": 1,
@@ -275,6 +275,15 @@
       "path": "day-30.html",
       "kind": "lesson",
       "publishedAt": "2026-09-01T09:01:15+09:00"
+    },
+    {
+      "day": 31,
+      "week": 5,
+      "title": "NUMA, locality, cache line, false sharing",
+      "summary": "thread·page의 NUMA placement와 cache-line ownership을 연결하고 first-touch, remote memory, false sharing을 관찰·완화·실패 대응까지 다룹니다.",
+      "path": "day-31.html",
+      "kind": "lesson",
+      "publishedAt": "2026-09-30T09:43:03+09:00"
     }
   ]
 }

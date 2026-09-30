@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Operating System 심화 커리큘럼 Day 31 - NUMA, locality, cache line, false sharing</title></head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.72;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#07111f;"><tr><td align="center" style="padding:24px 12px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:680px;background:#0f1d2e;border:1px solid #23415d;border-radius:18px;overflow:hidden;">
+<tr><td style="padding:30px 28px 22px;background:#102a43;border-bottom:1px solid #28506f;">
+<div style="font-size:13px;letter-spacing:.12em;color:#5eead4;font-weight:800;">OPERATING SYSTEM · DAY 31 / 63 · MEMORY LOCALITY</div>
+<h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">NUMA, locality, cache line, false sharing</h1>
+<p style="margin:0;color:#b9d6eb;">한 줄 요약: <strong style="color:#f8fafc;">빠른 병렬 코드는 “같은 주소에 접근하지 않는다”에서 끝나지 않고, thread와 page를 같은 NUMA node에 두며 서로 쓰는 변수를 다른 cache line에 배치해야 한다.</strong> 정확한 atomic code도 remote memory와 cache-line ping-pong 때문에 느릴 수 있다.</p>
+</td></tr><tr><td style="padding:26px 28px 34px;">
+
+<h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:14px;">
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;width:30%;">NUMA node</td><td style="border-bottom:1px solid #27435d;">CPU 묶음과 가까운 memory bank를 하나의 node로 본 단위. 어느 CPU가 접근하느냐에 따라 memory latency·bandwidth가 달라진다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">local / remote memory</td><td style="border-bottom:1px solid #27435d;">현재 CPU와 가까운 node의 memory / socket interconnect를 건너 접근하는 다른 node의 memory.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">first touch</td><td style="border-bottom:1px solid #27435d;">anonymous page가 실제로 처음 접근될 때 page가 할당되는 성질. 초기화한 thread의 node가 배치에 영향을 준다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">locality</td><td style="border-bottom:1px solid #27435d;">최근 data를 다시 쓰는 temporal locality와 이웃 주소를 함께 쓰는 spatial locality.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">cache line</td><td style="border-bottom:1px solid #27435d;">CPU cache가 memory와 주고받고 coherence를 유지하는 블록. 흔히 64B지만 architecture 값은 측정해야 한다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">cache coherence</td><td style="border-bottom:1px solid #27435d;">여러 CPU cache가 같은 line의 관찰 가능한 값을 일관되게 유지하는 hardware protocol.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">true sharing</td><td style="border-bottom:1px solid #27435d;">thread들이 실제 같은 변수·동기화 word를 읽고 써서 line 이동이 필요한 경우.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">false sharing</td><td style="border-bottom:1px solid #27435d;">서로 다른 변수라도 같은 cache line에 있어 한쪽 write가 다른 CPU의 line을 invalidation하는 현상.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">HITM</td><td style="border-bottom:1px solid #27435d;">다른 core가 수정 상태로 가진 line에서 data를 받아오는 관찰 사건. false sharing 단서가 될 수 있다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">CPU affinity</td><td style="border-bottom:1px solid #27435d;">thread가 실행할 CPU 집합을 제한하는 정책. memory placement와 함께 봐야 한다.</td></tr>
+<tr><td style="color:#7dd3fc;font-weight:700;">memory policy</td><td>page를 어느 NUMA node에서 할당할지 정하는 local, preferred, bind, interleave 같은 정책.</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 두 건물과 공동 화이트보드</h2>
+<p style="margin:0;">socket 0 직원이 같은 건물(node 0)의 서랍을 열면 빠르지만 node 1 서랍은 연결 통로를 왕복한다. 각 직원이 서로 다른 숫자를 적어도 두 숫자가 같은 화이트보드 한 장(cache line)에 있으면, 한 사람이 쓸 때마다 다른 사람의 복사본을 폐기해야 한다. 변수는 달라도 보드 소유권이 왕복하는 것이 false sharing이다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: CPU·cache·NUMA memory path</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">Socket / NUMA node 0                         Socket / NUMA node 1
+ CPU0 ─ L1/L2 ─┐                              ┌─ L2/L1 ─ CPU2
+ CPU1 ─ L1/L2 ─┴─ LLC ─ memory controller     memory controller ─ LLC
+                      │                         │
+                 local DRAM 0 ═ interconnect ═ local DRAM 1
+
+CPU0 load(page on node0): cache miss → local controller → DRAM0
+CPU0 load(page on node1): cache miss → interconnect → remote controller → DRAM1
+
+false sharing: CPU0 writes counter[0] ─ line ownership → CPU1 writes counter[1]
+               서로 다른 주소지만 같은 line이면 invalidation·ownership 왕복</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. cache line 상태 전이 그림</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">[CPU0·CPU1 both read: SHARED]
+          │ CPU0 write A
+          ▼
+[CPU0 write ownership, CPU1 copy INVALID]
+          │ CPU1 write B (A와 B가 같은 line)
+          ▼
+[CPU1 ownership, CPU0 INVALID] ─ CPU0 next write → 다시 ownership 이동
+
+MESI 이름은 이해용 모델이다. 실제 protocol은 CPU마다 다르지만
+coherence 단위가 개별 변수보다 큰 cache line이라는 핵심은 같다.</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. CS·kernel·hardware deep dive</h2>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.1 virtual address가 locality를 말해 주지 않는다</h3><p style="margin:0;">연속 VA라도 physical page는 여러 node에 있을 수 있다. `/proc/PID/numa_maps`는 mapping별 policy와 node별 page 분포를 보여 준다. RSS 하나만 보면 local/remote 비용을 놓친다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.2 first-touch는 초기화도 architecture 결정으로 만든다</h3><p style="margin:0;">anonymous memory policy는 새 page가 실제 할당될 때 적용되며, 보통 처음 page를 touch한 CPU 근처에 배치된다. main thread 하나가 전체 배열을 zero-fill한 뒤 worker를 여러 node에 흩으면 remote access를 만들 수 있다. worker가 담당 구간을 병렬 초기화하면 page placement도 분산될 수 있다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.3 thread affinity와 memory policy는 한 쌍이다</h3><p style="margin:0;">CPU만 pin하고 기존 page가 remote node에 남으면 성능이 악화될 수 있다. 반대로 memory만 bind해도 thread migration이 locality를 깨뜨린다. cpuset 제한은 application memory policy보다 우선할 수 있으므로 container·scheduler 설정까지 확인한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.4 false sharing에는 write가 필요하다</h3><p style="margin:0;">여러 CPU가 같은 line을 읽기만 하면 공유 복사본을 유지할 수 있다. 적어도 한쪽 write가 있을 때 invalidation이 반복된다. read/read, read/write, write/write를 구분해야 한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.5 atomic은 correctness를 주지만 locality 비용은 없애지 않는다</h3><p style="margin:0;">서로 다른 atomic counter라도 같은 line이면 data race는 없지만 line ownership은 ping-pong한다. memory order를 relaxed로 낮춰도 cache-line 배치 문제가 자동으로 해결되지는 않는다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.6 padding은 공짜가 아니다</h3><p style="margin:0;">hot writable field를 line 단위로 분리하면 coherence traffic은 줄지만 object 크기, cache footprint, TLB pressure가 늘고 새로운 인접 field와 false sharing이 생길 수 있다. 측정된 hot path에만 적용하고 실제 line 크기·struct layout을 확인한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.7 per-CPU·sharding은 write frequency를 낮춘다</h3><p style="margin:0;">global counter를 매 요청 갱신하는 대신 per-CPU/thread shard에 누적하고 가끔 합치면 ownership 이동을 줄인다. 대신 합산 시점의 stale view, CPU hotplug, thread migration, overflow, lifecycle을 설계해야 한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.8 automatic NUMA balancing은 만능이 아니다</h3><p style="margin:0;">kernel은 access를 sampling해 task나 page migration을 시도할 수 있지만 shared page, phase change, migration cost, capacity imbalance가 있다. 명시 정책과 자동 balancing을 동시에 바꿔 원인을 흐리지 말고 workload phase별로 검증한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. 증거를 묶어 읽기</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:13px;">
+<tr style="background:#15314a;color:#bae6fd;"><td>증거</td><td>질문</td><td>오판 방지</td></tr>
+<tr><td style="border-top:1px solid #27435d;">numastat -p, numa_maps</td><td style="border-top:1px solid #27435d;">page가 어느 node에 있는가?</td><td style="border-top:1px solid #27435d;">분포만으로 access frequency는 모른다.</td></tr>
+<tr><td style="border-top:1px solid #27435d;">CPU/node affinity</td><td style="border-top:1px solid #27435d;">누가 page를 접근하는가?</td><td style="border-top:1px solid #27435d;">시간에 따른 migration도 본다.</td></tr>
+<tr><td style="border-top:1px solid #27435d;">perf c2c HITM</td><td style="border-top:1px solid #27435d;">어느 line이 CPU 사이를 이동하는가?</td><td style="border-top:1px solid #27435d;">symbol·offset·struct layout으로 확인한다.</td></tr>
+<tr><td style="border-top:1px solid #27435d;">throughput·p99·CPU</td><td style="border-top:1px solid #27435d;">사용자 영향은 있는가?</td><td style="border-top:1px solid #27435d;">counter 하나만 최적화하지 않는다.</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. 실무 best practice</h2>
+<ul style="margin:0;padding-left:22px;"><li>CPU topology, thread affinity, page placement, workload phase를 같은 timestamp로 기록한다.</li><li>large array는 실제 worker가 맡을 구간을 병렬 first-touch하고, thread migration 정책을 명시한다.</li><li>hot write field는 mostly-read field와 분리하고, 같이 갱신되는 field는 함께 두는 layout을 검토한다.</li><li>global statistic은 per-CPU/thread shard와 batch aggregation을 고려하되 stale-read 계약을 문서화한다.</li><li>`numactl --membind`는 node 고갈 시 allocation 실패 가능성이 있으므로 preferred/interleave와 trade-off를 canary한다.</li><li>padding 전후 throughput·p99·CPU·LLC miss·HITM·RSS를 비교하고 compiler layout을 실제 확인한다.</li><li>NUMA가 없는 개발 장비 결과를 multi-socket production에 일반화하지 않는다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. error handling runbook</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;">회귀 확인:</strong> QPS·p99·CPU와 배포·traffic 변화를 먼저 맞춘다.</li><li><strong style="color:#f8fafc;">topology:</strong> `lscpu`, affinity, cpuset, NUMA distance를 수집한다.</li><li><strong style="color:#f8fafc;">placement:</strong> `numastat -p`와 `numa_maps`로 remote page 증가를 확인한다.</li><li><strong style="color:#f8fafc;">coherence:</strong> 승인된 짧은 window에 `perf c2c`로 hot address·HITM·offset을 좁힌다.</li><li><strong style="color:#f8fafc;">완화:</strong> thread+memory placement 또는 layout/sharding 중 한 변수만 canary한다.</li><li><strong style="color:#f8fafc;">실패:</strong> strict bind ENOMEM, migration 실패·latency spike가 나면 즉시 원래 policy로 rollback한다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. 놓치기 쉬운 함정</h2>
+<ul style="margin:0;padding-left:22px;"><li><strong style="color:#fecaca;">서로 다른 변수면 독립:</strong> coherence 단위는 변수 아닌 line이다.</li><li><strong style="color:#fecaca;">atomic이면 빠름:</strong> 정확성과 cache ownership 비용은 별개다.</li><li><strong style="color:#fecaca;">64B padding이면 모든 CPU에서 안전:</strong> line 크기·compiler layout·array stride를 확인해야 한다.</li><li><strong style="color:#fecaca;">CPU pinning만 하면 local:</strong> page placement가 remote일 수 있다.</li><li><strong style="color:#fecaca;">interleave가 항상 균형:</strong> bandwidth는 분산해도 thread별 latency와 shared-page 비용이 달라진다.</li><li><strong style="color:#fecaca;">remote page 수만으로 원인 확정:</strong> access frequency와 HITM·latency를 함께 봐야 한다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 30분 실습: cache-line ownership simulator</h2>
+<p style="margin:0 0 10px;">두 CPU가 각자의 counter를 번갈아 10,000번 쓴다. 같은 line이면 write마다 ownership이 이동하지만 padded layout이면 각 CPU가 자기 line을 계속 소유한다.</p>
+<pre style="margin:0;white-space:pre;overflow-x:auto;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;">python3 - &lt;&lt;'PY'
+def transfers(line_for_counter, writes=10_000, batch=1):
+    owner, moved = {}, 0
+    sequence = []
+    for start in range(0, writes, batch):
+        cpu = (start // batch) % 2
+        sequence.extend([cpu] * min(batch, writes - start))
+    for cpu in sequence:
+        line = line_for_counter[cpu]
+        if line in owner and owner[line] != cpu:
+            moved += 1
+        owner[line] = cpu
+    return moved
+
+packed = transfers([0, 0])
+padded = transfers([0, 1])
+batched = transfers([0, 0], batch=100)
+print(f"packed_transfers={packed} padded_transfers={padded} batched={batched}")
+assert (packed, padded, batched) == (9999, 0, 99)
+PY</pre>
+<ol style="margin:12px 0 0;padding-left:22px;"><li><strong style="color:#f8fafc;">0~10분:</strong> 같은 line·다른 line의 owner 상태를 손으로 그린다.</li><li><strong style="color:#f8fafc;">10~20분:</strong> batch를 1, 10, 100으로 바꿔 ownership transfer를 비교한다.</li><li><strong style="color:#f8fafc;">20~30분:</strong> padding·batching·per-CPU counter의 공간·freshness trade-off를 면접 답변으로 정리한다.</li></ol>
+<p style="margin:10px 0 0;padding:10px 12px;background:#13283a;border-left:4px solid #5eead4;color:#c8e5f3;font-size:14px;"><strong>모델 한계:</strong> 실제 coherence protocol·prefetcher·LLC·scheduler·NUMA interconnect latency를 재현하지 않는다. 소유권 이동 불변식을 분리해 보는 결정적 모델이다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. Linux production 관찰</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">lscpu -e=CPU,NODE,SOCKET,CORE
+numactl --hardware
+numactl --show
+numastat -p &lt;PID&gt;
+head -n 20 /proc/&lt;PID&gt;/numa_maps
+
+# 권한·PMU 지원을 확인하고 짧게 수집
+sudo perf c2c record -g -- &lt;WORKLOAD&gt;
+sudo perf c2c report --call-graph none</pre>
+<p style="margin:10px 0 0;">`perf c2c`가 가리킨 address를 symbol·source field·offset과 매핑한 뒤에만 false sharing으로 결론 낸다. PMU event 이름과 HITM 해석은 CPU·kernel·virtualization 환경마다 다를 수 있다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 실패 시나리오</h2>
+<p style="margin:0;">worker 수를 두 socket으로 늘렸는데 throughput이 오히려 떨어지고 system CPU와 p99가 증가했다. main thread가 200GiB table을 먼저 초기화해 page 대부분이 node 0에 있었고, 모든 worker가 갱신하는 통계 counter들이 한 line에 모여 있었다. 즉시 worker 수를 rollback한 뒤, 구간별 parallel first-touch와 per-node shard를 각각 canary했다. `numa_maps`의 node 분포, remote access, HITM, p99가 함께 개선된 변경만 채택했다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 대기업 면접 질문 3개</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;">NUMA에서 first-touch가 왜 중요한가?</strong><br>답변 포인트: demand allocation, 초기화 thread의 node, remote latency, parallel initialization, CPU+memory placement 결합.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">data race가 없는데도 false sharing이 가능한가?</strong><br>답변 포인트: 다른 atomic/field, 동일 cache line, write invalidation, ownership ping-pong, correctness와 scalability 분리.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">어떻게 증명하고 고칠 것인가?</strong><br>답변 포인트: topology·numa_maps·numastat·perf c2c·struct offset, padding/sharding/batching, 공간·freshness 비용, canary.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 퀴즈·누적 리뷰</h2>
+<ol style="margin:0;padding-left:22px;"><li>CPU0과 CPU1이 같은 line의 서로 다른 atomic을 쓰면? race는 없어도 false sharing은 가능하다.</li><li>main thread가 전체 배열을 초기화한 뒤 remote worker가 처리하면? first-touch 때문에 page가 main의 node에 몰릴 수 있다.</li><li>읽기만 하는 shared line도 harmful false sharing인가? 일반적으로 반복 invalidation에는 write가 필요하다.</li><li>Day 30 연결: per-CPU SLUB freelist는 lock뿐 아니라 cache-line locality도 개선하지만 remote free와 NUMA placement를 고려해야 한다.</li><li>Day 23 연결: cache line locality와 TLB locality는 별개지만 data set 확대·padding이 둘 모두에 영향을 줄 수 있다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">15. 다음 날 연결</h2>
+<p style="margin:0;">Day 32는 <strong style="color:#f8fafc;">huge page와 TLB reach</strong>다. locality를 개선하려고 data를 크게 묶었을 때 page 크기와 TLB coverage가 translation 비용·fragmentation·latency에 어떤 trade-off를 만드는지 본다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">16. 공식·1차 출처</h2>
+<ul style="margin:0;padding-left:22px;word-break:break-word;"><li><a href="https://docs.kernel.org/kernel-hacking/false-sharing.html" style="color:#7dd3fc;">Linux Kernel — False Sharing</a>: 발생 조건, perf c2c 탐지, field 재배치·per-CPU 완화와 비용.</li><li><a href="https://docs.kernel.org/admin-guide/mm/numa_memory_policy.html" style="color:#7dd3fc;">Linux Kernel — NUMA Memory Policy</a>: policy scope, node mask, cpuset과의 관계.</li><li><a href="https://docs.kernel.org/mm/physical_memory.html" style="color:#7dd3fc;">Linux Kernel — Physical Memory</a>: NUMA node abstraction과 기본 local allocation.</li><li><a href="https://man7.org/linux/man-pages/man7/numa.7.html" style="color:#7dd3fc;">numa(7)</a>: NUMA 개요, system call과 `/proc/PID/numa_maps`.</li><li><a href="https://man7.org/linux/man-pages/man2/set_mempolicy.2.html" style="color:#7dd3fc;">set_mempolicy(2)</a>: thread policy와 anonymous page first-touch 시점.</li><li><a href="https://man7.org/linux/man-pages/man8/numactl.8.html" style="color:#7dd3fc;">numactl(8)</a>: CPU·memory binding, preferred/interleave와 strict bind 실패 의미.</li><li><a href="https://man7.org/linux/man-pages/man2/move_pages.2.html" style="color:#7dd3fc;">move_pages(2)</a>: page node 조회·이동과 오류 처리.</li></ul>
+<p style="margin:28px 0 0;padding-top:18px;border-top:1px solid #27435d;color:#8fb3c9;font-size:13px;">Day 31 완료 기준: thread→cache line→NUMA node→DRAM 경로를 그리고, remote memory와 false sharing을 서로 다른 증거로 진단해 layout·placement·sharding 선택을 trade-off로 방어할 수 있다.</p>
+</td></tr></table></td></tr></table>
+</body></html>
