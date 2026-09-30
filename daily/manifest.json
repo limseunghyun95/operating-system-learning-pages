@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-09-30T09:43:03+09:00",
+  "updatedAt": "2026-09-30T09:49:45+09:00",
   "lessons": [
     {
       "day": 1,
@@ -284,6 +284,15 @@
       "path": "day-31.html",
       "kind": "lesson",
       "publishedAt": "2026-09-30T09:43:03+09:00"
+    },
+    {
+      "day": 32,
+      "week": 5,
+      "title": "huge page와 TLB reach",
+      "summary": "TLB reach 계산부터 THP·mTHP·HugeTLB의 collapse/split, compaction·fragmentation·fault latency와 production 검증까지 연결합니다.",
+      "path": "day-32.html",
+      "kind": "lesson",
+      "publishedAt": "2026-09-30T09:49:45+09:00"
     }
   ]
 }

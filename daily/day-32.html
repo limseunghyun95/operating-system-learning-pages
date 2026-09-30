@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Operating System 심화 커리큘럼 Day 32 - huge page와 TLB reach</title></head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.72;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#07111f;"><tr><td align="center" style="padding:24px 12px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:680px;background:#0f1d2e;border:1px solid #23415d;border-radius:18px;overflow:hidden;">
+<tr><td style="padding:30px 28px 22px;background:#102a43;border-bottom:1px solid #28506f;">
+<div style="font-size:13px;letter-spacing:.12em;color:#5eead4;font-weight:800;">OPERATING SYSTEM · DAY 32 / 63 · ADDRESS TRANSLATION</div>
+<h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">huge page와 TLB reach</h1>
+<p style="margin:0;color:#b9d6eb;">한 줄 요약: <strong style="color:#f8fafc;">huge page는 TLB 한 entry가 더 많은 byte를 가리키게 해 translation 비용을 줄이지만, 물리적으로 큰 연속 공간·alignment·memory waste와 fault·collapse·compaction latency를 교환한다.</strong> 따라서 “켜기”가 아니라 workload별 크기·범위·실패 계약을 측정해야 한다.</p>
+</td></tr><tr><td style="padding:26px 28px 34px;">
+
+<h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:14px;">
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;width:31%;">page / base page</td><td style="border-bottom:1px solid #27435d;">virtual memory를 나누는 고정 크기 블록. base page는 일반적인 최소 page이며 x86-64 Linux에서는 흔히 4KiB지만 architecture·kernel 설정에 따라 다르다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">TLB</td><td style="border-bottom:1px solid #27435d;">최근 virtual page→physical frame translation을 보관하는 CPU cache. data cache와 목적이 다르다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">TLB reach</td><td style="border-bottom:1px solid #27435d;">TLB가 page walk 없이 덮을 수 있는 주소 범위의 근사치. 단순 모델은 <code>entry 수 × page 크기</code>다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">huge page</td><td style="border-bottom:1px solid #27435d;">base page보다 큰 page. 한 translation으로 더 넓은 memory를 덮고 page-table entry 수도 줄인다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">PMD / PUD</td><td style="border-bottom:1px solid #27435d;">multi-level page table의 중간 level 이름. architecture에 따라 PMD·PUD entry 자체가 큰 leaf mapping이 될 수 있다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">THP</td><td style="border-bottom:1px solid #27435d;">Transparent Huge Pages. application이 HugeTLB pool을 직접 예약하지 않아도 kernel이 적합한 mapping을 큰 page로 만들거나 합치는 기능.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">mTHP</td><td style="border-bottom:1px solid #27435d;">multi-size THP. PMD 크기보다 작은 16KiB·64KiB 같은 power-of-two 묶음도 사용할 수 있는 현대 Linux 기능이며 지원 크기는 system마다 다르다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">HugeTLB</td><td style="border-bottom:1px solid #27435d;">명시적으로 예약·관리하는 huge page pool과 mapping mechanism. `hugetlbfs`, `MAP_HUGETLB`, SysV shared memory 등에서 사용한다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">collapse / split</td><td style="border-bottom:1px solid #27435d;">여러 작은 page를 큰 mapping으로 합치는 것 / 큰 mapping을 더 작은 mapping으로 나누는 것. promotion·demotion이라고도 부른다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">alignment</td><td style="border-bottom:1px solid #27435d;">주소와 길이가 page 크기의 경계에 맞는 성질. 큰 mapping을 만들 수 있는 범위를 결정한다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">compaction</td><td style="border-bottom:1px solid #27435d;">흩어진 free page를 이동해 큰 물리 연속 block을 만드는 kernel 작업. CPU와 latency 비용이 들 수 있다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">internal fragmentation</td><td style="border-bottom:1px solid #27435d;">큰 page 안에서 실제로 쓰지 않는 공간까지 memory를 차지하는 낭비. sparse access에서 커진다.</td></tr>
+<tr><td style="color:#7dd3fc;font-weight:700;">khugepaged</td><td>background에서 eligible한 작은 anonymous page들을 찾아 THP로 collapse하는 kernel thread.</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 주소 번역소의 한정된 표찰</h2>
+<p style="margin:0;">TLB를 표찰 512개뿐인 번역소로 생각하자. 4KiB 표찰이면 단순 reach가 2MiB지만 2MiB 표찰이면 1GiB다. 단, 큰 표찰을 붙이려면 큰 구역의 경계가 맞고 땅이 준비되어야 한다. 구역 일부만 써도 전체를 확보하며, 만들거나 쪼개는 순간에는 공사가 일어난다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: TLB hit, page walk, huge mapping</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">CPU virtual address
+       │
+       ▼
+   [TLB lookup] ── hit ───────────────→ physical address → cache / DRAM
+       │ miss
+       ▼
+ page-table walk
+   4KiB: upper levels → PTE leaf → 4KiB frame
+   2MiB: upper levels → PMD huge leaf → 2MiB frame
+   1GiB: upper level  → PUD huge leaf → 1GiB frame
+       │
+       └─ translation을 TLB에 채우고 instruction 재시도
+
+THP: fault-time allocation 또는 khugepaged/MADV_COLLAPSE로 큰 mapping
+HugeTLB: 미리 준비한 pool에서 explicit mapping</pre>
+<p style="margin:10px 0 0;">level 이름·page size·TLB 구조는 CPU와 kernel에 따라 달라진다. 핵심은 큰 leaf가 더 넓은 주소를 한 translation으로 덮고 page-walk 단계와 page-table footprint를 줄일 수 있다는 점이다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. THP 상태 전이 그림</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">[base-page PTE mappings]
+      │ eligible + aligned + policy 허용
+      ├─ huge fault allocation
+      ├─ khugepaged background collapse
+      └─ MADV_COLLAPSE synchronous best effort
+      ▼
+[THP / mTHP mapping]
+      │ partial unmap·mprotect·COW·pressure·underuse 등
+      ▼
+[split / demote] ───────────────────────→ [base-page mappings]
+
+큰 page 준비 실패 ─ THP: 보통 base page로 graceful fallback
+                  └ HugeTLB: pool·reservation 계약에 따라 mmap/fault 실패
+
+정책은 eligibility이지 성공 보장이 아니다. 실제 mapping을 다시 관찰한다.</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. 숫자로 보는 TLB reach</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:13px;">
+<tr style="background:#15314a;color:#bae6fd;"><td>가정</td><td>단순 reach</td><td>1GiB sequential working set</td></tr>
+<tr><td style="border-top:1px solid #27435d;">512 entries × 4KiB</td><td style="border-top:1px solid #27435d;">2MiB</td><td style="border-top:1px solid #27435d;">262,144 translations</td></tr>
+<tr><td style="border-top:1px solid #27435d;">512 entries × 2MiB</td><td style="border-top:1px solid #27435d;">1GiB</td><td style="border-top:1px solid #27435d;">512 translations</td></tr>
+<tr><td style="border-top:1px solid #27435d;">64 entries × 1GiB</td><td style="border-top:1px solid #27435d;">64GiB</td><td style="border-top:1px solid #27435d;">1 translation</td></tr>
+</table>
+<p style="margin:10px 0 0;">이는 면접용 1차 모델이다. 실제 CPU에는 크기별 TLB, 여러 level, associativity, shared translation cache, replacement, simultaneous thread 경쟁이 있어 entry 수만으로 miss rate를 확정할 수 없다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. CS·kernel·hardware deep dive</h2>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.1 translation locality와 data locality는 다르다</h3><p style="margin:0;">huge page는 주소 번역 범위를 넓히지만 cache line을 자동으로 더 잘 재사용하게 만들지는 않는다. random access의 data-cache miss는 그대로일 수 있고, TLB miss 감소가 전체 실행 시간에서 충분히 커야 이득이 난다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.2 큰 leaf는 page table도 줄인다</h3><p style="margin:0;">1GiB를 4KiB로 map하면 262,144 PTE가 필요하지만 2MiB leaf면 512개다. page-table memory, page-walk memory reference, fault bookkeeping을 줄일 수 있다. 반면 실제 CPU의 huge-page TLB entry 수는 base-page entry 수와 다를 수 있다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.3 THP와 HugeTLB는 다른 계약이다</h3><p style="margin:0;">THP는 ordinary anonymous memory에 투명하게 적용되고 큰 page가 부족하면 작은 page로 fallback하는 것이 일반적이다. HugeTLB는 관리자가 pool을 예약하고 application이 명시적으로 소비하므로 deterministic capacity를 만들 수 있지만, pool·권한·limit이 없으면 allocation 또는 fault가 실패할 수 있다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.4 fault 수 감소와 fault tail 증가는 동시에 가능하다</h3><p style="margin:0;">큰 page 하나를 fault하면 많은 base page fault를 대신할 수 있다. 그러나 큰 page zeroing, allocation, compaction, copy-on-write는 한 번의 작업을 크게 만들어 p99 spike를 만들 수 있다. Linux의 mTHP는 중간 크기로 이 trade-off를 세분화한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.5 alignment와 물리 연속성이 두 경계다</h3><p style="margin:0;">virtual range가 huge-page boundary에 맞아도 큰 물리 block이 없으면 allocation·collapse가 실패한다. long-running host의 fragmentation과 reclaim pressure가 결과를 바꾸므로 boot 직후 benchmark를 production에 그대로 일반화하면 안 된다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.6 collapse와 split은 control-plane 비용이다</h3><p style="margin:0;">khugepaged는 background에서 page를 scan·copy·collapse한다. partial unmap, permission 변경, COW 등은 split을 유발할 수 있다. application latency뿐 아니라 collapse/split rate와 CPU, compaction, reclaim을 같은 시간축에서 본다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.7 sparse touch는 memory amplification을 만든다</h3><p style="margin:0;">2MiB THP의 작은 부분만 사용해도 whole huge page가 할당될 수 있다. TLB miss를 줄이려다 RSS와 reclaim pressure, OOM risk가 커질 수 있으므로 access density를 봐야 한다. Linux는 underused THP를 split하도록 설정할 수 있지만 정책과 version을 확인한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.8 NUMA placement granularity도 커진다</h3><p style="margin:0;">Day 31의 first-touch가 큰 page 단위로 굳으면 여러 worker가 page를 공유할 때 일부는 remote access를 감수할 수 있다. huge page, affinity, NUMA policy를 따로 튜닝하면 translation은 좋아지고 memory latency는 나빠지는 회귀가 생긴다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.9 MADV_HUGEPAGE와 MADV_COLLAPSE도 보장은 아니다</h3><p style="margin:0;">`MADV_HUGEPAGE`는 eligible hint다. Linux 6.1부터 `MADV_COLLAPSE`는 range를 동기적으로 collapse하려는 best-effort 요청이며 일부 또는 전부 실패할 수 있다. return code와 실제 `smaps`를 모두 확인한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. 무엇을 선택할까?</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:13px;">
+<tr style="background:#15314a;color:#bae6fd;"><td>선택</td><td>잘 맞는 경우</td><td>핵심 실패 계약</td></tr>
+<tr><td style="border-top:1px solid #27435d;">base page</td><td style="border-top:1px solid #27435d;">sparse·작은 allocation, 낮은 memory waste</td><td style="border-top:1px solid #27435d;">TLB/page-table pressure 증가</td></tr>
+<tr><td style="border-top:1px solid #27435d;">THP/mTHP</td><td style="border-top:1px solid #27435d;">dense hot anonymous region, 투명 fallback 필요</td><td style="border-top:1px solid #27435d;">collapse·compaction latency, 실제 적용 불확실</td></tr>
+<tr><td style="border-top:1px solid #27435d;">HugeTLB</td><td style="border-top:1px solid #27435d;">DB·JVM 등 예약 capacity와 예측 가능한 explicit mapping</td><td style="border-top:1px solid #27435d;">pool 고갈·fragmentation·cgroup limit 시 실패</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. 실무 best practice</h2>
+<ul style="margin:0;padding-left:22px;"><li>최적화 전에 `dTLB-load-misses`, page-walk cost, p50/p99, RSS/PSS, CPU를 baseline으로 묶는다.</li><li>dense하고 오래 사는 hot arena만 `MADV_HUGEPAGE`로 좁혀 canary한다. global `always`부터 시작하지 않는다.</li><li>THP size와 defrag policy를 한 번에 하나씩 바꾸고, collapse·split·compact·reclaim 지표를 배포 시점과 맞춘다.</li><li>allocation·touch 범위를 huge-page boundary에 맞추고 실제 access density를 측정한다.</li><li>HugeTLB는 필요한 page 수, startup reservation, NUMA node별 capacity, cgroup limit, restart 실패 시 fallback 또는 fail-fast 계약을 문서화한다.</li><li>throughput이 좋아져도 p99와 memory headroom이 악화되면 채택하지 않는다.</li><li>kernel version·architecture·virtualization별 지원 page size와 PMU event를 production host에서 확인한다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. error handling runbook</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;">증상 고정:</strong> 동일 traffic에서 latency·QPS·CPU·RSS·major/minor fault 변화를 비교한다.</li><li><strong style="color:#f8fafc;">실제 mapping:</strong> policy 문자열이 아니라 `smaps`의 page size·AnonHugePages·THPeligible과 HugeTLB 항목을 확인한다.</li><li><strong style="color:#f8fafc;">kernel 작업:</strong> `vmstat`의 fault·collapse·split, compaction·reclaim과 PSI를 같은 window에 수집한다.</li><li><strong style="color:#f8fafc;">THP 미적용:</strong> alignment, mapping type, policy, memory pressure를 확인하고 base-page fallback을 정상 경로로 처리한다.</li><li><strong style="color:#f8fafc;">HugeTLB 실패:</strong> pool free/reserved/surplus, requested size, memlock·group 권한, cgroup limit을 확인한다. silent downgrade인지 fail-fast인지 application 계약을 따른다.</li><li><strong style="color:#f8fafc;">tail spike:</strong> direct reclaim·compaction이 연관되면 작은 mTHP size, `madvise` 범위, defrag policy를 canary하고 즉시 rollback 가능하게 한다.</li><li><strong style="color:#f8fafc;">memory 급증:</strong> sparse region을 huge-page 대상에서 제외하고 split/demotion 후 OOM headroom을 재검증한다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 놓치기 쉬운 함정</h2>
+<ul style="margin:0;padding-left:22px;"><li><strong style="color:#fecaca;">huge page면 memory가 늘어난다:</strong> capacity가 아니라 translation granularity가 커진다.</li><li><strong style="color:#fecaca;">THP와 HugeTLB는 같은 기능:</strong> 투명 fallback과 명시적 예약이라는 운영 계약이 다르다.</li><li><strong style="color:#fecaca;">enabled면 모든 mapping이 huge:</strong> eligibility, alignment, pressure, mapping type 때문에 base page일 수 있다.</li><li><strong style="color:#fecaca;">TLB miss가 줄면 항상 빠르다:</strong> data-cache miss, zeroing, compaction, RSS 증가가 이득을 상쇄할 수 있다.</li><li><strong style="color:#fecaca;">madvise는 보장:</strong> hint 또는 best-effort 요청이며 결과·errno·실제 mapping을 확인해야 한다.</li><li><strong style="color:#fecaca;">AnonHugePages 하나면 모든 THP를 안다:</strong> PMD-mapped anonymous THP의 중요한 단서지만 mTHP와 file/shmem mapping은 kernel별 counter와 다른 smaps field까지 봐야 한다.</li><li><strong style="color:#fecaca;">HugeTLB도 RSS/PSS와 똑같이 보인다:</strong> `Private_Hugetlb`·`Shared_Hugetlb`와 `/proc/meminfo`를 별도로 확인한다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. 30분 실습: TLB reach simulator</h2>
+<p style="margin:0 0 10px;">1GiB sequential working set을 두 번 순회하는 단순 fully-associative LRU 모델이다. 512-entry TLB에서 working set의 translation 수가 entry 수 이하일 때 두 번째 pass가 hit가 되는 불변식을 검증한다.</p>
+<pre style="margin:0;white-space:pre;overflow-x:auto;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;">python3 - &lt;&lt;'PY'
+GiB, KiB, MiB = 1024**3, 1024, 1024**2
+
+def sequential(pages, entries, passes=2):
+    # cyclic sequential scan의 결정적 결과
+    if pages &lt;= entries:
+        return pages, pages * (passes - 1)
+    return pages * passes, 0
+
+for name, size, entries in [
+    ("base_4k", 4*KiB, 512),
+    ("huge_2m", 2*MiB, 512),
+    ("huge_1g", GiB, 64),
+]:
+    pages = GiB // size
+    misses, hits = sequential(pages, entries)
+    print(name, "pages=", pages, "reach=", entries*size,
+          "misses=", misses, "hits=", hits)
+
+assert sequential(GiB//(4*KiB), 512) == (524288, 0)
+assert sequential(GiB//(2*MiB), 512) == (512, 512)
+print("waste_if_touch_1_byte:", {"4K": 4*KiB-1, "2M": 2*MiB-1})
+PY</pre>
+<ol style="margin:12px 0 0;padding-left:22px;"><li><strong style="color:#f8fafc;">0~10분:</strong> 512×4KiB와 512×2MiB reach를 손으로 계산한다.</li><li><strong style="color:#f8fafc;">10~20분:</strong> entries·working set·passes를 바꿔 hit 조건을 설명한다.</li><li><strong style="color:#f8fafc;">20~30분:</strong> TLB 절약과 1-byte sparse touch의 memory waste를 함께 면접 답변으로 정리한다.</li></ol>
+<p style="margin:10px 0 0;padding:10px 12px;background:#13283a;border-left:4px solid #5eead4;color:#c8e5f3;font-size:14px;"><strong>모델 한계:</strong> 실제 set associativity, multi-level TLB, hardware prefetch/page-walk cache, mixed page size, PCID, shootdown, cache·NUMA 비용을 생략한다. 결과 수치가 아니라 reach와 reuse 조건을 검증하는 모델이다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. Linux production 관찰</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;"># THP global/per-size policy와 PMD 크기
+cat /sys/kernel/mm/transparent_hugepage/enabled
+cat /sys/kernel/mm/transparent_hugepage/hpage_pmd_size
+grep . /sys/kernel/mm/transparent_hugepage/hugepages-*/enabled 2&gt;/dev/null
+
+# process mapping: 모든 field가 모든 kernel에 존재하는 것은 아니다
+grep -E 'KernelPageSize|MMUPageSize|AnonHugePages|ShmemPmdMapped|FilePmdMapped|THPeligible|Private_Hugetlb|Shared_Hugetlb' /proc/&lt;PID&gt;/smaps
+
+# explicit HugeTLB pool과 THP total
+grep -E 'AnonHugePages|HugePages_|Hugepagesize|Hugetlb' /proc/meminfo
+
+# 이름은 kernel version마다 다를 수 있다
+grep -E 'thp_(fault|collapse|split|deferred)' /proc/vmstat
+
+# PMU 지원과 event 이름을 먼저 확인하고 짧게 수집
+perf stat -e dTLB-loads,dTLB-load-misses -- &lt;WORKLOAD&gt;</pre>
+<p style="margin:10px 0 0;">`KernelPageSize`와 `MMUPageSize`가 다를 수 있고 `AnonHugePages`만으로 모든 mTHP를 완전히 계수한다고 가정하면 안 된다. policy→실제 mapping→PMU→SLO를 한 흐름으로 확인한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 실패 시나리오</h2>
+<p style="margin:0;">latency-sensitive service에서 THP를 global `always`로 바꾸자 평균 CPU는 줄었지만 p99가 튀고 RSS가 35% 늘었다. sparse 2MiB arena가 작은 touch만으로 큰 page를 차지했고 memory pressure 때 direct compaction·split이 몰렸다. 즉시 원래 policy로 rollback하고 dense hot arena만 `MADV_HUGEPAGE`로 제한했다. 작은 mTHP size를 별도 canary하며 dTLB miss, collapse/split, compact stall, PSI, RSS, p99를 함께 비교했다. 모든 환경에서 큰 page를 강제하지 않고 fallback을 정상 계약으로 유지했다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 대기업 면접 질문 3개</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;">TLB reach를 계산하고 huge page의 장단점을 설명하라.</strong><br>답변 포인트: entries×page size, 4KiB/2MiB 계산, page walk·page-table 감소, fragmentation·fault/compaction latency, mixed-size TLB 현실.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">THP와 HugeTLB는 언제 각각 선택하는가?</strong><br>답변 포인트: automatic eligibility와 graceful fallback, explicit pool/reservation, deterministic capacity, startup·fault failure, cgroup·NUMA 운영.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">THP enable 후 p99가 나빠졌다면 어떻게 증명할까?</strong><br>답변 포인트: actual smaps mapping, vmstat fault/collapse/split/compaction, PSI·RSS·PMU·SLO correlation, sparse density·alignment, 한 변수 canary와 rollback.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">15. 퀴즈·누적 리뷰</h2>
+<ol style="margin:0;padding-left:22px;"><li>512-entry TLB가 4KiB page만 담으면 단순 reach는? 2MiB.</li><li>2MiB THP allocation이 실패하면 application도 반드시 실패하는가? 일반 THP는 보통 base-page mapping으로 fallback하지만 explicit HugeTLB는 pool 계약에 따라 실패할 수 있다.</li><li>`MADV_HUGEPAGE` 성공이 실제 huge mapping을 보장하는가? 아니다. hint이며 실제 mapping을 관찰해야 한다.</li><li>Day 23 연결: TLB miss는 page fault가 아니다. page table이 resident해도 TLB miss는 page walk를 유발한다.</li><li>Day 31 연결: TLB reach가 좋아져도 huge page의 NUMA placement가 remote라면 memory latency는 악화될 수 있다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">16. 다음 날 연결</h2>
+<p style="margin:0;">Day 33은 <strong style="color:#f8fafc;">reclaim, swap, thrashing, OOM killer</strong>다. 큰 page와 sparse allocation이 memory pressure를 높였을 때 kernel이 어떤 page를 회수하고 언제 swap·thrashing·OOM으로 넘어가는지 상태 전이로 추적한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">17. 공식·1차 출처</h2>
+<ul style="margin:0;padding-left:22px;word-break:break-word;"><li><a href="https://docs.kernel.org/admin-guide/mm/transhuge.html" style="color:#7dd3fc;">Linux Kernel — Transparent Hugepage Support</a>: THP·mTHP, sysfs policy, madvise, defrag, fallback, latency·memory trade-off.</li><li><a href="https://docs.kernel.org/mm/transhuge.html" style="color:#7dd3fc;">Linux Kernel MM — Transparent Hugepage Support</a>: fault, collapse, split과 구현 동작.</li><li><a href="https://docs.kernel.org/admin-guide/mm/hugetlbpage.html" style="color:#7dd3fc;">Linux Kernel — HugeTLB Pages</a>: explicit pool, reservation, hugetlbfs와 `/proc/meminfo` field.</li><li><a href="https://docs.kernel.org/filesystems/proc.html" style="color:#7dd3fc;">Linux Kernel — /proc Filesystem</a>: `smaps` page-size·THP·HugeTLB 관찰 field.</li><li><a href="https://man7.org/linux/man-pages/man2/madvise.2.html" style="color:#7dd3fc;">madvise(2)</a>: `MADV_HUGEPAGE`, `MADV_NOHUGEPAGE`, `MADV_COLLAPSE`의 조건과 오류.</li><li><a href="https://man7.org/linux/man-pages/man2/mmap.2.html" style="color:#7dd3fc;">mmap(2)</a>: `MAP_HUGETLB`, `MAP_HUGE_2MB`, `MAP_HUGE_1GB`와 지원 조건.</li><li><a href="https://docs.kernel.org/admin-guide/cgroup-v2.html" style="color:#7dd3fc;">Linux Kernel — cgroup v2 HugeTLB controller</a>: explicit HugeTLB usage limit과 fault-time enforcement.</li></ul>
+<p style="margin:28px 0 0;padding-top:18px;border-top:1px solid #27435d;color:#8fb3c9;font-size:13px;">Day 32 완료 기준: TLB reach를 계산하고, THP·mTHP·HugeTLB의 서로 다른 계약과 collapse/split 경로를 그리며, translation 이득을 p99·RSS·compaction·NUMA 증거와 함께 방어할 수 있다.</p>
+</td></tr></table></td></tr></table>
+</body></html>
