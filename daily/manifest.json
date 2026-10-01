@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-09-30T09:49:45+09:00",
+  "updatedAt": "2026-10-01T09:01:58+09:00",
   "lessons": [
     {
       "day": 1,
@@ -293,6 +293,15 @@
       "path": "day-32.html",
       "kind": "lesson",
       "publishedAt": "2026-09-30T09:49:45+09:00"
+    },
+    {
+      "day": 33,
+      "week": 5,
+      "title": "reclaim, swap, thrashing, OOM killer",
+      "summary": "allocation에서 kswapd·direct reclaim, file drop·anonymous swap, refault·thrashing과 scoped OOM까지 production 증거로 연결합니다.",
+      "path": "day-33.html",
+      "kind": "lesson",
+      "publishedAt": "2026-10-01T09:01:58+09:00"
     }
   ]
 }

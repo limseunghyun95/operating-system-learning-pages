@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Operating System 심화 커리큘럼 Day 33 - reclaim, swap, thrashing, OOM killer</title></head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.72;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#07111f;"><tr><td align="center" style="padding:24px 12px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:680px;background:#0f1d2e;border:1px solid #23415d;border-radius:18px;overflow:hidden;">
+<tr><td style="padding:30px 28px 22px;background:#102a43;border-bottom:1px solid #28506f;">
+<div style="font-size:13px;letter-spacing:.12em;color:#5eead4;font-weight:800;">OPERATING SYSTEM · DAY 33 / 63 · MEMORY PRESSURE</div>
+<h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">reclaim, swap, thrashing, OOM killer</h1>
+<p style="margin:0;color:#b9d6eb;">한 줄 요약: <strong style="color:#f8fafc;">memory 부족은 곧 OOM이 아니라, 먼저 cold page를 reclaim하고 file page는 drop·writeback하며 anonymous page는 swap으로 보존하는 과정이다.</strong> working set이 다시 필요해 계속 refault하면 thrashing이 되고, reclaim으로도 allocation을 만족하지 못할 때 scope 안의 OOM killer가 최후의 복구를 시도한다.</p>
+</td></tr><tr><td style="padding:26px 28px 34px;">
+
+<h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:14px;">
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;width:31%;">reclaim</td><td style="border-bottom:1px solid #27435d;">다른 allocation을 위해 RAM의 page를 회수하는 kernel 작업. data를 버릴 수 있는지, 먼저 저장해야 하는지 판단한다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">working set</td><td style="border-bottom:1px solid #27435d;">일정 시간 동안 workload가 반복해서 실제 접근하는 page 집합. resident capacity보다 크면 refault가 급증할 수 있다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">watermark</td><td style="border-bottom:1px solid #27435d;">memory zone이 유지하려는 free-page 기준선. 낮아지면 kswapd가 깨어나고 allocation path가 reclaim에 직접 참여할 수 있다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">kswapd / direct reclaim</td><td style="border-bottom:1px solid #27435d;">background reclaim kernel thread / allocation을 요청한 task가 자기 latency를 쓰며 수행하는 synchronous reclaim.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">LRU</td><td style="border-bottom:1px solid #27435d;">Least Recently Used. 최근 사용되지 않은 page부터 고르려는 근사 정책. Linux는 active/inactive 계열 또는 Multi-Gen LRU 같은 구현을 쓴다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">file-backed / anonymous</td><td style="border-bottom:1px solid #27435d;">원본 file에서 다시 읽을 수 있는 page / heap·stack처럼 file 원본이 없어 그대로 버릴 수 없는 page.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">swap / swap cache</td><td style="border-bottom:1px solid #27435d;">RAM 밖의 swap area에 anonymous page 내용을 보존하는 기법 / RAM page와 swap slot의 대응을 추적하는 cache.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">page fault / refault</td><td style="border-bottom:1px solid #27435d;">translation 또는 resident page가 없어 kernel이 처리하는 사건 / 최근 회수한 page를 다시 필요로 해 불러오는 fault.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">thrashing</td><td style="border-bottom:1px solid #27435d;">유용한 일을 하기보다 page를 내보내고 다시 읽는 데 대부분의 시간을 쓰는 상태.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">PSI</td><td style="border-bottom:1px solid #27435d;">Pressure Stall Information. CPU·memory·I/O 부족으로 task가 실제 멈춘 시간 비율을 나타내는 Linux 지표.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">OOM / OOM killer</td><td style="border-bottom:1px solid #27435d;">요청을 만족할 memory를 확보하지 못한 상태 / system 생존을 위해 victim task를 종료해 memory를 회수하는 최후 수단.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">memcg OOM</td><td style="border-bottom:1px solid #27435d;">machine 전체가 아니라 cgroup의 `memory.max` scope에서 발생한 OOM. 바깥 task는 victim 후보가 아니다.</td></tr>
+<tr><td style="color:#7dd3fc;font-weight:700;">oom_score_adj</td><td>OOM victim 선택 점수에 더하는 -1000~1000 조정값. -1000은 보호지만 남용하면 죽일 수 있는 task가 사라져 system 복구가 어려워진다.</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 비상 창고를 운영하는 도서관</h2>
+<p style="margin:0;">RAM은 책상, page cache는 원본 책이 서가에 있는 복사본, anonymous page는 원본이 없는 메모다. 자리가 부족하면 차가운 깨끗한 복사본은 버리고, dirty 복사본은 서가에 반영한 뒤 치운다. 원본 없는 메모는 swap 창고에 맡겨야 한다. 방금 치운 자료를 계속 다시 가져오면 직원은 운반만 하고 독서는 멈춘다. 그것이 thrashing이며, 더 치울 수도 저장할 곳도 없으면 관리자가 한 작업을 종료하는 것이 OOM kill이다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: allocation부터 reclaim·OOM까지</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">application allocation / page fault / kernel allocation
+                    │
+                    ▼
+             [free page allocator]
+        enough ─────┴───── pressure
+          │                  │
+          ▼                  ├─ low watermark → kswapd background reclaim
+       success               └─ allocation path → direct reclaim / throttle
+                                     │ scan cold folios
+                  ┌──────────────────┼────────────────────┐
+                  ▼                  ▼                    ▼
+          clean file page     dirty file page       anonymous page
+          unmap + drop        writeback + drop      swap-out if allowed
+                  └──────────────────┬────────────────────┘
+                                     ▼
+                              enough reclaimed?
+                       yes ──────────┴────────── no
+                        │                         │
+                     retry allocation     constrained/global OOM 판단
+                                                  │
+                                memcg OOM: 해당 cgroup 안에서 victim
+                                global/node/cpuset: 해당 allowed scope에서 victim</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. 상태 전이 그림: healthy → pressure → thrashing → OOM</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">[HEALTHY: working set fits]
+      │ allocation 증가 / limit 감소 / traffic 증가
+      ▼
+[PRESSURE: kswapd reclaim]
+      │ cold page가 충분함 ─────────────────────────────→ [RECOVERED]
+      │ cold page 부족, allocator stall
+      ▼
+[DIRECT RECLAIM / SWAP]
+      │ eviction한 page를 곧 refault, PSI some/full 증가
+      ▼
+[THRASHING: useful throughput 급락]
+      │ load shed·scale·memory release ────────────────→ [RECOVERED]
+      │ reclaim progress 없음, hard limit/allowed memory 소진
+      ▼
+[OOM DECISION] → victim SIGKILL → exit/reap으로 pages 반환 → [RECOVERY or REPEAT]
+
+주의: 모든 allocation 실패가 OOM kill을 부르지는 않는다.
+high-order·NOWAIT 성격 요청은 -ENOMEM/fallback으로 끝날 수 있다.</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. page 종류별 회수 비용</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:13px;">
+<tr style="background:#15314a;color:#bae6fd;"><td>page</td><td>reclaim 경로</td><td>다시 접근할 때</td></tr>
+<tr><td style="border-top:1px solid #27435d;">clean file-backed</td><td style="border-top:1px solid #27435d;">원본이 있으므로 mapping 정리 후 drop 가능</td><td style="border-top:1px solid #27435d;">file read fault; storage I/O 가능</td></tr>
+<tr><td style="border-top:1px solid #27435d;">dirty file-backed</td><td style="border-top:1px solid #27435d;">writeback 완료가 필요</td><td style="border-top:1px solid #27435d;">원본에서 다시 읽음</td></tr>
+<tr><td style="border-top:1px solid #27435d;">anonymous</td><td style="border-top:1px solid #27435d;">swap slot에 보존한 뒤 RAM에서 제거</td><td style="border-top:1px solid #27435d;">swap-in major fault 가능</td></tr>
+<tr><td style="border-top:1px solid #27435d;">mlocked / unevictable</td><td style="border-top:1px solid #27435d;">일반 reclaim 후보에서 제외</td><td style="border-top:1px solid #27435d;">resident 유지, 다른 page 압박 증가</td></tr>
+<tr><td style="border-top:1px solid #27435d;">reclaimable slab</td><td style="border-top:1px solid #27435d;">shrinker가 dentry/inode 등 object 회수</td><td style="border-top:1px solid #27435d;">metadata 재생성·I/O 비용 가능</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. CS·kernel·hardware deep dive</h2>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.1 reclaim은 정확한 LRU가 아니라 비용 있는 근사다</h3><p style="margin:0;">모든 memory access 시 global 순서를 갱신하면 overhead가 너무 크다. Linux는 accessed bit, active/inactive 정보 또는 Multi-Gen LRU의 generation·refault feedback으로 hot/cold를 근사한다. shared page, scan overhead, workload phase change 때문에 오판은 가능하다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.2 Multi-Gen LRU는 aging과 eviction의 feedback loop다</h3><p style="margin:0;">aging은 page-table walk와 accessed bit로 최근 page를 젊은 generation에 둔다. eviction은 오래된 generation을 소비하며 file/anon refault 비율을 관찰해 어느 type을 더 보호할지 조정한다. 즉 “anonymous 먼저”나 “file 먼저”라는 고정 규칙이 아니다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.3 kswapd와 direct reclaim의 latency 위치가 다르다</h3><p style="margin:0;">kswapd가 미리 free page를 회복하면 application은 덜 멈춘다. 따라잡지 못하면 allocation을 요청한 task가 scan·writeback·swap을 수행하거나 기다리므로 p99에 비용이 직접 나타난다. `pgscan_direct*`, `allocstall`, memory PSI가 중요한 이유다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.4 swap은 RAM 확장이 아니라 latency를 사는 보존 계층이다</h3><p style="margin:0;">swap이 있으면 cold anonymous data를 보존해 file cache와 active working set에 RAM을 돌릴 수 있고 급작스러운 OOM을 늦춘다. 그러나 hot page를 내보내면 swap-in I/O와 page fault가 반복된다. zram·zswap은 storage 대신 CPU·compressed RAM을 쓰므로 병목 위치만 달라진다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.5 swappiness는 RAM 사용률도 swap 비율도 아니다</h3><p style="margin:0;">Linux의 `vm.swappiness` 0~200은 swap I/O와 filesystem paging의 상대 비용 힌트다. 100은 비용이 같다고 보는 기준이고, 0도 swap을 완전히 금지하는 switch가 아니다. storage·zram·workload refault 비용을 측정해 정한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.6 thrashing은 capacity cliff다</h3><p style="margin:0;">resident frame 수가 working set보다 조금만 작아져도 cyclic workload는 방금 내보낸 page를 곧 다시 fault할 수 있다. throughput은 memory 사용량에 선형으로 감소하지 않고 급락한다. 높은 `pswpin/pswpout`, major fault, refault와 memory PSI full을 함께 본다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.7 PSI는 “얼마나 찼나”가 아니라 “얼마나 멈췄나”다</h3><p style="margin:0;">memory PSI `some`은 적어도 일부 task가 memory 때문에 멈춘 시간, `full`은 모든 non-idle task가 동시에 멈춘 시간이다. extended full은 kernel 문서가 thrashing으로 보는 심각한 생산성 손실이다. MemFree 하나보다 SLO와 직접 연결된다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.8 OOM의 scope는 machine 전체가 아닐 수 있다</h3><p style="margin:0;">`memory.max`, cpuset, NUMA mempolicy가 허용한 memory만 소진돼도 그 scope에서는 OOM이다. 다른 node나 host에 free memory가 보여도 사용할 수 없다. memcg OOM은 해당 cgroup 밖 task를 kill하지 않는다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.9 overcommit과 OOM은 다른 시점의 계약이다</h3><p style="margin:0;">overcommit은 virtual memory reservation을 허용할지 판단한다. `malloc` 성공 뒤 실제 page touch에서 physical backing이 부족해 OOM이 날 수 있다. 반대로 strict commit policy는 실제 RAM pressure 전에도 allocation을 `ENOMEM`으로 거절할 수 있다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.10 OOM kill은 종료가 아니라 회복 시작이다</h3><p style="margin:0;">victim에 SIGKILL을 보낸 즉시 모든 page가 사라지는 것은 아니다. task가 exit하고 shared reference·I/O·kernel path가 정리돼야 memory가 돌아온다. 같은 압력이 계속되면 연속 OOM이 날 수 있으므로 restart backoff와 load shedding이 필요하다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. cgroup v2를 pressure valve로 설계하기</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:13px;">
+<tr style="background:#15314a;color:#bae6fd;"><td>interface</td><td>의미</td><td>운영 의도</td></tr>
+<tr><td style="border-top:1px solid #27435d;">memory.low</td><td style="border-top:1px solid #27435d;">best-effort 보호</td><td style="border-top:1px solid #27435d;">중요 working set 보호, 과도한 합계 금지</td></tr>
+<tr><td style="border-top:1px solid #27435d;">memory.high</td><td style="border-top:1px solid #27435d;">throttle + heavy reclaim, OOM kill 없음</td><td style="border-top:1px solid #27435d;">hard limit 전에 pressure를 보이는 경보선</td></tr>
+<tr><td style="border-top:1px solid #27435d;">memory.max</td><td style="border-top:1px solid #27435d;">reclaim 실패 시 cgroup OOM</td><td style="border-top:1px solid #27435d;">blast radius를 막는 최종 guardrail</td></tr>
+<tr><td style="border-top:1px solid #27435d;">memory.swap.max</td><td style="border-top:1px solid #27435d;">cgroup swap 사용 상한</td><td style="border-top:1px solid #27435d;">latency budget과 capacity를 분리</td></tr>
+<tr><td style="border-top:1px solid #27435d;">memory.oom.group</td><td style="border-top:1px solid #27435d;">workload를 함께 kill</td><td style="border-top:1px solid #27435d;">부분 종료로 invariant가 깨지는 service 보호</td></tr>
+<tr><td style="border-top:1px solid #27435d;">memory.events.local</td><td style="border-top:1px solid #27435d;">low/high/max/oom/oom_kill 증분</td><td style="border-top:1px solid #27435d;">해당 cgroup 자체의 pressure 원인 판별</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. 실무 best practice</h2>
+<ul style="margin:0;padding-left:22px;"><li>capacity는 peak RSS가 아니라 working set, page cache, kernel memory, swap latency, failover headroom을 합쳐 잡는다.</li><li>`memory.high`에서 먼저 throttle·alert하고 `memory.max`는 최종 blast-radius guardrail로 둔다. 두 값을 같게 두어 warning window를 없애지 않는다.</li><li>PSI some/full, allocation latency, `pgscan_direct*`, refault, swap-in/out, major fault를 application p99와 같은 timestamp로 수집한다.</li><li>stat counter는 boot 이후 누적값이므로 rate·delta로 비교하고 kernel version별 field 존재 여부를 확인한다.</li><li>restartable batch와 stateful quorum member의 `oom_score_adj`·`memory.oom.group` 정책을 다르게 설계하고 이유를 문서화한다.</li><li>load shedding, queue bound, concurrency cap, autoscaling을 OOM 전 PSI threshold에 연결한다.</li><li>swappiness·swap size·zram/zswap은 canary에서 throughput·p99·CPU·I/O·OOM 빈도를 함께 비교한다.</li><li>모든 daemon을 `oom_score_adj=-1000`으로 보호하지 않는다. system이 희생할 안전한 후보와 recovery service의 memory reserve를 남긴다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. error handling runbook</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;">scope 식별:</strong> global, NUMA/cpuset, container cgroup 중 어디의 allowed memory가 소진됐는지 확인한다.</li><li><strong style="color:#f8fafc;">stall 확인:</strong> `/proc/pressure/memory`와 cgroup `memory.pressure`, p99를 보고 “가득 참”과 “멈춤”을 구분한다.</li><li><strong style="color:#f8fafc;">reclaim 분해:</strong> vmstat delta로 kswapd/direct scan·steal, refault, major fault, swap-in/out, writeback을 묶는다.</li><li><strong style="color:#f8fafc;">즉시 완화:</strong> admission을 닫고 low-priority traffic·batch를 줄이며 concurrency를 제한한다. 무작정 cache를 drop하지 않는다.</li><li><strong style="color:#f8fafc;">OOM 증거:</strong> `memory.events.local`, kernel journal, victim·scope·constraint·order, restart 횟수를 보존한다.</li><li><strong style="color:#f8fafc;">복구:</strong> victim을 backoff와 readiness gate로 재시작하고 memory가 실제 반환될 때까지 traffic을 서서히 연다.</li><li><strong style="color:#f8fafc;">근본 수정:</strong> leak/retention, working-set 증가, limit 오설정, cache growth, unevictable memory, swap latency 중 하나를 증거로 좁힌다.</li><li><strong style="color:#f8fafc;">rollback:</strong> 새 limit·swappiness·page policy와 동시에 시작된 회귀라면 한 변수만 되돌리고 같은 지표로 확인한다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 놓치기 쉬운 함정</h2>
+<ul style="margin:0;padding-left:22px;"><li><strong style="color:#fecaca;">free memory가 적으면 장애:</strong> file cache 활용은 정상이며 stall·reclaim efficiency를 봐야 한다.</li><li><strong style="color:#fecaca;">swap 사용량이 있으면 thrashing:</strong> cold page가 오래 swap에 있는 것은 문제 아닐 수 있다. 지속 swap-in/out과 refault·PSI가 핵심이다.</li><li><strong style="color:#fecaca;">swappiness 0이면 swap off:</strong> 완전 금지가 아니라 reclaim 비용 선호가 크게 바뀐다.</li><li><strong style="color:#fecaca;">OOM은 host RAM 100%에서만:</strong> cgroup·cpuset·mempolicy scope exhaustion도 OOM을 만든다.</li><li><strong style="color:#fecaca;">OOM killer가 가장 큰 RSS를 죽임:</strong> allowed memory 기준 badness와 `oom_score_adj`, scope가 함께 작동한다.</li><li><strong style="color:#fecaca;">OOM kill 즉시 정상:</strong> victim exit와 memory 반환, restart storm까지 관찰해야 한다.</li><li><strong style="color:#fecaca;">drop_caches가 leak 치료:</strong> 재구성 가능한 cache를 버릴 뿐 live object leak을 고치지 않고 다음 I/O를 악화시킨다.</li><li><strong style="color:#fecaca;">pressure 중 swapoff가 안전:</strong> swap page를 RAM으로 되돌릴 공간이 없어 실패하거나 더 큰 stall을 만들 수 있다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. 30분 실습: working-set cliff simulator</h2>
+<p style="margin:0 0 10px;">8-page working set을 다섯 번 순회하는 fully-associative LRU 모델이다. frame이 8개면 첫 pass 뒤 hit지만 6개면 방금 쫓아낸 page를 다시 요구해 모든 access가 miss가 된다.</p>
+<pre style="margin:0;white-space:pre;overflow-x:auto;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;">python3 - &lt;&lt;'PY'
+from collections import OrderedDict
+
+def run(working_set=8, frames=8, passes=5):
+    resident, seen = OrderedDict(), set()
+    hits = misses = evictions = refaults = 0
+    for page in list(range(working_set)) * passes:
+        if page in resident:
+            hits += 1
+            resident.move_to_end(page)
+            continue
+        misses += 1
+        if page in seen:
+            refaults += 1
+        seen.add(page)
+        if len(resident) == frames:
+            resident.popitem(last=False)
+            evictions += 1
+        resident[page] = None
+    return hits, misses, evictions, refaults
+
+for frames in (8, 6, 4):
+    print("frames=", frames, "hits/miss/evict/refault=", run(frames=frames))
+
+assert run(frames=8) == (32, 8, 0, 0)
+assert run(frames=6) == (0, 40, 34, 32)
+assert run(frames=4) == (0, 40, 36, 32)
+PY</pre>
+<ol style="margin:12px 0 0;padding-left:22px;"><li><strong style="color:#f8fafc;">0~10분:</strong> frame 8과 6의 첫 두 pass를 손으로 그린다.</li><li><strong style="color:#f8fafc;">10~20분:</strong> working set·frame·access pattern을 바꿔 miss cliff를 찾는다.</li><li><strong style="color:#f8fafc;">20~30분:</strong> 실제 system의 `workingset_refault`, `pswpin/out`, major fault, PSI와 모델 변수를 연결한다.</li></ol>
+<p style="margin:10px 0 0;padding:10px 12px;background:#13283a;border-left:4px solid #5eead4;color:#c8e5f3;font-size:14px;"><strong>모델 한계:</strong> Linux의 active/inactive·Multi-Gen LRU, file/anon 비용, dirty writeback, swap readahead, shared page, cgroup scope를 생략한다. “working set이 resident capacity를 넘으면 refault feedback이 폭발할 수 있다”는 불변식을 분리해 본다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. Linux production 관찰</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;"># stall과 1초 rate: 첫 vmstat 행은 boot 이후 평균이므로 -y 사용
+cat /proc/pressure/memory
+vmstat -y 1
+
+# 누적 counter는 두 snapshot의 delta를 계산
+grep -E 'pgscan|pgsteal|allocstall|workingset_refault|pswpin|pswpout|pgmajfault' /proc/vmstat
+grep -E 'MemAvailable|SwapTotal|SwapFree|Active|Inactive|Unevictable|Mlocked' /proc/meminfo
+cat /proc/swaps
+
+# cgroup v2: 실제 workload 경로로 바꾼다
+cg=/sys/fs/cgroup/&lt;WORKLOAD&gt;
+cat "$cg/memory.current" "$cg/memory.high" "$cg/memory.max"
+cat "$cg/memory.swap.current" "$cg/memory.swap.max"
+cat "$cg/memory.events.local" "$cg/memory.pressure"
+grep -E '^(anon|file|kernel|slab|workingset_refault)' "$cg/memory.stat"
+
+# OOM evidence: 배포 환경의 journal 보존 정책을 확인
+journalctl -k --since '-15 min' | grep -Ei 'out of memory|oom-kill|killed process'</pre>
+<p style="margin:10px 0 0;">`memory.events`는 hierarchy 누적이고 `memory.events.local`은 해당 cgroup 자체 사건이다. host와 container의 PSI·limits를 모두 확인해 원인 scope를 혼동하지 않는다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 실패 시나리오</h2>
+<p style="margin:0;">cache service의 dataset이 20% 늘자 `memory.current`가 `memory.high`를 넘고 direct reclaim이 시작됐다. 평균 RSS만 보면 limit 아래였지만 `memory.events.local high`, `pgscan_direct`, `workingset_refault`, memory PSI full, p99가 함께 상승했다. 운영자가 swap을 끄거나 cache를 전부 drop하지 않고 admission을 줄여 working set을 낮춘 뒤 replica를 추가했다. `memory.max` 직전 OOM을 피하고, 이후 key density와 object retention을 수정해 high event rate와 refault/PSI가 baseline으로 돌아온 것을 확인했다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 대기업 면접 질문 3개</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;">memory pressure에서 file page와 anonymous page는 어떻게 reclaim되는가?</strong><br>답변 포인트: clean drop, dirty writeback, anonymous swap, unevictable, fault/refault 비용, LRU/MGLRU 근사.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">swap 사용과 thrashing을 어떻게 구분하는가?</strong><br>답변 포인트: 사용량 stock보다 pswpin/out rate, major fault·refault, PSI some/full, throughput·p99, working set capacity cliff.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">container OOM과 host OOM을 어떻게 진단·예방하는가?</strong><br>답변 포인트: allowed scope, memory.events.local, high vs max, cgroup 밖 victim 금지, oom.group/score_adj, load shed·headroom·restart backoff.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">15. 퀴즈·누적 리뷰</h2>
+<ol style="margin:0;padding-left:22px;"><li>clean file page가 anonymous page보다 보통 싸게 회수되는 이유는? storage의 원본에서 다시 만들 수 있어 swap write가 필요 없기 때문이다.</li><li>swap used가 높지만 pswpin/out과 PSI가 안정적이면 즉시 thrashing인가? 아니다. cold data가 오래 보관된 상태일 수 있다.</li><li>`memory.high` 초과가 바로 OOM kill을 일으키는가? 아니다. throttle과 heavy reclaim을 만들며 OOM은 `memory.max` reclaim 실패에서 발생한다.</li><li>Day 28 연결: RSS가 유지돼도 live object가 bounded면 allocator/page cache retention일 수 있고, pressure·refault 증거 없이 leak으로 단정하지 않는다.</li><li>Day 32 연결: huge page의 sparse allocation과 split/compaction이 reclaim pressure·RSS amplification을 키울 수 있다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">16. 다음 날 연결</h2>
+<p style="margin:0;">Day 34는 <strong style="color:#f8fafc;">실패 실습: fragmentation과 locality benchmark</strong>다. allocator·SLUB·NUMA·huge page·reclaim을 한 실습에 묶어 총 free memory만으로 allocation 성공과 latency를 예측할 수 없는 이유를 측정한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">17. 공식·1차 출처</h2>
+<ul style="margin:0;padding-left:22px;word-break:break-word;"><li><a href="https://docs.kernel.org/admin-guide/mm/concepts.html" style="color:#7dd3fc;">Linux Kernel — Memory Management Concepts</a>: reclaim과 OOM killer의 역할.</li><li><a href="https://docs.kernel.org/admin-guide/mm/multigen_lru.html" style="color:#7dd3fc;">Linux Kernel — Multi-Gen LRU</a>: aging·eviction·refault feedback과 thrashing prevention.</li><li><a href="https://docs.kernel.org/accounting/psi.html" style="color:#7dd3fc;">Linux Kernel — Pressure Stall Information</a>: memory some/full, thrashing 의미와 threshold trigger.</li><li><a href="https://docs.kernel.org/admin-guide/cgroup-v2.html" style="color:#7dd3fc;">Linux Kernel — cgroup v2 Memory Controller</a>: memory.low/high/max, swap, events, group OOM.</li><li><a href="https://docs.kernel.org/admin-guide/sysctl/vm.html" style="color:#7dd3fc;">Linux Kernel — /proc/sys/vm</a>: swappiness, page-cluster, watermark와 recovery reserve.</li><li><a href="https://man7.org/linux/man-pages/man5/proc_vmstat.5.html" style="color:#7dd3fc;">proc_vmstat(5)</a>: scan·steal·fault·swap·workingset 누적 counter.</li><li><a href="https://docs.kernel.org/filesystems/proc.html" style="color:#7dd3fc;">Linux Kernel — /proc Filesystem</a>: OOM badness와 `oom_score_adj` scope.</li><li><a href="https://man7.org/linux/man-pages/man2/mlock.2.html" style="color:#7dd3fc;">mlock(2)</a>: page resident 보장, limits와 unevictable memory의 계약.</li></ul>
+<p style="margin:28px 0 0;padding-top:18px;border-top:1px solid #27435d;color:#8fb3c9;font-size:13px;">Day 33 완료 기준: allocation→kswapd/direct reclaim→file drop/writeback·anonymous swap→refault/thrashing→scoped OOM 흐름을 그리고, MemFree가 아니라 PSI·vmstat delta·cgroup events로 복구 우선순위를 방어할 수 있다.</p>
+</td></tr></table></td></tr></table>
+</body></html>
