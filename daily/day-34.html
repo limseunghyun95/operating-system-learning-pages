@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Operating System 심화 커리큘럼 Day 34 - 실패 실습: fragmentation과 locality benchmark</title></head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.72;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#07111f;"><tr><td align="center" style="padding:24px 12px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:680px;background:#0f1d2e;border:1px solid #23415d;border-radius:18px;overflow:hidden;">
+<tr><td style="padding:30px 28px 22px;background:#102a43;border-bottom:1px solid #28506f;">
+<div style="font-size:13px;letter-spacing:.12em;color:#5eead4;font-weight:800;">OPERATING SYSTEM · DAY 34 / 63 · FAILURE LAB</div>
+<h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">실패 실습: fragmentation과 locality benchmark</h1>
+<p style="margin:0;color:#b9d6eb;">한 줄 요약: <strong style="color:#f8fafc;">총 free memory가 충분해도 필요한 크기의 연속 block이 없으면 allocation은 실패하거나 compaction으로 지연되고, 같은 byte를 같은 횟수만큼 읽어도 순서가 cache·TLB·prefetcher 친화적인지에 따라 시간이 달라진다.</strong> capacity와 shape, correctness와 locality를 각각 측정해야 한다.</p>
+</td></tr><tr><td style="padding:26px 28px 34px;">
+
+<h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:14px;">
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;width:31%;">internal fragmentation</td><td style="border-bottom:1px solid #27435d;">할당된 block 내부에서 실제 요청보다 크게 반올림되어 낭비되는 공간. size class·alignment 때문에 생긴다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">external fragmentation</td><td style="border-bottom:1px solid #27435d;">free 공간 총합은 충분하지만 작은 구멍으로 흩어져 큰 연속 block 요청을 만족하지 못하는 상태.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">virtual / physical contiguous</td><td style="border-bottom:1px solid #27435d;">process 주소가 연속인 것 / 실제 RAM frame이 연속인 것. page table은 흩어진 physical page를 연속 VA로 보이게 할 수 있다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">buddy allocator</td><td style="border-bottom:1px solid #27435d;">Linux가 physical page를 2의 거듭제곱 block으로 split·merge하는 allocator. 같은 크기·정렬의 짝을 buddy라 부른다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">order</td><td style="border-bottom:1px solid #27435d;">buddy block 크기 지수. byte 크기는 <code>2^order × PAGE_SIZE</code>다. 4KiB base page에서 order 9는 2MiB다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">pageblock / migratetype</td><td style="border-bottom:1px solid #27435d;">fragmentation을 제어하는 큰 page 묶음 / Movable·Unmovable·Reclaimable처럼 page 이동 가능성을 분류한 속성.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">compaction</td><td style="border-bottom:1px solid #27435d;">movable page를 옮겨 흩어진 free page를 큰 연속 영역으로 모으는 kernel 작업. reclaim과 달리 반드시 사용량을 줄이지는 않는다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">high-order allocation</td><td style="border-bottom:1px solid #27435d;">order 1 이상처럼 여러 physical page가 연속이어야 하는 요청. THP·일부 DMA·큰 slab 등이 필요로 할 수 있다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">locality</td><td style="border-bottom:1px solid #27435d;">최근 data를 다시 쓰는 temporal locality와 가까운 주소를 연속 사용하는 spatial locality.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">cache line / prefetcher</td><td style="border-bottom:1px solid #27435d;">CPU cache 이동·coherence 단위 / 규칙적 접근을 예측해 미리 data를 가져오는 hardware.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">arena / size class</td><td style="border-bottom:1px solid #27435d;">user allocator가 thread 경쟁을 줄이려 나눈 heap 영역 / 비슷한 요청을 같은 block 크기로 반올림해 재사용하는 분류.</td></tr>
+<tr><td style="color:#7dd3fc;font-weight:700;">benchmark confounder</td><td>관심 원인 외에 측정값을 바꾸는 요인. page fault, CPU migration, turbo/DVFS, compiler 최적화, cache warmup, background task 등이 있다.</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 빈 좌석 총합과 붙어 있는 좌석</h2>
+<p style="margin:0;">공연장에 빈 좌석 32개가 있어도 16명이 한 줄로 앉아야 하는데 빈자리가 8개씩 네 군데 흩어져 있으면 예약은 실패한다. 사람을 다른 자리로 이동시켜 16석을 붙이는 것이 compaction이다. 좌석을 확보한 뒤에도 관객이 순서대로 출구를 지나면 흐름이 좋지만 무작위로 건물을 왕복하면 같은 인원이어도 이동 시간이 늘어난다. 앞은 fragmentation, 뒤는 locality 문제다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: object에서 physical page·CPU cache까지</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">application malloc / aligned allocation
+            │
+            ▼
+ user allocator: arena → size class → free list
+       │ reuse block              │ 더 많은 VA 필요
+       │                          ▼
+       │                    brk / mmap VMA
+       │                          │ first touch / fault
+       ▼                          ▼
+ virtual object ─────────→ kernel page allocator
+                            per-CPU pageset → zone buddy free_area[order]
+                                              │ 부족
+                                   reclaim / compaction / fallback
+                                              ▼
+                            physical frames on NUMA node
+                                              │ access
+                                              ▼
+ VA → TLB → cache line → LLC → memory controller → DRAM
+
+fragmentation: 각 allocator layer에서 “free 총합”과 “쓸 수 있는 shape”가 다름
+locality: allocation 성공 뒤에도 access order·CPU/node placement가 latency를 결정</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. 상태 전이 그림: buddy split·merge와 compaction</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">[free order 3: 8 pages]
+        │ order 1 요청
+        ▼ split
+[order 2: 4] + [order 2: 4]
+        │ split one
+        ▼
+[order 1 allocated: 2] + [order 1 free: 2] + [order 2 free: 4]
+
+free(A) ─ buddy도 free이고 정렬된 짝인가? ─ yes → merge → higher order
+                                       └ no  → 같은 order hole 유지
+
+[order-0 free는 많지만 higher order가 0]
+        │ high-order request
+        ├─ movable page 충분 → kcompactd/direct compaction → retry
+        ├─ unmovable pinning → compaction 실패·defer
+        └─ policy 허용 → smaller page fallback / allocation failure
+
+compaction은 page를 이동해 shape를 바꾸고, reclaim은 사용 page를 free로 바꾼다.</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. 실패 실습의 두 질문</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:13px;">
+<tr style="background:#15314a;color:#bae6fd;"><td>실험</td><td>고정할 것</td><td>판정할 것</td></tr>
+<tr><td style="border-top:1px solid #27435d;">first-fit simulator</td><td style="border-top:1px solid #27435d;">arena 64, block 8×8, free pattern</td><td style="border-top:1px solid #27435d;">total free와 largest free가 다른가?</td></tr>
+<tr><td style="border-top:1px solid #27435d;">C locality benchmark</td><td style="border-top:1px solid #27435d;">64MiB, 64B line, 동일 access 수·sum</td><td style="border-top:1px solid #27435d;">sequential/random ns per access 차이</td></tr>
+<tr><td style="border-top:1px solid #27435d;">Linux 관찰</td><td style="border-top:1px solid #27435d;">동일 host·traffic window</td><td style="border-top:1px solid #27435d;">buddy order, migratetype, compaction·THP counter</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. CS·kernel·hardware deep dive</h2>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.1 fragmentation은 layer마다 별개다</h3><p style="margin:0;">user allocator free list가 조각나도 OS에는 page를 반환하지 않았을 수 있고, physical buddy가 조각나도 일반 `malloc`은 흩어진 page를 연속 VA로 map해 성공할 수 있다. allocator metric, RSS, `/proc/buddyinfo`를 한 숫자로 섞으면 안 된다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.2 virtual contiguous는 보통 physical contiguous를 요구하지 않는다</h3><p style="margin:0;">page table이 각 virtual page를 다른 frame에 연결할 수 있으므로 큰 user buffer가 곧 high-order physical allocation은 아니다. DMA, 일부 kernel object, HugeTLB/THP backing처럼 physical shape가 중요한 경로를 따로 본다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.3 buddy order는 capacity와 shape를 동시에 표현한다</h3><p style="margin:0;">`free_area[order]`의 각 block은 `2^order` page다. 작은 order block 총합이 커도 요청 order column이 0이면 즉시 만족할 block이 없다. `/proc/buddyinfo`는 node·zone별 shape를 보여 주지만 미래 allocation 성공을 보장하는 예약표는 아니다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.4 migratetype은 미래 compaction 가능성을 보존한다</h3><p style="margin:0;">Movable·Reclaimable·Unmovable page를 pageblock 단위로 가능한 한 분리하면 movable page를 옮겨 큰 hole을 만들기 쉽다. unmovable page 하나가 pageblock에 섞이면 많은 free page가 있어도 큰 연속 영역을 만들기 어려울 수 있다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.5 direct compaction은 성공률과 tail latency를 교환한다</h3><p style="margin:0;">`kcompactd`는 background에서 shape를 준비하지만 allocation 순간 부족하면 caller가 synchronous compaction을 할 수 있다. THP `defrag=always`는 immediate huge page 성공을 위해 application을 stall시킬 수 있고, `defer` 계열은 background 준비와 later collapse를 선호한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.6 arena는 lock contention을 줄이고 footprint를 늘릴 수 있다</h3><p style="margin:0;">thread별/다중 arena는 allocator lock 경쟁을 줄이지만 free block이 arena 사이에서 즉시 합쳐지지 않아 각 arena에 작은 잔여 공간이 남을 수 있다. throughput만 보고 RSS·return-to-OS·tail allocation latency를 놓치지 않는다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.7 alignment는 correctness 요구와 performance hint가 다르다</h3><p style="margin:0;">direct I/O·DMA·SIMD API는 특정 alignment가 계약일 수 있지만, 모든 object를 cache-line/page 정렬하면 padding과 working set이 커진다. `posix_memalign`은 alignment가 2의 거듭제곱이면서 pointer 크기의 배수여야 하고 실패 시 errno가 아니라 return code를 확인한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.8 sequential access는 hardware가 추측할 수 있다</h3><p style="margin:0;">연속 cache line은 spatial locality와 prefetcher를 활용하고 page walk도 규칙적이다. random order는 cache line reuse, prefetch, TLB set/level behavior를 불리하게 만들 수 있다. 연산 수와 결과가 같아도 memory-level parallelism과 stall 시간이 달라진다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.9 benchmark는 compiler와 scheduler도 측정한다</h3><p style="margin:0;">compiler가 unused load를 제거할 수 있어 sum을 검증해야 한다. first-touch fault, warm cache, CPU migration, frequency, SMT neighbor, NUMA placement, background process가 결과를 바꾼다. 반복·분포·PMU 증거 없이 한 번의 wall time을 결론으로 쓰지 않는다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.10 locality 최적화가 fragmentation을 키울 수 있다</h3><p style="margin:0;">cache-line padding, per-thread shard, huge page, NUMA-local pool은 접근 비용을 줄이지만 object·page footprint와 stranded free space를 늘릴 수 있다. Day 29~33의 allocator, NUMA, TLB, reclaim 지표를 함께 비교해야 한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. 결과를 어떻게 읽을까?</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:13px;">
+<tr style="background:#15314a;color:#bae6fd;"><td>관찰</td><td>가능한 해석</td><td>추가 증거</td></tr>
+<tr><td style="border-top:1px solid #27435d;">total free↑, largest free↓</td><td style="border-top:1px solid #27435d;">external fragmentation</td><td style="border-top:1px solid #27435d;">free-list histogram, buddy order</td></tr>
+<tr><td style="border-top:1px solid #27435d;">high order 0, compact_stall↑</td><td style="border-top:1px solid #27435d;">physical shape 회복 시도</td><td style="border-top:1px solid #27435d;">pagetypeinfo, compact_fail/success</td></tr>
+<tr><td style="border-top:1px solid #27435d;">random ns/access↑</td><td style="border-top:1px solid #27435d;">locality/prefetch/cache/TLB 후보</td><td style="border-top:1px solid #27435d;">perf cache·dTLB event, repeat variance</td></tr>
+<tr><td style="border-top:1px solid #27435d;">RSS↑, live bytes 일정</td><td style="border-top:1px solid #27435d;">arena retention/internal fragmentation 후보</td><td style="border-top:1px solid #27435d;">malloc_info, mapping·allocator profile</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. 실무 best practice</h2>
+<ul style="margin:0;padding-left:22px;"><li>allocation 실패 metric에 requested size, alignment, allocator/zone/node, errno 또는 return code를 구조화해 남긴다.</li><li>큰 contiguous physical allocation은 boot-time reserve, CMA, scatter-gather, smaller chunk fallback 등 architecture 단계에서 줄인다.</li><li>object lifetime·size가 비슷한 것끼리 pool을 나눠 coalescing과 page 반환 가능성을 높인다.</li><li>arena·size-class·padding 변경은 throughput뿐 아니라 RSS/PSS, largest free, p99 allocation, reclaim·compaction을 함께 canary한다.</li><li>benchmark는 pre-touch, warmup, 동일 access 수, correctness checksum, 반복과 median/p95, CPU/node affinity를 명시한다.</li><li>PMU event는 CPU·kernel·virtualization마다 지원이 다르므로 `perf list`로 확인하고 wall time과 교차한다.</li><li>production에서 `compact_memory`·`drop_caches`를 임의 실행하지 않는다. workload stall과 cache cold-start를 만들 수 있다.</li><li>THP fallback을 정상 경로로 두고 huge-page 성공률보다 SLO와 memory headroom을 우선한다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. error handling runbook</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;">failure contract:</strong> `malloc` NULL+errno, `posix_memalign` return code, kernel allocation fallback 여부를 구분한다.</li><li><strong style="color:#f8fafc;">scope:</strong> user allocator free-list 문제인지 physical buddy node/zone/order 문제인지 먼저 가른다.</li><li><strong style="color:#f8fafc;">partial rollback:</strong> 여러 chunk 중간 실패 시 이미 얻은 block을 정확히 해제하고 external side effect를 commit하지 않는다.</li><li><strong style="color:#f8fafc;">shape evidence:</strong> `/proc/buddyinfo`, `/proc/pagetypeinfo`, `compact_stall/fail/success`, THP fallback delta를 같은 시간축에 보존한다.</li><li><strong style="color:#f8fafc;">latency evidence:</strong> allocator p99, memory PSI, CPU, page fault, cache/TLB miss를 배포 전후 같은 workload로 비교한다.</li><li><strong style="color:#f8fafc;">safe mitigation:</strong> smaller chunks, scatter-gather, alignment 완화, concurrency/working-set 축소 중 계약에 맞는 하나를 canary한다.</li><li><strong style="color:#f8fafc;">rollback:</strong> compaction·THP·arena tuning 뒤 p99나 RSS가 악화되면 즉시 이전 정책으로 돌아가고 background 회복 시간을 관찰한다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 놓치기 쉬운 함정</h2>
+<ul style="margin:0;padding-left:22px;"><li><strong style="color:#fecaca;">MemFree가 크면 큰 allocation 성공:</strong> zone·node·order·migratetype shape가 맞아야 한다.</li><li><strong style="color:#fecaca;">큰 malloc은 연속 physical RAM:</strong> 일반 user mapping은 흩어진 frame을 연속 VA로 구성할 수 있다.</li><li><strong style="color:#fecaca;">compaction은 memory를 free:</strong> 주목적은 movable page를 옮겨 free 공간을 모으는 것이다.</li><li><strong style="color:#fecaca;">random이 느리면 cache miss 확정:</strong> order-array load, TLB, prefetch, branch, NUMA까지 포함된 후보이므로 PMU로 좁힌다.</li><li><strong style="color:#fecaca;">평균이 빨라지면 성공:</strong> allocation/compaction p99와 RSS·OOM headroom 회귀를 확인해야 한다.</li><li><strong style="color:#fecaca;">한 번의 microbenchmark가 production:</strong> 실제 data layout, concurrency, CPU topology, compiler flag를 반영하지 않는다.</li><li><strong style="color:#fecaca;">malloc non-NULL이면 memory 확보 완료:</strong> Linux overcommit에서는 first touch 시점에 backing 실패·OOM이 가능하다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. 30분 실습 A: external fragmentation 재현</h2>
+<p style="margin:0 0 10px;">64-unit first-fit arena를 8-unit block 8개로 채우고 교대로 free한다. 총 32가 비어도 largest hole은 8이라 16 요청이 실패한다. 인접 block을 하나 더 free해 coalesce하면 성공한다.</p>
+<pre style="margin:0;white-space:pre;overflow-x:auto;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;">python3 - &lt;&lt;'PY'
+class Arena:
+    def __init__(self, size):
+        self.free, self.used = [(0, size)], {}
+    def alloc(self, ident, size):
+        for i, (start, length) in enumerate(self.free):
+            if length &lt; size: continue
+            self.used[ident] = (start, size)
+            self.free[i:i+1] = [] if length == size else [(start+size, length-size)]
+            return (start, size)
+        return None
+    def release(self, ident):
+        self.free.append(self.used.pop(ident)); self.free.sort()
+        merged = []
+        for start, length in self.free:
+            if merged and merged[-1][0] + merged[-1][1] == start:
+                a, n = merged[-1]; merged[-1] = (a, n+length)
+            else: merged.append((start, length))
+        self.free = merged
+    def stats(self):
+        return sum(n for _, n in self.free), max(n for _, n in self.free)
+
+a = Arena(64)
+for ident in range(8): assert a.alloc(ident, 8)
+for ident in (1, 3, 5, 7): a.release(ident)
+print("fragmented", a.stats(), "alloc16=", a.alloc("big", 16))
+assert a.stats() == (32, 8) and "big" not in a.used
+a.release(0)
+print("coalesced", a.stats())
+assert a.stats() == (40, 16) and a.alloc("big", 16) == (0, 16)
+PY</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 30분 실습 B: 동일 access 수의 locality 비교</h2>
+<p style="margin:0 0 10px;">64MiB의 모든 64B line을 8번 읽는다. sequential/random 모두 8,388,608번 읽고 checksum도 같게 해 correctness를 고정한다. 개발 장비에서만 실행하고 다른 workload와 결과 수치를 비교하지 않는다.</p>
+<pre style="margin:0;white-space:pre;overflow-x:auto;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;">cat &gt;/tmp/locality.c &lt;&lt;'C'
+#define _POSIX_C_SOURCE 200809L
+#include &lt;inttypes.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;time.h&gt;
+enum { LINE=64, MIB=1024*1024, BYTES=64*MIB, ROUNDS=8 };
+static uint64_t ns(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&amp;t);
+  return (uint64_t)t.tv_sec*1000000000ULL+t.tv_nsec; }
+static uint32_t rnd(uint32_t *s){ uint32_t x=*s; x^=x&lt;&lt;13; x^=x&gt;&gt;17;
+  x^=x&lt;&lt;5; return *s=x; }
+static double bench(volatile unsigned char *d,size_t *o,size_t n,int random,
+                    uint64_t *sum){ uint64_t s=0,t=ns();
+  for(int r=0;r&lt;ROUNDS;r++) for(size_t i=0;i&lt;n;i++)
+    s+=d[(random?o[i]:i)*LINE];
+  *sum=s; return (double)(ns()-t)/(n*ROUNDS); }
+int main(void){ size_t n=BYTES/LINE,*o=malloc(n*sizeof *o); unsigned char *d=0;
+  if(!o) return 1; int rc=posix_memalign((void**)&amp;d,LINE,BYTES);
+  if(rc){ fprintf(stderr,"posix_memalign=%d\n",rc); free(o); return 1; }
+  for(size_t i=0;i&lt;n;i++){ d[i*LINE]=1; o[i]=i; }
+  uint32_t state=0x12345678U;
+  for(size_t i=n-1;i&gt;0;i--){ size_t j=rnd(&amp;state)%(i+1),x=o[i];o[i]=o[j];o[j]=x; }
+  uint64_t a,b; double seq=bench(d,o,n,0,&amp;a),ran=bench(d,o,n,1,&amp;b);
+  printf("seq_ns=%.3f random_ns=%.3f ratio=%.2f sums=%"PRIu64"/%"PRIu64"\n",
+         seq,ran,ran/seq,a,b); free(d);free(o); return a==b?0:2; }
+C
+cc -O2 -std=c11 -Wall -Wextra -Werror /tmp/locality.c -o /tmp/locality
+/tmp/locality</pre>
+<p style="margin:10px 0 0;">검증 host의 한 실행은 `sequential=1.789ns`, `random=4.283ns`, ratio `2.39`, 두 sum 모두 `8,388,608`이었다. 절대값과 ratio는 hardware·OS·부하마다 달라진다. random mode는 permutation array load도 포함하므로 순수 cache penalty만 분리한 값이 아니다.</p>
+<ol style="margin:12px 0 0;padding-left:22px;"><li><strong style="color:#f8fafc;">0~10분:</strong> simulator로 total free와 largest free 불변식을 확인한다.</li><li><strong style="color:#f8fafc;">10~25분:</strong> C benchmark를 5회 반복하고 median·범위를 기록한다.</li><li><strong style="color:#f8fafc;">25~30분:</strong> Linux라면 `perf stat -d -d -r 5 -- /tmp/locality`로 cache·TLB event 지원 여부와 변화를 확인한다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. Linux production 관찰</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">getconf PAGESIZE
+cat /proc/buddyinfo
+cat /proc/pagetypeinfo
+
+# 두 snapshot delta로 compaction/THP 실패와 성공을 본다
+grep -E 'compact_(stall|fail|success)|pgmigrate_(success|fail)|thp_(fault|collapse).*' /proc/vmstat
+
+# allocator·mapping 관찰: glibc 전용 API는 다른 libc에서 다르다
+cat /proc/&lt;PID&gt;/smaps_rollup
+pmap -x &lt;PID&gt;
+
+# event 이름·권한·PMU 지원을 perf list로 먼저 확인
+perf list | grep -Ei 'cache-misses|dTLB'
+perf stat -d -d -r 5 -- /tmp/locality</pre>
+<p style="margin:10px 0 0;">`buddyinfo` 각 column은 order 0부터 시작하며 block byte는 `count × 2^order × PAGE_SIZE`로 환산한다. `pagetypeinfo`로 같은 order를 migratetype별로 나눠 unmovable contamination 가능성을 본다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 실패 시나리오</h2>
+<p style="margin:0;">영상 처리 service가 배포 후 평균 RSS는 동일했지만 간헐적으로 2MiB buffer 준비에 200ms가 걸렸다. 팀은 “free RAM 20GiB”만 보고 storage 문제로 오판했다. 실제로는 새로운 per-thread pool이 많은 unmovable·짧은 수명 page를 섞어 higher-order block을 고갈시켰고 `compact_stall`과 p99가 함께 올랐다. global compaction을 강제하지 않고 pool 수를 제한하고 buffer를 smaller chunk+scatter-gather로 바꿔, order 분포·compact delta·p99가 동시에 회복된 변경만 채택했다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">15. 대기업 면접 질문 3개</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;">free memory가 충분한데 allocation이 실패할 수 있는 이유는?</strong><br>답변 포인트: allocator layer, largest contiguous block, node/zone/order/GFP constraint, migratetype, compaction, general malloc의 virtual contiguity와 구분.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">sequential access가 random보다 빠른 이유를 어떻게 증명할까?</strong><br>답변 포인트: 동일 work/checksum, cache line·prefetcher·TLB, warmup·affinity·NUMA 통제, 반복 분포, perf event 교차 검증.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">fragmentation을 줄이는 설계의 trade-off는?</strong><br>답변 포인트: lifetime/size pool, arena 수, compaction CPU·stall, padding footprint, huge page TLB 이득과 memory waste, chunk/scatter-gather 복잡도.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">16. 퀴즈·누적 리뷰</h2>
+<ol style="margin:0;padding-left:22px;"><li>4KiB page에서 order 9 block 크기는? `2^9 × 4KiB = 2MiB`.</li><li>compaction과 reclaim의 핵심 차이는? compaction은 page를 이동해 연속 shape를 만들고 reclaim은 사용 page를 free 상태로 바꾼다.</li><li>random benchmark checksum이 필요한 이유는? compiler 제거와 correctness 차이를 막아 동일 work를 비교하기 위해서다.</li><li>Day 31 연결: per-thread padding/shard는 false sharing을 줄이지만 working set과 allocator fragmentation을 키울 수 있다.</li><li>Day 32~33 연결: THP 성공에는 큰 physical block이 필요하고 direct compaction은 latency, fallback은 TLB reach와 교환된다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">17. 다음 날 연결</h2>
+<p style="margin:0;">Day 35는 <strong style="color:#f8fafc;">리뷰: 메모리 장애 진단 runbook</strong>이다. allocator·SLUB·NUMA·false sharing·TLB·huge page·reclaim·OOM 증거를 증상에서 원인까지 한 장의 decision tree로 통합한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">18. 공식·1차 출처</h2>
+<ul style="margin:0;padding-left:22px;word-break:break-word;"><li><a href="https://docs.kernel.org/mm/physical_memory.html" style="color:#7dd3fc;">Linux Kernel — Physical Memory</a>: zone, per-CPU pageset, buddy free_area와 split/merge.</li><li><a href="https://docs.kernel.org/admin-guide/mm/concepts.html" style="color:#7dd3fc;">Linux Kernel — Memory Management Concepts</a>: virtual/physical memory와 compaction 목적·동기/비동기 경로.</li><li><a href="https://docs.kernel.org/filesystems/proc.html" style="color:#7dd3fc;">Linux Kernel — /proc Filesystem</a>: buddyinfo·pagetypeinfo order와 migratetype 해석.</li><li><a href="https://docs.kernel.org/admin-guide/mm/transhuge.html" style="color:#7dd3fc;">Linux Kernel — Transparent Hugepage Support</a>: fragmentation fallback과 defrag/compaction policy.</li><li><a href="https://docs.kernel.org/mm/page_owner.html" style="color:#7dd3fc;">Linux Kernel — Page Owner</a>: page allocation stack과 fragmentation 분석의 비용·사용법.</li><li><a href="https://man7.org/linux/man-pages/man3/malloc.3.html" style="color:#7dd3fc;">malloc(3)</a>: failure, overcommit, heap와 mmap 경로.</li><li><a href="https://man7.org/linux/man-pages/man3/posix_memalign.3.html" style="color:#7dd3fc;">posix_memalign(3)</a>: alignment 계약, return code와 ENOMEM.</li><li><a href="https://man7.org/linux/man-pages/man3/malloc_info.3.html" style="color:#7dd3fc;">malloc_info(3)</a>: glibc 전체 arena allocator state 관찰.</li><li><a href="https://man7.org/linux/man-pages/man1/perf-stat.1.html" style="color:#7dd3fc;">perf-stat(1)</a>: 반복 측정과 cache·TLB hardware counter.</li></ul>
+<p style="margin:28px 0 0;padding-top:18px;border-top:1px solid #27435d;color:#8fb3c9;font-size:13px;">Day 34 완료 기준: total free와 largest/order를 구분하고, user·physical fragmentation 경계를 설명하며, 동일 access 수·checksum·반복·PMU를 갖춘 locality benchmark 결과를 SLO trade-off로 방어할 수 있다.</p>
+</td></tr></table></td></tr></table>
+</body></html>

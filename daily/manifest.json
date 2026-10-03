@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-10-01T09:01:58+09:00",
+  "updatedAt": "2026-10-03T09:01:24+09:00",
   "lessons": [
     {
       "day": 1,
@@ -302,6 +302,15 @@
       "path": "day-33.html",
       "kind": "lesson",
       "publishedAt": "2026-10-01T09:01:58+09:00"
+    },
+    {
+      "day": 34,
+      "week": 5,
+      "title": "실패 실습: fragmentation과 locality benchmark",
+      "summary": "total free와 largest/order를 분리하고 external fragmentation 실패와 sequential/random locality 차이를 simulator·C benchmark로 검증합니다.",
+      "path": "day-34.html",
+      "kind": "lab",
+      "publishedAt": "2026-10-03T09:01:24+09:00"
     }
   ]
 }
