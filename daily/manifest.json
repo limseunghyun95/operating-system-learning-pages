@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-10-03T09:01:24+09:00",
+  "updatedAt": "2026-10-11T14:51:55+09:00",
   "lessons": [
     {
       "day": 1,
@@ -311,6 +311,15 @@
       "path": "day-34.html",
       "kind": "lab",
       "publishedAt": "2026-10-03T09:01:24+09:00"
+    },
+    {
+      "day": 35,
+      "week": 5,
+      "title": "리뷰: 메모리 장애 진단 runbook",
+      "summary": "allocator·SLUB·NUMA·TLB·huge page·reclaim·OOM 증거를 사용자 영향→scope→mechanism→완화→검증의 memory incident decision tree로 통합합니다.",
+      "path": "day-35.html",
+      "kind": "review",
+      "publishedAt": "2026-10-11T14:51:55+09:00"
     }
   ]
 }
