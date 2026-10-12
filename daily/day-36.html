@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Operating System 심화 커리큘럼 Day 36 - file, inode, directory entry, file descriptor</title></head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.72;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#07111f;"><tr><td align="center" style="padding:24px 12px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:680px;background:#0f1d2e;border:1px solid #23415d;border-radius:18px;overflow:hidden;">
+<tr><td style="padding:30px 28px 22px;background:#102a43;border-bottom:1px solid #28506f;">
+<div style="font-size:13px;letter-spacing:.12em;color:#5eead4;font-weight:800;">OPERATING SYSTEM · DAY 36 / 63 · FILESYSTEM</div>
+<h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">file, inode, directory entry, file descriptor</h1>
+<p style="margin:0;color:#b9d6eb;">한 줄 요약: <strong style="color:#f8fafc;">pathname은 file 자체가 아니라 directory entry를 찾는 문자열이고, inode는 filesystem object의 identity·metadata, open file description은 열린 instance의 offset·status, file descriptor는 process가 그 instance를 가리키는 작은 정수다.</strong> 이 네 층을 구분해야 rename·unlink·dup·fork·exec·fd leak을 정확히 설명할 수 있다.</p>
+</td></tr><tr><td style="padding:26px 28px 34px;">
+
+<h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:14px;">
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;width:31%;">file</td><td style="border-bottom:1px solid #27435d;">byte data와 metadata를 가진 filesystem object. regular file뿐 아니라 directory·device·pipe·socket도 “file-like object”로 같은 fd API를 쓸 수 있다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">pathname</td><td style="border-bottom:1px solid #27435d;">`/srv/app/data.txt`처럼 directory name을 순서대로 걷게 하는 문자열. object identity가 아니며 rename·link로 바뀌거나 여러 개일 수 있다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">directory entry</td><td style="border-bottom:1px solid #27435d;">한 directory 안의 `name → inode` 연결. 저장장치의 directory record와 VFS가 cache하는 dentry를 문맥에 따라 구분한다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">dentry</td><td style="border-bottom:1px solid #27435d;">Linux VFS의 pathname component cache object. name, parent dentry, inode pointer를 가지며 “그 이름이 없음”을 기억하는 negative dentry도 있다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">inode</td><td style="border-bottom:1px solid #27435d;">type, mode, owner, size, timestamps, link count, data-block mapping 등 metadata를 나타내는 filesystem object. 이름 자체는 inode에 들어 있지 않다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">inode number</td><td style="border-bottom:1px solid #27435d;">한 filesystem 안에서 inode를 식별하는 번호. 전역 identity는 아니므로 보통 `(st_dev, st_ino)` 쌍으로 비교하고, 삭제 뒤 재사용될 수도 있다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">hard link</td><td style="border-bottom:1px solid #27435d;">같은 inode를 가리키는 또 다른 directory entry. 두 pathname은 동등하며 inode의 link count가 증가한다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">symbolic link</td><td style="border-bottom:1px solid #27435d;">다른 pathname 문자열을 data로 가진 별도 inode. path resolution이 그 문자열을 다시 따라간다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">open file description</td><td style="border-bottom:1px solid #27435d;">`open()`마다 만들어지는 system-wide 열린 instance. Linux kernel의 `struct file`에 해당하며 current offset과 file status flags를 가진다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">file descriptor(fd)</td><td style="border-bottom:1px solid #27435d;">process별 fd table의 index인 작은 nonnegative integer. inode 번호도 pointer도 아니며 보통 가장 낮은 빈 번호가 재사용된다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">file offset</td><td style="border-bottom:1px solid #27435d;">다음 read/write가 시작할 byte 위치. fd가 아니라 open file description에 있어 `dup`·`fork`로 만든 fd끼리 공유할 수 있다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">FD_CLOEXEC</td><td style="border-bottom:1px solid #27435d;">`execve()` 성공 시 해당 fd를 자동 close하는 descriptor flag. `O_CLOEXEC`로 생성 순간 원자적으로 설정한다.</td></tr>
+<tr><td style="color:#7dd3fc;font-weight:700;">reference count</td><td>kernel object를 누가 얼마나 참조하는지 세는 값. link count와 open reference는 다른 수명 축이다.</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 주소·건물·방문증을 분리하라</h2>
+<p style="margin:0;">pathname은 주소, directory entry는 주소록의 이름→건물 연결, inode는 건물의 등기 identity와 속성, open file description은 한 번의 방문 상태, fd는 방문자가 가진 번호표다. 주소가 바뀌거나 지워져도 이미 들어간 방문자는 번호표로 건물에 접근할 수 있다. 번호표를 복사하면 같은 방문 상태와 현재 위치를 공유하지만, 주소를 다시 검색해 새로 들어가면 같은 건물이어도 별도의 현재 위치를 가진다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: pathname에서 read까지</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">application: openat(dirfd, "logs/app.log", O_RDONLY|O_CLOEXEC)
+                           │ syscall
+                           ▼
+process fs context: root / cwd / dirfd
+                           │ component walk: logs → app.log
+                           ▼
+mount namespace → VFS dcache: (parent dentry, name)
+                           │ miss/revalidate
+                           ▼
+filesystem directory lookup → inode cache / on-disk inode
+                           │ permission·type·flags 검사
+                           ▼
+open file description (Linux struct file)
+  path/inode reference + f_pos(offset) + file status flags + operations
+                           │
+                           ▼
+process fd table: fd 7 ────┘
+                           │ read(7, buf, n)
+                           ▼
+filesystem file_operations → page cache / block mapping → storage
+
+fd는 per-process index이고, data path의 실제 상태는 open file description과
+inode·filesystem operations가 맡는다.</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. 관계 그림: 같은 inode, 같은 open instance, 다른 fd</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">directory A: "report" ─┐
+                        ├── inode #421  (nlink=2, size, mode, block map)
+directory B: "latest" ─┘
+
+open("report") ─→ OFD X { offset=0, O_RDONLY } ←─ fd 3
+                                              └─ fd 8 = dup(3)
+                                              └─ child fd 3 after fork()
+
+open("latest") ─→ OFD Y { offset=0, O_RDONLY } ←─ fd 4
+
+X와 Y는 같은 inode를 가리켜도 offset은 독립이다.
+fd 3·8·child fd 3은 같은 X를 가리켜 offset·status flags를 공유한다.
+각 fd의 FD_CLOEXEC 같은 descriptor flag는 별도다.</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. 상태 전이: link, open, unlink, close</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">create("a")         link("a", "b")       open("a")
+inode nlink=1  ───→  inode nlink=2  ───→  open reference +1
+   │ a→inode            │ a,b→same inode       │ fd→OFD→inode
+   │                    │                      │
+unlink("a")             unlink("b")            close(last fd)
+nlink=1            ───→ nlink=0, open ref=1 ─→ open ref=0
+name a 사라짐           pathname lookup 불가       data block 회수 가능
+                        기존 fd I/O는 계속 가능
+
+rename("b","c")는 directory mapping을 바꾸지만 이미 열린 fd의 identity를
+바꾸지 않는다. inode storage 수명은 pathname 수명과 open reference 수명을 모두 본다.</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. CS·kernel deep dive</h2>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.1 “파일 이름”은 inode의 속성이 아니다</h3><p style="margin:0;">한 inode에 hard link 여러 개가 있으면 대표 이름이 없다. 이름은 부모 directory 안의 entry가 보유한다. 따라서 `stat(path)`은 path lookup 뒤 inode metadata를 읽고, `fstat(fd)`는 이미 열린 reference로 inode metadata를 읽는다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.2 identity는 pathname보다 `(device, inode)`에 가깝다</h3><p style="margin:0;">같은 pathname은 rename·replacement 뒤 다른 inode를 가리킬 수 있고, 다른 pathname이 hard link로 같은 inode를 가리킬 수 있다. `(st_dev, st_ino)`는 한 시점의 local filesystem identity 비교에 유용하지만 삭제·재사용, network filesystem, snapshot 때문에 영구 global ID로 쓰면 안 된다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.3 dentry는 단순 cache 이상이다</h3><p style="margin:0;">Linux VFS dentry는 component name, parent, inode 연결을 표현하고 mount traversal과 rename concurrency에도 관여한다. negative dentry는 존재하지 않는 이름을 cache해 반복 miss를 빠르게 한다. network filesystem은 server에서 이름이 바뀔 수 있어 dentry revalidation이 필요하다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.4 path walk에는 권한·symlink·mount·race가 함께 있다</h3><p style="margin:0;">absolute path는 process root에서, relative path는 cwd 또는 `openat`의 dirfd에서 시작한다. 중간 directory마다 search 권한을 확인하고 symlink와 mountpoint를 처리한다. lookup 중 rename이 일어날 수 있어 VFS는 RCU/refcount/lock과 retry로 일관성을 지킨다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.5 open은 inode를 fd로 직접 바꾸지 않는다</h3><p style="margin:0;">성공한 `open()`은 새로운 open file description을 만들고 process fd table의 빈 slot에 reference를 설치한다. 같은 path를 두 번 open하면 같은 inode라도 OFD가 둘이므로 offset이 독립이다. `dup`은 새 OFD가 아니라 같은 OFD를 가리키는 fd를 추가한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.6 offset과 flags의 소유자를 구분한다</h3><p style="margin:0;">current offset과 `O_APPEND`, `O_NONBLOCK` 같은 file status flags는 OFD에 있어 dup/fork descriptor가 공유한다. `FD_CLOEXEC`은 fd entry의 descriptor flag라 서로 공유하지 않는다. `lseek(fd8)`이 fd3 read 위치를 바꿀 수 있는 이유가 여기 있다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.7 fork와 exec는 fd graph를 다르게 바꾼다</h3><p style="margin:0;">`fork()` child는 parent fd의 duplicate를 받아 같은 OFD를 참조한다. `execve()`는 process image를 교체하지만 기본적으로 fd는 남고, `FD_CLOEXEC`이 설정된 것만 닫힌다. multithreaded program에서 open 뒤 `fcntl`로 flag를 붙이면 그 사이 fork+exec가 비밀 fd를 leak할 수 있으므로 `O_CLOEXEC`가 필요하다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.8 unlink는 “열린 파일을 즉시 파괴”하지 않는다</h3><p style="margin:0;">`unlink()`는 directory entry와 link count를 바꾼다. 마지막 이름이 사라져도 open reference가 있으면 기존 fd로 read/write할 수 있다. 이 특성은 temporary file과 atomic replacement에 유용하지만, 오래 열린 deleted log가 disk block을 계속 점유하는 장애도 만든다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.9 close는 fd 번호 재사용 race를 만든다</h3><p style="margin:0;">Linux에서 `close()` 처리 초기에 fd slot이 해제될 수 있어 다른 thread가 같은 번호를 재사용할 수 있다. error가 났다고 무조건 `close(fd)`를 재시도하면 새 object를 닫을 수 있다. fd ownership을 명확히 하고 concurrent close/use를 설계로 막는다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.10 “everything is a file”은 API 통일이지 의미 통일이 아니다</h3><p style="margin:0;">regular file, directory, pipe, socket, device는 fd로 다루지만 seek 가능성, blocking, durability, readiness, error semantics가 다르다. `read`·`write` 이름이 같다고 같은 guarantee를 주는 것은 아니다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. 연산별로 무엇을 공유하나?</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:12px;">
+<tr style="background:#15314a;color:#bae6fd;"><td>연산</td><td>새 fd</td><td>새 OFD</td><td>offset</td><td>pathname 영향</td></tr>
+<tr><td style="border-top:1px solid #27435d;">open(path)</td><td style="border-top:1px solid #27435d;">예</td><td style="border-top:1px solid #27435d;">예</td><td style="border-top:1px solid #27435d;">독립</td><td style="border-top:1px solid #27435d;">lookup만 함</td></tr>
+<tr><td style="border-top:1px solid #27435d;">dup(fd)</td><td style="border-top:1px solid #27435d;">예</td><td style="border-top:1px solid #27435d;">아니오</td><td style="border-top:1px solid #27435d;">공유</td><td style="border-top:1px solid #27435d;">없음</td></tr>
+<tr><td style="border-top:1px solid #27435d;">fork()</td><td style="border-top:1px solid #27435d;">child table에 복제</td><td style="border-top:1px solid #27435d;">아니오</td><td style="border-top:1px solid #27435d;">공유</td><td style="border-top:1px solid #27435d;">없음</td></tr>
+<tr><td style="border-top:1px solid #27435d;">rename()</td><td style="border-top:1px solid #27435d;">없음</td><td style="border-top:1px solid #27435d;">없음</td><td style="border-top:1px solid #27435d;">기존 그대로</td><td style="border-top:1px solid #27435d;">name mapping 변경</td></tr>
+<tr><td style="border-top:1px solid #27435d;">unlink()</td><td style="border-top:1px solid #27435d;">없음</td><td style="border-top:1px solid #27435d;">없음</td><td style="border-top:1px solid #27435d;">기존 그대로</td><td style="border-top:1px solid #27435d;">entry 제거</td></tr>
+<tr><td style="border-top:1px solid #27435d;">close(fd)</td><td style="border-top:1px solid #27435d;">slot 해제</td><td style="border-top:1px solid #27435d;">마지막 ref면 해제</td><td style="border-top:1px solid #27435d;">마지막 ref면 소멸</td><td style="border-top:1px solid #27435d;">없음</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. 실무 best practice</h2>
+<ul style="margin:0;padding-left:22px;"><li>모든 fd에 단일 owner와 close 지점을 정하고, error path·timeout·cancellation에서도 같은 cleanup contract를 적용한다.</li><li>생성 시 `O_CLOEXEC`, 복제 시 `dup3(..., O_CLOEXEC)`를 사용해 exec leak race를 원자적으로 차단한다.</li><li>untrusted pathname은 `openat`/`openat2`와 안정된 dirfd를 사용한다. Linux에서는 필요에 따라 `RESOLVE_BENEATH`, `RESOLVE_IN_ROOT`, `RESOLVE_NO_SYMLINKS`, `RESOLVE_NO_XDEV`를 검토한다.</li><li>`access()` 후 `open()`처럼 검사와 사용을 분리하지 않는다. 실제 open operation의 결과와 atomic flag를 신뢰한다.</li><li>create는 `O_CREAT|O_EXCL`, temporary file은 안전한 library API 또는 `O_TMPFILE` 지원 여부를 사용하고 예측 가능한 name을 피한다.</li><li>fd metric을 process count 하나로 끝내지 말고 type, owner component, age, open/close rate, soft limit 대비 비율로 본다.</li><li>log rotation은 pathname rename만 하지 말고 writer가 reopen하는 protocol과 deleted-open file 탐지를 갖춘다.</li><li>metadata identity 비교에는 path string보다 `fstat`의 `(st_dev, st_ino)`를 쓰되 inode reuse와 filesystem semantics를 문서화한다.</li><li>network filesystem은 dentry/attribute cache, ESTALE, server-side permission·failure가 있으므로 local filesystem 가정을 일반화하지 않는다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. error handling runbook</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;">open failure를 분류:</strong> `ENOENT`는 component 부재, `ENOTDIR`는 중간 component type, `EACCES`는 search/access 권한, `ELOOP`는 symlink loop, `EMFILE`은 process limit, `ENFILE`은 system-wide open-file limit 후보이다.</li><li><strong style="color:#f8fafc;">retry 조건:</strong> `EINTR`만 API·platform contract에 따라 안전하게 재시도하고, permission·bad path·limit 오류를 무한 retry하지 않는다.</li><li><strong style="color:#f8fafc;">partial acquisition:</strong> 여러 fd 중간 실패 시 이미 연 fd를 역순 close하고 임시 name·lock·buffer를 cleanup한다.</li><li><strong style="color:#f8fafc;">EMFILE 대응:</strong> admission을 줄이고 fd owner별 leak을 찾는다. network server는 관찰·복구를 위한 reserve fd 패턴을 검토하되 accept storm을 backoff한다.</li><li><strong style="color:#f8fafc;">close 결과:</strong> delayed I/O error가 보고될 수 있어 error를 log한다. Linux에서는 close 재시도가 fd reuse를 해칠 수 있으므로 blind retry하지 않는다.</li><li><strong style="color:#f8fafc;">durability:</strong> 중요한 data는 `close()` 성공만으로 durable이라 가정하지 말고 Day 39의 `fsync`·directory sync protocol을 따른다.</li><li><strong style="color:#f8fafc;">evidence:</strong> `/proc/PID/fd`, `fdinfo`, limits, `(dev,ino)`, flags, owning stack/operation을 timestamp와 함께 보존한다.</li><li><strong style="color:#f8fafc;">verify:</strong> fd count·deleted-open bytes·error rate가 baseline으로 회복되고 leak 재현 test가 통과해야 종료한다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 놓치기 쉬운 함정</h2>
+<ul style="margin:0;padding-left:22px;"><li><strong style="color:#fecaca;">fd 숫자가 identity:</strong> close 뒤 가장 낮은 빈 번호가 즉시 다른 object에 재사용될 수 있다.</li><li><strong style="color:#fecaca;">inode 안에 filename:</strong> 이름은 directory entry에 있고 한 inode에 여러 hard link가 가능하다.</li><li><strong style="color:#fecaca;">같은 inode면 같은 offset:</strong> offset은 inode가 아니라 OFD에 있다. 별도 open은 독립, dup/fork는 공유한다.</li><li><strong style="color:#fecaca;">unlink하면 열린 fd도 invalid:</strong> name만 사라지고 open reference가 남으면 I/O는 계속된다.</li><li><strong style="color:#fecaca;">rename하면 fd가 새 path를 따라감:</strong> fd는 기존 object reference를 유지한다.</li><li><strong style="color:#fecaca;">O_NOFOLLOW가 전체 path 보호:</strong> 일반적으로 final component에 대한 의미이므로 전체 containment에는 openat2 정책을 검토한다.</li><li><strong style="color:#fecaca;">FD_CLOEXEC와 O_CLOEXEC가 같은 종류의 flag:</strong> 결과는 연결되지만 전자는 descriptor flag, 후자는 open 시 원자 설정 요청이다.</li><li><strong style="color:#fecaca;">close를 retry하면 안전:</strong> multithreaded process에서는 재사용된 fd를 닫을 수 있다.</li><li><strong style="color:#fecaca;">모든 fd는 seek 가능:</strong> pipe·socket은 `lseek`가 실패하고 readiness·blocking semantics도 다르다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. 30분 실습: offset·hard link·unlink lifetime</h2>
+<p style="margin:0 0 10px;">안전한 temporary directory에서 같은 inode를 두 번 open하고 한 번 dup한다. `dup`만 offset을 공유하고, 마지막 pathname을 unlink한 뒤에도 fd가 data를 읽는지 검증한다.</p>
+<pre style="margin:0;white-space:pre;overflow-x:auto;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;">python3 - &lt;&lt;'PY'
+import os, tempfile
+
+with tempfile.TemporaryDirectory(prefix="os-day36-") as d:
+    a, b = os.path.join(d, "a.txt"), os.path.join(d, "b.txt")
+    with open(a, "wb") as f:
+        f.write(b"ABCDEFGHIJ")
+    os.link(a, b)
+    sa, sb = os.stat(a), os.stat(b)
+    assert (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino)
+    assert sa.st_nlink == 2
+
+    fd1 = os.open(a, os.O_RDONLY)
+    fd2 = os.open(a, os.O_RDONLY)   # 새 open file description
+    fd3 = os.dup(fd1)               # fd1과 같은 description
+    try:
+        assert os.read(fd1, 2) == b"AB"
+        assert os.read(fd3, 2) == b"CD"  # shared offset: 2 → 4
+        assert os.read(fd2, 2) == b"AB"  # independent offset
+        print("offsets", os.lseek(fd1,0,os.SEEK_CUR),
+              os.lseek(fd2,0,os.SEEK_CUR), os.lseek(fd3,0,os.SEEK_CUR))
+
+        os.unlink(a)
+        assert os.path.exists(b) and os.fstat(fd1).st_nlink == 1
+        os.unlink(b)
+        assert not os.path.exists(a) and not os.path.exists(b)
+        assert os.fstat(fd1).st_nlink == 0
+        os.lseek(fd1, 0, os.SEEK_SET)
+        assert os.read(fd1, 10) == b"ABCDEFGHIJ"
+        print("unlinked_but_open", os.fstat(fd1).st_ino,
+              os.fstat(fd1).st_nlink)
+
+        proc = f"/proc/{os.getpid()}/fd/{fd1}"
+        if os.path.exists("/proc/self/fd"):
+            print("proc_fd", os.readlink(proc))
+    finally:
+        for fd in (fd3, fd2, fd1):
+            os.close(fd)
+PY</pre>
+<ol style="margin:12px 0 0;padding-left:22px;"><li><strong style="color:#f8fafc;">0~10분:</strong> 출력이 `offsets 4 2 4`가 되는 이유를 fd table과 OFD 그림으로 설명한다.</li><li><strong style="color:#f8fafc;">10~20분:</strong> 두 pathname의 `(dev,ino)`와 link count 변화를 기록한다.</li><li><strong style="color:#f8fafc;">20~30분:</strong> Linux에서 `/proc/self/fd` link가 `(deleted)`를 보여도 read가 가능한 이유와 마지막 close 뒤 storage 회수 조건을 설명한다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. Linux production 관찰</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;"># pathname과 inode metadata
+stat /path/to/file
+namei -l /path/to/file
+findmnt -T /path/to/file
+
+# process fd table과 open file description 정보
+ls -l /proc/&lt;PID&gt;/fd
+cat /proc/&lt;PID&gt;/fdinfo/&lt;FD&gt;
+grep -E 'Max open files' /proc/&lt;PID&gt;/limits
+
+# deleted pathname인데 아직 열린 object
+lsof -nP +L1
+find /proc/&lt;PID&gt;/fd -lname '* (deleted)' -ls 2&gt;/dev/null
+
+# syscall boundary 추적: production overhead·민감 path를 고려
+strace -f -yy -e trace=openat,openat2,dup,dup2,dup3,close,link,unlink,rename \
+  -p &lt;PID&gt;</pre>
+<p style="margin:10px 0 0;">`/proc/PID/fd` 접근은 ptrace permission check와 namespace/credential 제약을 받는다. `lsof` 결과도 snapshot이라 concurrent open/close와 race가 있으며, path 출력에 secret이 들어갈 수 있어 수집·보관 범위를 제한한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 실패 시나리오: rotation 뒤에도 disk가 줄지 않는다</h2>
+<p style="margin:0;">운영자가 40GiB `app.log`를 rename 후 unlink했지만 disk usage가 줄지 않았다. `df`는 가득 찼고 `du` 합은 작았다. writer process의 fd가 link count 0인 inode를 계속 참조해 block이 유지된 것이 원인이었다. process를 즉시 kill하기보다 `lsof +L1`과 `/proc/PID/fdinfo`로 owner·offset을 확인하고, service가 signal/API로 log를 reopen하도록 traffic-safe하게 조치했다. 이후 rotation protocol에 reopen acknowledgement, deleted-open bytes alert, `O_CLOEXEC`, fd owner metric을 추가했다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 대기업 면접 질문 3개</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;">inode, dentry, open file description, fd를 구분해 설명해 보세요.</strong><br>답변 포인트: name→inode, VFS pathname cache, metadata identity, per-open offset/status, per-process integer index와 reference graph.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">dup한 두 fd와 같은 path를 두 번 open한 fd는 무엇이 다른가요?</strong><br>답변 포인트: dup은 OFD·offset·status flags 공유, separate open은 새 OFD와 독립 offset, descriptor flag는 fd별, fork/exec 변화.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">unlink한 큰 log가 왜 disk를 계속 차지하나요?</strong><br>답변 포인트: directory entry/link count와 open reference의 독립 수명, deleted fd 관찰, reopen protocol, 마지막 reference 뒤 회수.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">15. 퀴즈·누적 리뷰</h2>
+<ol style="margin:0;padding-left:22px;"><li>한 inode가 이름 두 개를 가질 수 있는가? hard link 두 directory entry가 같은 inode를 가리킬 수 있다.</li><li>fd 4를 close한 직후 새 open이 fd 4를 받을 수 있는가? 가능하다. fd는 재사용되는 table index다.</li><li>dup(fd) 뒤 한쪽에서 `lseek`하면 다른 쪽 offset은? 같은 OFD를 공유하므로 함께 바뀐다.</li><li>같은 path를 두 번 open하면 offset은? 별도 OFD이므로 독립이다.</li><li>link count 0인데 read가 가능한 이유는? pathname reference는 없지만 open reference가 inode/data 수명을 유지한다.</li><li>Day 25 연결: fd를 close한 뒤에도 file-backed mmap이 계속 유효할 수 있는 이유를 object lifetime 관점에서 설명해 보자.</li><li>Day 26 연결: inode identity와 page cache page의 mapping 관계가 buffered I/O에서 어떤 역할을 하는가?</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">16. 다음 날 연결</h2>
+<p style="margin:0;">Day 37은 <strong style="color:#f8fafc;">VFS, mount, filesystem namespace</strong>다. 오늘의 dentry·inode·struct file을 여러 filesystem 구현 위에서 공통 API로 연결하는 VFS와, 같은 path가 process별 mount namespace에서 다른 object를 찾는 이유를 다룬다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">17. 공식·1차 출처</h2>
+<ul style="margin:0;padding-left:22px;word-break:break-word;"><li><a href="https://docs.kernel.org/filesystems/vfs.html" style="color:#7dd3fc;">Linux Kernel — Overview of the Linux Virtual File System</a>: inode·file·dentry operations와 VFS object 경계.</li><li><a href="https://docs.kernel.org/filesystems/path-lookup.html" style="color:#7dd3fc;">Linux Kernel — Pathname lookup</a>: dcache, negative dentry, RCU/REF walk, rename·lookup concurrency.</li><li><a href="https://man7.org/linux/man-pages/man2/open.2.html" style="color:#7dd3fc;">Linux man-pages — open(2)</a>: fd와 open file description, flags, openat rationale.</li><li><a href="https://man7.org/linux/man-pages/man7/inode.7.html" style="color:#7dd3fc;">Linux man-pages — inode(7)</a>: inode metadata와 stat/statx fields.</li><li><a href="https://man7.org/linux/man-pages/man7/path_resolution.7.html" style="color:#7dd3fc;">Linux man-pages — path_resolution(7)</a>: root/cwd, components, symlink와 permission resolution.</li><li><a href="https://man7.org/linux/man-pages/man2/dup.2.html" style="color:#7dd3fc;">Linux man-pages — dup(2)</a>: OFD·offset 공유와 descriptor flag 분리.</li><li><a href="https://man7.org/linux/man-pages/man2/unlink.2.html" style="color:#7dd3fc;">Linux man-pages — unlink(2)</a>: name 제거, link count와 open reference lifetime.</li><li><a href="https://man7.org/linux/man-pages/man2/close.2.html" style="color:#7dd3fc;">Linux man-pages — close(2)</a>: delayed error, multithreaded close와 재시도 위험.</li><li><a href="https://man7.org/linux/man-pages/man2/openat2.2.html" style="color:#7dd3fc;">Linux man-pages — openat2(2)</a>: dirfd 기반 resolution restriction.</li><li><a href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/open.html" style="color:#7dd3fc;">POSIX.1-2024 — open()</a>: file descriptor와 open file description의 표준 계약.</li></ul>
+<p style="margin:28px 0 0;padding-top:18px;border-top:1px solid #27435d;color:#8fb3c9;font-size:13px;">Day 36 완료 기준: pathname·dentry·inode·OFD·fd를 한 장에 그리고, open/dup/fork/exec/rename/unlink/close마다 어느 reference·offset·flag·수명이 바뀌는지 설명할 수 있다.</p>
+</td></tr></table></td></tr></table>
+</body></html>

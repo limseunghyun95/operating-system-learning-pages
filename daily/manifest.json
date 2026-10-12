@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-10-11T14:51:55+09:00",
+  "updatedAt": "2026-10-12T09:01:00+09:00",
   "lessons": [
     {
       "day": 1,
@@ -320,6 +320,15 @@
       "path": "day-35.html",
       "kind": "review",
       "publishedAt": "2026-10-11T14:51:55+09:00"
+    },
+    {
+      "day": 36,
+      "week": 6,
+      "title": "file, inode, directory entry, file descriptor",
+      "summary": "pathname→dentry→inode→open file description→fd table의 경계를 따라 open·dup·fork·exec·rename·unlink·close의 공유 상태와 수명을 추적합니다.",
+      "path": "day-36.html",
+      "kind": "lesson",
+      "publishedAt": "2026-10-12T09:01:00+09:00"
     }
   ]
 }
