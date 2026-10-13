@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Operating System 심화 커리큘럼 Day 37 - VFS, mount, filesystem namespace</title></head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.72;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#07111f;"><tr><td align="center" style="padding:24px 12px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:680px;background:#0f1d2e;border:1px solid #23415d;border-radius:18px;overflow:hidden;">
+<tr><td style="padding:30px 28px 22px;background:#102a43;border-bottom:1px solid #28506f;">
+<div style="font-size:13px;letter-spacing:.12em;color:#5eead4;font-weight:800;">OPERATING SYSTEM · DAY 37 / 63 · FILESYSTEM</div>
+<h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">VFS, mount, filesystem namespace</h1>
+<p style="margin:0;color:#b9d6eb;">한 줄 요약: <strong style="color:#f8fafc;">VFS는 하나의 syscall API를 ext4·XFS·tmpfs·procfs·NFS의 operation table로 dispatch하고, mount는 filesystem subtree를 namespace의 특정 dentry에 붙이며, mount namespace는 process별로 “어떤 mount tree를 볼지”를 격리한다.</strong> 같은 pathname도 namespace·root·mount propagation에 따라 다른 object를 찾는다.</p>
+</td></tr><tr><td style="padding:26px 28px 34px;">
+
+<h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:14px;">
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;width:31%;">VFS</td><td style="border-bottom:1px solid #27435d;">Virtual File System 또는 Virtual Filesystem Switch. 공통 syscall을 filesystem별 구현으로 연결하는 kernel 추상화 layer.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">filesystem type</td><td style="border-bottom:1px solid #27435d;">ext4, XFS, tmpfs, proc, NFS처럼 data·metadata 저장과 operation을 구현하는 종류. `/proc/filesystems`에서 등록된 type을 볼 수 있다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">superblock</td><td style="border-bottom:1px solid #27435d;">filesystem instance의 공통 상태를 나타내는 VFS object. block size, root inode/dentry, superblock operations, writeback·quota 상태 등을 연결한다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">mount</td><td style="border-bottom:1px solid #27435d;">filesystem 또는 기존 subtree의 root를 현재 namespace의 mountpoint에 연결한 VFS graph edge. disk를 복사하는 동작이 아니다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">mountpoint</td><td style="border-bottom:1px solid #27435d;">새 mount가 붙는 기존 directory dentry. mount 뒤 원래 subtree는 삭제되지 않고 가려진다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">bind mount</td><td style="border-bottom:1px solid #27435d;">이미 보이는 file/directory subtree를 같은 namespace의 다른 pathname에도 보이게 하는 mount. 같은 underlying object를 새 위치에서 본다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">mount namespace</td><td style="border-bottom:1px solid #27435d;">process들이 보는 mount 목록과 hierarchy를 격리하는 Linux namespace. 새 namespace는 기존 mount list의 view를 복사해 시작한다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">mount propagation</td><td style="border-bottom:1px solid #27435d;">한 mount 아래의 mount/unmount event를 peer 또는 slave mount로 전달하는 규칙.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">shared / private</td><td style="border-bottom:1px solid #27435d;">peer와 event를 양방향 전파 / event를 주고받지 않는 propagation type.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">slave / unbindable</td><td style="border-bottom:1px solid #27435d;">master에서 event는 받지만 역방향 전파하지 않음 / private 성질에 더해 bind mount source가 될 수 없음.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">overmount</td><td style="border-bottom:1px solid #27435d;">이미 content가 있는 directory 위에 다른 filesystem을 mount해 기존 content를 namespace view에서 가리는 것.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">pseudo filesystem</td><td style="border-bottom:1px solid #27435d;">고정 disk image 대신 kernel state를 file interface로 표현하는 procfs·sysfs 같은 filesystem.</td></tr>
+<tr><td style="color:#7dd3fc;font-weight:700;">lazy unmount</td><td>`MNT_DETACH`로 mount tree에서 즉시 분리하고 남은 reference가 사라질 때 cleanup하는 방식. “강제 종료”가 아니며 기존 user는 계속 접근할 수 있다.</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 같은 도시, 다른 지하철 노선도</h2>
+<p style="margin:0;">inode·data는 건물이고 VFS는 모든 건물 유형에 공통 출입 규칙을 제공하는 교통 layer다. mount는 특정 역에서 다른 노선으로 갈아타는 연결이고, mount namespace는 각 process 집단이 받은 노선도다. 두 container가 `/data/report`라는 같은 문자열을 사용해도 각 노선도의 `/data`가 host disk, tmpfs, remote volume 중 어디로 연결됐는지에 따라 전혀 다른 file을 연다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: syscall에서 concrete filesystem까지</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">process
+ ├─ fs context: root, cwd
+ └─ nsproxy ─→ mount namespace ─→ mount tree
+                       │ mountpoint마다 (mount, dentry) crossing
+open("/srv/data/x")    ▼
+        │        VFS pathname walk / dcache
+        ▼              │
+     struct path = { vfsmount, dentry }
+                       │
+        ┌──────────────┼────────────────┐
+        ▼              ▼                ▼
+   superblock       inode            struct file
+ filesystem state  metadata+i_op     offset+f_op
+        │              │                │
+        └──────────────┴──── dispatch ──┘
+                       │
+        ┌──────────────┼───────────────┬─────────────┐
+        ▼              ▼               ▼             ▼
+      ext4            XFS            tmpfs         NFS/procfs
+ block/page cache  block/page cache   RAM       network/kernel state</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. mount graph: directory tree 위의 전환점</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">namespace A                                  namespace B
+/  rootfs                                     /  rootfs
+├─ /etc                                       ├─ /etc
+├─ /srv ─ mount ext4(fs#10, root=/)            ├─ /srv ─ mount tmpfs(fs#22)
+│  └─ app                                     │  └─ app
+├─ /work ─ bind(fs#10, root=/app)              └─ /proc ─ procfs for B's view
+└─ /proc ─ procfs
+
+A:/srv/app/config  ─┐
+A:/work/config     ─┴─ 같은 superblock/inode subtree를 다른 mount path로 봄
+B:/srv/app/config  ─── tmpfs의 별도 object
+
+mount object는 “filesystem의 어느 root를 namespace의 어느 dentry에 붙였는가”를
+기록한다. mountpoint 아래 원래 rootfs content는 overmount 동안 가려질 뿐 삭제되지 않는다.</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. 상태 전이: namespace clone과 propagation</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">[host mount namespace: /shared is shared:42]
+             │ clone/unshare(CLONE_NEWNS)
+             ▼
+[child namespace: mount list copy, /shared peer shared:42]
+             │
+ host mounts /shared/usb
+             ├─ shared peer → child에도 /shared/usb event 생성
+             │
+ child: mount --make-private /shared
+             │ peer group에서 분리
+             ▼
+ host mounts /shared/next
+             └─ child에는 전파되지 않음
+
+slave: master event는 받지만 child event를 master로 돌려보내지 않음
+private: 양방향 차단
+unbindable: private + bind source 금지</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. CS·kernel deep dive</h2>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.1 VFS는 interface와 dispatch boundary다</h3><p style="margin:0;">application은 `open/read/write/stat`을 호출하지만 VFS는 pathname으로 dentry·inode를 찾고 `inode_operations`, `file_operations`, `super_operations`의 function pointer를 concrete filesystem 구현으로 dispatch한다. 같은 read syscall도 ext4는 page/block mapping, NFS는 network RPC, procfs는 kernel state 생성을 수행할 수 있다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.2 superblock과 mount는 같은 object가 아니다</h3><p style="margin:0;">superblock은 filesystem instance와 공통 상태를 나타내고, mount object는 그 filesystem의 특정 root dentry를 namespace tree의 mountpoint에 붙인다. bind mount는 새 data copy나 새 filesystem을 만들지 않고 같은 underlying subtree에 별도 mount path를 만든다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.3 mount crossing도 pathname resolution의 일부다</h3><p style="margin:0;">VFS path walk는 component별 dentry lookup만 하지 않는다. 현재 `(mount,dentry)`가 mountpoint이면 child mount root로 넘어가고 `..`에서는 namespace root와 mount boundary 규칙을 적용한다. 그래서 dentry만으로 global path identity를 표현할 수 없고 `struct path`가 mount와 dentry를 함께 가진다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.4 mount namespace는 data를 복제하지 않는다</h3><p style="margin:0;">새 namespace는 mount list의 view를 복사해 시작하지만 inode·page cache·superblock과 실제 storage data를 통째로 복제하지 않는다. namespace A와 B가 같은 filesystem을 mount하면 data 변경은 공유될 수 있고, 격리되는 것은 “어디에 무엇이 붙어 보이는가”다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.5 같은 pathname은 process context에 의존한다</h3><p style="margin:0;">resolution 시작점은 process root, cwd 또는 dirfd이고 mount namespace가 crossing 가능한 mount tree를 정한다. container의 `/proc`, `/etc`, `/data`가 host와 다른 이유다. pathname 문자열을 resource identity나 authorization 근거로 단독 사용하면 안 된다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.6 propagation은 namespace isolation의 예외 통로다</h3><p style="margin:0;">mount list가 분리돼도 shared peer group이면 자식 mount/unmount event가 namespace 사이에 복제된다. container runtime이 host volume을 container에 전달할 때 유용하지만, 예상치 못한 event 유출·미전파·unmount 실패의 원인이 된다. propagation은 per-mountpoint 설정이며 data write replication과 다른 개념이다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.7 bind mount와 symlink는 layer가 다르다</h3><p style="margin:0;">symlink는 pathname 문자열을 가진 inode이고 lookup이 그 문자열을 다시 해석한다. bind mount는 mount graph에 subtree 연결을 추가한다. bind target은 mount boundary가 되며 source rename과 namespace visibility, propagation semantics가 symlink와 다르다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.8 chroot는 mount namespace가 아니다</h3><p style="margin:0;">`chroot`는 process의 path resolution root를 바꾸지만 mount list를 분리하지 않고 독립 security boundary를 완성하지 않는다. open fd, cwd, privilege가 있으면 escape 가능성이 있다. container rootfs는 mount namespace, user/capability policy, `pivot_root` 또는 유사 setup, proc/sys mount 제한을 함께 설계한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.9 unmount는 storage를 파괴하는 operation이 아니다</h3><p style="margin:0;">정상 unmount는 현재 namespace mount tree에서 연결을 제거하며 busy reference가 있으면 `EBUSY`일 수 있다. lazy unmount는 tree에서 먼저 떼고 open fd·cwd·submount reference가 사라질 때 cleanup한다. 문제를 해결했다기보다 관찰 경로에서 숨길 수 있어 default 복구 수단으로 쓰면 안 된다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.10 namespace 자체도 reference-counted resource다</h3><p style="margin:0;">일반적으로 마지막 member process가 떠나면 namespace가 사라지지만 `/proc/PID/ns/mnt`에 열린 fd나 bind mount가 namespace를 pin할 수 있다. debugger·orchestrator가 namespace fd를 닫지 않으면 mount와 resource 수명이 예상보다 길어질 수 있다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. propagation 의사결정 표</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:12px;">
+<tr style="background:#15314a;color:#bae6fd;"><td>type</td><td>event 받기</td><td>event 보내기</td><td>주요 용도·위험</td></tr>
+<tr><td style="border-top:1px solid #27435d;">shared</td><td style="border-top:1px solid #27435d;">peer에서</td><td style="border-top:1px solid #27435d;">peer로</td><td style="border-top:1px solid #27435d;">동적 device/volume 공유; 의도치 않은 양방향 전파</td></tr>
+<tr><td style="border-top:1px solid #27435d;">private</td><td style="border-top:1px solid #27435d;">아니오</td><td style="border-top:1px solid #27435d;">아니오</td><td style="border-top:1px solid #27435d;">강한 mount-view 격리; host 새 mount가 안 보일 수 있음</td></tr>
+<tr><td style="border-top:1px solid #27435d;">slave</td><td style="border-top:1px solid #27435d;">master에서</td><td style="border-top:1px solid #27435d;">master로는 안 보냄</td><td style="border-top:1px solid #27435d;">host→container 단방향; 역전파 차단</td></tr>
+<tr><td style="border-top:1px solid #27435d;">unbindable</td><td style="border-top:1px solid #27435d;">아니오</td><td style="border-top:1px solid #27435d;">아니오</td><td style="border-top:1px solid #27435d;">bind 복제를 금지할 subtree</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. 실무 best practice</h2>
+<ul style="margin:0;padding-left:22px;"><li>장애 분석은 host의 `/proc/self/mountinfo`가 아니라 대상 PID의 `/proc/PID/mountinfo`에서 시작한다.</li><li>mountpoint와 source만 보지 말고 mount ID·parent ID·major:minor·root·fs type·per-mount options·super options·propagation tag를 함께 기록한다.</li><li>container volume의 propagation을 `private/slave/shared` 중 명시하고, 실제 mount·unmount event가 어느 방향으로 가야 하는지 integration test한다.</li><li>root를 recursive shared로 만드는 범위를 최소화하고, host path bind는 allowlist·read-only·`nosuid,nodev,noexec` 등 defense-in-depth를 검토한다.</li><li>`/etc/mtab`보다 `/proc/PID/mountinfo` 또는 이를 해석하는 `findmnt`를 source of truth로 쓴다.</li><li>unmount 전 child mounts, cwd, open fd, mmap, namespace pin을 찾아 drain한다. lazy/force unmount는 승인된 마지막 수단으로 둔다.</li><li>network filesystem은 reconnect·timeout·stale handle·hard/soft mount policy가 request latency와 data correctness에 미치는 영향을 별도 SLO로 관리한다.</li><li>device path `/dev/sdX`보다 UUID·label 같은 stable identifier를 쓰고 boot ordering·automount failure를 검증한다.</li><li>namespace fd를 의도적으로 pin한다면 owner와 close lifecycle을 문서화하고 namespace·mount count leak을 모니터링한다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. error handling runbook</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;">scope:</strong> 실패한 process PID와 mount namespace ID를 먼저 고정한다. host에서 성공한다는 사실은 container에서도 성공함을 뜻하지 않는다.</li><li><strong style="color:#f8fafc;">request 보존:</strong> source, target, fs type, options, propagation, credential/capability, kernel log를 secret 제거 후 기록한다.</li><li><strong style="color:#f8fafc;">mount error 분류:</strong> `EPERM`은 capability/policy, `ENOENT`·`ENOTDIR`는 path, `ENODEV`는 fs/device support, `EINVAL`은 option/propagation 조합, `EBUSY`는 target/source 상태 후보이다.</li><li><strong style="color:#f8fafc;">현재 graph 확인:</strong> `findmnt -T`, `/proc/PID/mountinfo`, parent-child mount ID, shared/master tag로 실제 연결을 그린다.</li><li><strong style="color:#f8fafc;">partial rollback:</strong> 여러 child mount 중 실패하면 생성 역순으로 unmount하고 parent를 마지막에 처리한다. 다른 namespace의 기존 mount를 건드리지 않는다.</li><li><strong style="color:#f8fafc;">EBUSY 대응:</strong> cwd, open fd, mmap, child mount, namespace pin을 찾아 owner를 drain한다. 무작정 `umount -l` 또는 force를 쓰지 않는다.</li><li><strong style="color:#f8fafc;">verify:</strong> operation 직후 대상 namespace 안에서 expected fs type·source·root·options·propagation을 다시 읽고 sentinel file identity를 확인한다.</li><li><strong style="color:#f8fafc;">rollback guard:</strong> health check와 data path가 회복되지 않으면 원래 mount graph를 복원하고 traffic을 열지 않는다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 놓치기 쉬운 함정</h2>
+<ul style="margin:0;padding-left:22px;"><li><strong style="color:#fecaca;">namespace마다 file data도 복사:</strong> mount view만 분리되며 같은 superblock/data를 공유할 수 있다.</li><li><strong style="color:#fecaca;">mountpoint 아래 기존 file이 삭제:</strong> overmount 동안 가려질 뿐 unmount하면 다시 보인다.</li><li><strong style="color:#fecaca;">bind mount는 symlink 별칭:</strong> mount graph edge이며 mount boundary·options·propagation이 있다.</li><li><strong style="color:#fecaca;">container path를 host에서 조사:</strong> 같은 문자열이 다른 mount를 가리킬 수 있으므로 target PID namespace에서 본다.</li><li><strong style="color:#fecaca;">private이면 data write도 격리:</strong> mount event만 격리하며 underlying filesystem write는 공유될 수 있다.</li><li><strong style="color:#fecaca;">read-only bind 하나면 완전 격리:</strong> 다른 writable alias, submount, remount capability, device path를 함께 봐야 한다.</li><li><strong style="color:#fecaca;">chroot가 container 보안 경계:</strong> mount namespace와 권한·capability isolation을 대신하지 않는다.</li><li><strong style="color:#fecaca;">lazy unmount가 user를 종료:</strong> 새 lookup에서 숨길 뿐 기존 reference는 계속 동작할 수 있다.</li><li><strong style="color:#fecaca;">`df`와 `du` 차이는 계산 오류:</strong> overmount로 가린 file, deleted-open inode, namespace 차이일 수 있다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. 30분 실습 A: namespace view simulator</h2>
+<p style="margin:0 0 10px;">권한 없이 실행 가능한 model이다. longest mountpoint match, bind subtree, namespace별 overmount를 검증한다. 실제 kernel의 lock·propagation 전체를 재현하지 않는 교육용 model이다.</p>
+<pre style="margin:0;white-space:pre;overflow-x:auto;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;">python3 - &lt;&lt;'PY'
+import posixpath
+
+def resolve(mounts, path):
+    candidates = [m for m in mounts
+                  if path == m or path.startswith(m.rstrip("/") + "/")]
+    target = max(candidates, key=len)
+    fs, root = mounts[target]
+    rel = path[len(target):].lstrip("/")
+    inner = posixpath.normpath(posixpath.join(root, rel))
+    return fs, inner, target
+
+host = {"/": ("rootfs", "/"), "/srv": ("disk#10", "/")}
+container = dict(host)  # mount list view로 시작; storage copy가 아님
+
+host["/work"] = ("disk#10", "/app")  # /srv/app subtree의 bind model
+assert resolve(host, "/srv/app/config")[:2] == ("disk#10", "/app/config")
+assert resolve(host, "/work/config")[:2] == ("disk#10", "/app/config")
+
+container["/srv"] = ("tmpfs#22", "/")  # container namespace만 overmount
+assert resolve(container, "/srv/app/config")[:2] == ("tmpfs#22", "/app/config")
+assert resolve(host, "/srv/app/config")[:2] == ("disk#10", "/app/config")
+
+for name, view in (("host", host), ("container", container)):
+    print(name, resolve(view, "/srv/app/config"))
+print("bind_alias", resolve(host, "/work/config"))
+PY</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 30분 실습 B: 격리된 Linux mount namespace</h2>
+<p style="margin:0 0 10px;">개발용 Linux VM/container에서만 실행한다. unprivileged user namespace가 비활성화되면 `unshare: Operation not permitted`로 종료하고 host에서 sudo로 우회하지 않는다. 새 private mount namespace 안에서만 tmpfs overmount를 만들며 trap으로 정리한다.</p>
+<pre style="margin:0;white-space:pre;overflow-x:auto;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;">unshare --user --map-root-user --mount --propagation private sh -eu &lt;&lt;'SH'
+lab=$(mktemp -d /tmp/os-day37.XXXXXX)
+cleanup(){ mountpoint -q "$lab/view" &amp;&amp; umount "$lab/view" || true; rm -rf "$lab"; }
+trap cleanup EXIT INT TERM
+
+mkdir "$lab/base" "$lab/view"
+printf 'underlying\n' &gt;"$lab/base/value"
+mount --bind "$lab/base" "$lab/view"
+printf 'bind: '; cat "$lab/view/value"
+
+mount -t tmpfs -o size=4m tmpfs "$lab/view"
+printf 'overlay\n' &gt;"$lab/view/value"
+printf 'overmount: '; cat "$lab/view/value"
+findmnt -T "$lab/view" -o TARGET,SOURCE,FSTYPE,OPTIONS,PROPAGATION
+
+umount "$lab/view"
+printf 'revealed bind: '; cat "$lab/view/value"
+grep " $lab/view " /proc/self/mountinfo
+SH</pre>
+<ol style="margin:12px 0 0;padding-left:22px;"><li><strong style="color:#f8fafc;">0~10분:</strong> simulator에서 path→longest mountpoint→filesystem root 변환을 그린다.</li><li><strong style="color:#f8fafc;">10~25분:</strong> Linux 실습이 가능하면 bind→tmpfs overmount→unmount reveal을 관찰한다.</li><li><strong style="color:#f8fafc;">25~30분:</strong> host shell과 namespace shell의 mountinfo가 다른 이유, data copy가 없다는 증거를 설명한다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. Linux production 관찰</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;"># 현재 process의 namespace와 mount tree
+readlink /proc/self/ns/mnt
+findmnt -R -o TARGET,SOURCE,FSTYPE,OPTIONS,PROPAGATION
+cat /proc/self/mountinfo
+
+# 대상 process의 실제 view와 특정 path
+readlink /proc/&lt;PID&gt;/ns/mnt
+findmnt --task &lt;PID&gt; --target /data -o ID,PARENT,TARGET,SOURCE,FSTYPE,OPTIONS,PROPAGATION
+nsenter -t &lt;PID&gt; -m -- findmnt -T /data
+nsenter -t &lt;PID&gt; -m -- stat -c '%d:%i %m %n' /data
+
+# registered filesystem과 mount 통계
+cat /proc/filesystems
+cat /proc/&lt;PID&gt;/mountstats
+
+# EBUSY 후보: 결과는 snapshot이며 권한·namespace를 맞춘다
+fuser -vm /mount/point
+lsof +f -- /mount/point</pre>
+<p style="margin:10px 0 0;">`mountinfo` parser는 ` - ` separator 앞 optional field가 늘어날 수 있으므로 unknown tag를 무시해야 한다. mount ID와 peer group ID는 수명 종료 뒤 재사용될 수 있어 영구 business ID로 저장하지 않는다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 실패 시나리오: host에는 volume이 있는데 container에는 없다</h2>
+<p style="margin:0;">node agent가 host `/var/lib/data/new`에 volume을 mount했지만 이미 실행 중인 container의 같은 path에는 빈 directory만 보였다. application 권한 문제가 아니라 container parent mount가 private여서 host의 새 child mount event가 전파되지 않은 것이었다. host에서 무작정 bind를 반복하지 않고 대상 PID `mountinfo`의 namespace ID와 shared/master tag를 비교했다. 필요한 경로만 host→container 단방향 slave propagation으로 재설계하고, mount event·source device·sentinel inode를 검증한 뒤 traffic을 열었다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">15. 대기업 면접 질문 3개</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;">VFS가 ext4와 NFS를 같은 API로 다루는 내부 원리는?</strong><br>답변 포인트: superblock·inode·dentry·file object, operation table dispatch, pathname walk, local block/page cache와 remote RPC implementation 차이.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">mount namespace가 격리하는 것과 격리하지 않는 것은?</strong><br>답변 포인트: mount list/hierarchy view, 같은 superblock·inode·page cache·data 공유 가능, root/cwd context, container security의 추가 boundary.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">shared·slave·private propagation을 언제 선택하나요?</strong><br>답변 포인트: event 방향, host device/volume 전달, 역전파 위험, per-mount 설정, mountinfo tag, 실제 event integration test.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">16. 퀴즈·누적 리뷰</h2>
+<ol style="margin:0;padding-left:22px;"><li>VFS superblock과 mount object의 차이는? filesystem instance state와 namespace attachment다.</li><li>bind mount는 data를 복사하는가? 아니다. 같은 underlying subtree를 다른 mount path에 연결한다.</li><li>private mount에서 file write도 다른 namespace와 격리되는가? 같은 filesystem을 참조하면 data 변경은 공유될 수 있다.</li><li>overmount 뒤 원래 directory file은 어디 갔나? 가려졌을 뿐이며 mount를 제거하면 다시 보인다.</li><li>Day 36 연결: pathname identity가 `(mount,dentry)` context를 필요로 하는 이유는?</li><li>Day 25 연결: mount namespace와 process address-space mapping은 각각 어떤 view를 격리하는가?</li><li>lazy unmount 뒤 기존 fd가 동작할 수 있는 이유를 reference lifetime으로 설명해 보자.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">17. 다음 날 연결</h2>
+<p style="margin:0;">Day 38은 <strong style="color:#f8fafc;">read/write, buffering, page cache, direct I/O</strong>다. 오늘 VFS가 선택한 `file_operations`가 application buffer와 page cache, block layer를 거쳐 data를 옮기는 경로와 buffered/direct I/O trade-off를 추적한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">18. 공식·1차 출처</h2>
+<ul style="margin:0;padding-left:22px;word-break:break-word;"><li><a href="https://docs.kernel.org/filesystems/vfs.html" style="color:#7dd3fc;">Linux Kernel — Overview of the Linux Virtual File System</a>: VFS, superblock·inode·dentry·file object와 operation dispatch.</li><li><a href="https://docs.kernel.org/filesystems/path-lookup.html" style="color:#7dd3fc;">Linux Kernel — Pathname lookup</a>: `(mount,dentry)` path walk와 mountpoint crossing·concurrency.</li><li><a href="https://docs.kernel.org/filesystems/sharedsubtree.html" style="color:#7dd3fc;">Linux Kernel — Shared Subtrees</a>: shared/private/slave/unbindable semantics와 propagation.</li><li><a href="https://man7.org/linux/man-pages/man7/mount_namespaces.7.html" style="color:#7dd3fc;">Linux man-pages — mount_namespaces(7)</a>: namespace mount list, clone/unshare, propagation·restriction.</li><li><a href="https://man7.org/linux/man-pages/man2/mount.2.html" style="color:#7dd3fc;">Linux man-pages — mount(2)</a>: bind/recursive bind, remount, propagation flag 계약.</li><li><a href="https://man7.org/linux/man-pages/man2/umount.2.html" style="color:#7dd3fc;">Linux man-pages — umount(2)</a>: EBUSY, MNT_DETACH, force·expiration semantics.</li><li><a href="https://man7.org/linux/man-pages/man5/proc_pid_mountinfo.5.html" style="color:#7dd3fc;">Linux man-pages — proc_pid_mountinfo(5)</a>: mount ID·parent·root·mountpoint·optional tag·super options 형식.</li><li><a href="https://man7.org/linux/man-pages/man7/namespaces.7.html" style="color:#7dd3fc;">Linux man-pages — namespaces(7)</a>: namespace lifetime과 `/proc/PID/ns/*` pinning.</li><li><a href="https://man7.org/linux/man-pages/man2/setns.2.html" style="color:#7dd3fc;">Linux man-pages — setns(2)</a>: process의 namespace join과 권한 조건.</li><li><a href="https://man7.org/linux/man-pages/man8/findmnt.8.html" style="color:#7dd3fc;">util-linux — findmnt(8)</a>: mountinfo 기반 target·tree·propagation 관찰.</li></ul>
+<p style="margin:28px 0 0;padding-top:18px;border-top:1px solid #27435d;color:#8fb3c9;font-size:13px;">Day 37 완료 기준: VFS object graph과 namespace mount tree를 그리고, 같은 pathname이 왜 다른 object로 resolve되는지와 propagation·EBUSY·lazy unmount 장애를 증거 기반으로 설명할 수 있다.</p>
+</td></tr></table></td></tr></table>
+</body></html>
