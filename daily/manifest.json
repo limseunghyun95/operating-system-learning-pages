@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-10-13T09:01:03+09:00",
+  "updatedAt": "2026-10-14T09:01:29+09:00",
   "lessons": [
     {
       "day": 1,
@@ -338,6 +338,15 @@
       "path": "day-37.html",
       "kind": "lesson",
       "publishedAt": "2026-10-13T09:01:03+09:00"
+    },
+    {
+      "day": 38,
+      "week": 6,
+      "title": "read/write, buffering, page cache, direct I/O",
+      "summary": "user buffer에서 VFS·page cache·writeback·block layer까지 buffered I/O를 추적하고 O_DIRECT의 alignment·coherency·partial I/O·SLO trade-off를 비교합니다.",
+      "path": "day-38.html",
+      "kind": "lesson",
+      "publishedAt": "2026-10-14T09:01:29+09:00"
     }
   ]
 }

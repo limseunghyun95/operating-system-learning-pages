@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Operating System 심화 커리큘럼 Day 38 - read/write, buffering, page cache, direct I/O</title></head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.72;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#07111f;"><tr><td align="center" style="padding:24px 12px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:680px;background:#0f1d2e;border:1px solid #23415d;border-radius:18px;overflow:hidden;">
+<tr><td style="padding:30px 28px 22px;background:#102a43;border-bottom:1px solid #28506f;">
+<div style="font-size:13px;letter-spacing:.12em;color:#5eead4;font-weight:800;">OPERATING SYSTEM · DAY 38 / 63 · FILESYSTEM I/O</div>
+<h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">read/write, buffering, page cache, direct I/O</h1>
+<p style="margin:0;color:#b9d6eb;">한 줄 요약: <strong style="color:#f8fafc;">buffered I/O는 user buffer와 page cache 사이에서 data를 복사하고 dirty data를 나중에 writeback하며, direct I/O는 file data의 page-cache 경로를 우회한다.</strong> 둘 다 VFS·filesystem·block layer를 지나며, 성공한 <code>write()</code>는 전체 요청 완료나 영속 저장을 보장하지 않는다.</p>
+</td></tr><tr><td style="padding:26px 28px 34px;">
+
+<h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:14px;">
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;width:31%;">user buffer</td><td style="border-bottom:1px solid #27435d;">application address space의 memory 영역. <code>read()</code>의 목적지이고 <code>write()</code>의 source다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">buffering</td><td style="border-bottom:1px solid #27435d;">작은 operation을 memory에 모아 syscall·I/O 횟수를 줄이는 전략. libc stdio buffer와 kernel page cache는 서로 다른 layer다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">page cache</td><td style="border-bottom:1px solid #27435d;">file offset의 data를 RAM의 folio/page로 cache하는 kernel 구조. read hit와 buffered write를 처리하며 memory pressure 때 reclaim된다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">page / folio</td><td style="border-bottom:1px solid #27435d;">page는 memory 관리의 기본 단위, folio는 하나 이상의 연속 page를 묶어 다루는 Linux kernel abstraction이다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">cache hit / miss</td><td style="border-bottom:1px solid #27435d;">요청 data가 page cache에 있어 storage I/O 없이 제공됨 / 없어 storage에서 채워야 함.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">readahead</td><td style="border-bottom:1px solid #27435d;">순차 접근을 감지해 다음 file range를 미리 읽는 최적화. 무작위 접근에서는 불필요한 I/O가 될 수 있다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">dirty</td><td style="border-bottom:1px solid #27435d;">RAM의 cached data가 backing storage보다 최신인 상태. 아직 durable하다는 뜻이 아니다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">writeback</td><td style="border-bottom:1px solid #27435d;">dirty folio를 filesystem·block layer를 통해 storage로 내보내는 kernel 작업.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">direct I/O</td><td style="border-bottom:1px solid #27435d;"><code>O_DIRECT</code>처럼 file data transfer에서 page cache를 우회하는 I/O. kernel·VFS·filesystem·device cache까지 모두 우회한다는 뜻은 아니다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">alignment</td><td style="border-bottom:1px solid #27435d;">buffer address, file offset, length이 filesystem/device가 요구하는 배수 경계에 맞는 조건.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">short I/O</td><td style="border-bottom:1px solid #27435d;">요청한 byte보다 적은 양을 성공적으로 전송한 결과. 반환값이 양수면 그만큼 progress가 있었다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">file offset</td><td style="border-bottom:1px solid #27435d;">open file description에 저장된 다음 read/write 위치. <code>pread/pwrite</code>는 shared offset을 바꾸지 않는다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">DMA</td><td style="border-bottom:1px solid #27435d;">device/controller가 CPU의 byte-by-byte copy 없이 main memory와 data를 전송하는 방식. syscall 전체가 zero-copy라는 뜻은 아니다.</td></tr>
+<tr><td style="color:#7dd3fc;font-weight:700;">durability</td><td>power loss 뒤에도 data가 남는 성질. <code>write()</code>, <code>O_DIRECT</code>, visibility와 별도 계약이며 Day 39에서 <code>fsync</code>·ordering과 연결한다.</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 접수 창구와 직송 트럭</h2>
+<p style="margin:0;">buffered write는 택배를 지역 물류센터(page cache)에 맡기고 접수증을 받는 것과 같다. 창구가 받았다고 목적지 storage에 도착한 것은 아니다. writeback이 묶어서 운송한다. direct I/O는 규격 pallet로 창고까지 직송하는 경로다. 중간 data cache를 줄일 수 있지만 pallet 크기·주소·도착 위치를 맞춰야 하고, 작은 random request를 자동으로 합쳐 주는 장점도 잃는다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: application buffer에서 storage까지</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">application
+  │ fread/fwrite라면 libc stdio buffer (선택적·user space)
+  ▼
+read/write/pread/pwrite/readv/writev syscall
+  ▼
+VFS: struct file → file_operations.read_iter/write_iter
+  │
+  ├─ buffered I/O ─→ address_space / page cache (folio)
+  │                    ├─ read hit → copy_to_user
+  │                    ├─ read miss → readahead / storage read
+  │                    └─ write → copy_from_user → dirty
+  │                                           │ later writeback
+  │                                           ▼
+  └─ O_DIRECT ─────→ buffer pin/map, filesystem block mapping
+                         │ page-cache data path bypass
+                         ▼
+              bio / block layer / scheduler / queue
+                         ▼
+              controller ─ DMA ─ device cache ─ media
+
+O_DIRECT도 syscall·VFS·filesystem mapping·block layer를 지난다.
+device cache의 persistence는 O_SYNC/fsync와 hardware flush 계약이 별도로 결정한다.</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. 상태 전이: buffered read·write와 direct I/O</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">BUFFERED READ
+[syscall] → cache lookup ─ hit ─→ copy_to_user → return n
+                         └ miss → folio allocate/lock
+                                   → filesystem mapping → device read
+                                   → uptodate → copy_to_user → return n
+
+BUFFERED WRITE
+[syscall] → folio lookup/allocate → copy_from_user → mark dirty → return n
+                                                   │
+              background threshold / age / pressure / fsync
+                                                   ▼
+                         writeback → block I/O → completion
+                              └ error recorded → later write/fsync may see EIO
+
+DIRECT I/O
+[syscall] → support/alignment check → map file blocks → pin/map user pages
+          → flush/invalidate overlapping cache as needed → submit bio/DMA
+          → completion/unpin → return transferred bytes or error</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. CS·kernel deep dive</h2>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.1 libc buffering과 page cache를 분리하라</h3><p style="margin:0;"><code>fwrite()</code>가 user-space stdio buffer에만 쌓이면 syscall조차 아직 안 했을 수 있다. <code>fflush()</code>는 이를 kernel로 넘기지만 page cache에서 storage로 persist시키는 계약은 아니다. 반대로 raw <code>write()</code>는 stdio buffer를 건너뛰어도 일반적으로 page cache에는 들어간다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.2 read/write는 “최대 count byte” API다</h3><p style="margin:0;"><code>read()</code>와 <code>write()</code>는 요청 길이를 모두 채우겠다는 API가 아니다. regular file의 EOF, pipe/socket의 현재 가용량, signal, quota·disk-full, nonblocking 상태 때문에 양수의 짧은 결과가 정상이다. 정확한 record가 필요하면 반환된 byte만큼 offset을 진전시키며 loop해야 한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.3 page cache의 key는 file mapping과 offset이다</h3><p style="margin:0;">VFS inode의 <code>address_space</code>가 file content의 cached folio를 관리하고 filesystem의 <code>address_space_operations</code>가 read, readahead, dirty, writeback을 연결한다. 여러 process가 같은 file을 buffered read하거나 shared mmap하면 이 kernel cache를 공유할 수 있다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.4 read miss와 readahead</h3><p style="margin:0;">cache miss에서는 filesystem이 logical file offset을 extent/block으로 map하고 I/O를 제출한다. 순차 패턴이면 kernel이 뒤 range를 미리 읽어 future fault/read latency를 숨길 수 있다. workload가 random으로 바뀌면 읽지 않을 data가 queue와 memory를 소비하므로 hit ratio·device read amplification을 같이 봐야 한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.5 buffered write의 빠른 반환은 latency debt다</h3><p style="margin:0;">user data를 folio에 copy하고 dirty 표시한 뒤 <code>write()</code>가 돌아올 수 있다. background flusher는 dirty threshold와 age에 따라 writeback하고, dirty memory가 높은 limit에 닿으면 writer 자신이 writeback·throttling에 묶여 tail latency가 튈 수 있다. 빠른 평균 write latency만 보면 debt를 숨긴다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.6 delayed error는 성공을 취소하지 않고 나중에 보고된다</h3><p style="margin:0;">buffered write 뒤 발생한 storage error는 최초 <code>write()</code>가 반환할 때 알 수 없을 수 있다. Linux는 writeback error를 후속 <code>write()</code> 또는 <code>fsync()</code>에서 <code>EIO</code>로 보고할 수 있다. 따라서 durability contract가 있는 code는 sync 결과까지 처리해야 한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.7 direct I/O는 page cache data path의 우회다</h3><p style="margin:0;">Linux iomap direct read는 storage에서 caller buffer로 I/O를 내고, direct write는 caller buffer에서 storage로 낸다. 그러나 extent allocation, COW, encryption·compression support, metadata, locking, bio 생성과 completion은 filesystem 구현에 남는다. “kernel bypass”나 “무조건 zero-copy”라고 말하면 틀리다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.8 O_DIRECT의 alignment는 상수가 아니다</h3><p style="margin:0;">buffer address, file offset, I/O length 제한은 filesystem·kernel version·file 특성에 따라 다르고 misaligned request는 <code>EINVAL</code> 또는 buffered fallback이 될 수 있다. Linux 6.1부터 지원 filesystem에서는 <code>statx(STATX_DIOALIGN)</code>의 memory·offset alignment를 우선 조회한다. “항상 4096”을 hard-code하지 않는다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.9 buffered와 direct를 섞으면 coherency 비용이 생긴다</h3><p style="margin:0;">동일 range에 dirty page cache와 direct write가 겹치면 stale data 방지를 위해 flush·invalidate·serialization이 필요하다. iomap direct path도 overlapping dirty cache를 flush하고 write 전후 invalidate할 수 있다. overlapping buffered I/O·mmap·O_DIRECT 혼용을 피하고 ownership boundary를 정한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.10 direct I/O는 application이 cache policy를 소유할 때 유리하다</h3><p style="margin:0;">database/storage engine처럼 자체 buffer pool, eviction, checksum, batching, queue depth를 제어하면 이중 cache와 memory pollution을 줄일 수 있다. 일반 application은 page cache의 sharing·readahead·write coalescing을 잃고 alignment·tail 처리·retry 복잡성을 떠안으므로 benchmark 없는 O_DIRECT 도입은 위험하다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.11 shared offset과 positional I/O</h3><p style="margin:0;">dup/fork로 공유한 open file description은 file offset도 공유한다. 여러 worker가 독립 offset에서 병렬 I/O한다면 <code>pread/pwrite</code>를 사용해 seek+read/write race와 shared offset contention을 제거한다. 반환된 short count를 기준으로 요청 위치를 갱신해야 한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. buffered vs direct 의사결정 표</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:12px;">
+<tr style="background:#15314a;color:#bae6fd;"><td>관점</td><td>buffered I/O</td><td>direct I/O</td></tr>
+<tr><td style="border-top:1px solid #27435d;">data 경로</td><td style="border-top:1px solid #27435d;">user buffer ↔ page cache ↔ storage</td><td style="border-top:1px solid #27435d;">user buffer ↔ storage, page-cache data path 우회</td></tr>
+<tr><td style="border-top:1px solid #27435d;">강점</td><td style="border-top:1px solid #27435d;">cache sharing, readahead, write coalescing, 간단한 buffer</td><td style="border-top:1px solid #27435d;">application cache ownership, predictable cache footprint, double caching 감소</td></tr>
+<tr><td style="border-top:1px solid #27435d;">비용</td><td style="border-top:1px solid #27435d;">copy, cache pollution, dirty debt·writeback stall</td><td style="border-top:1px solid #27435d;">alignment, page pin/map, 작은 I/O, tail·coherency 처리</td></tr>
+<tr><td style="border-top:1px solid #27435d;">적합 workload</td><td style="border-top:1px solid #27435d;">일반 file service, shared hot data, sequential read</td><td style="border-top:1px solid #27435d;">검증된 DB/storage engine의 큰 aligned I/O</td></tr>
+<tr><td style="border-top:1px solid #27435d;">durability</td><td style="border-top:1px solid #27435d;">write success만으로 보장 안 됨</td><td style="border-top:1px solid #27435d;">O_DIRECT만으로 O_SYNC/fsync 보장 아님</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. 실무 best practice</h2>
+<ul style="margin:0;padding-left:22px;"><li>protocol·file format이 정확한 길이를 요구하면 <code>read_exact/write_all</code> helper를 만들고 progress, EOF, retryable error를 명시한다.</li><li>동시 worker의 독립 offset은 <code>pread/pwrite</code>로 표현하고 shared seek offset에 의존하지 않는다.</li><li>buffer size와 batch는 syscall count, cache locality, device queue, cancellation latency를 함께 측정해 고른다. 무조건 큰 buffer가 정답은 아니다.</li><li><code>readv/writev</code>로 scatter/gather를 줄여도 전체 iovec를 다 처리했다는 보장은 없으므로 반환 byte를 vector에 다시 배분한다.</li><li>DB가 자체 cache를 갖더라도 buffered와 O_DIRECT 양쪽을 실제 data set·memory pressure·failure injection으로 비교한다.</li><li>direct I/O는 <code>statx(STATX_DIOALIGN)</code>로 capability와 alignment를 탐지하고 aligned allocator·offset·length·EOF tail 정책을 한 module에 캡슐화한다.</li><li>동일 file range의 buffered, direct, writable mmap 혼용을 피하고 mode 전환은 quiesce→flush→invalidate→verify 절차로 제한한다.</li><li>관찰 지표는 application latency만 보지 말고 cache hit/miss, major fault, readahead, Dirty/Writeback, writeback throttle, PSI I/O, device latency·queue depth를 연결한다.</li><li>production benchmark에서 global <code>drop_caches</code>를 사용하지 않는다. 격리 환경에서도 cold/warm 조건과 cache state를 기록한다.</li><li>성공 응답의 의미를 “kernel memory에 복사”, “device completion”, “power-loss durable” 중 무엇인지 API 계약에 적는다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. error handling runbook</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;">return value 우선:</strong> <code>n &gt; 0</code>이면 n byte progress를 먼저 commit한다. 남은 slice만 재시도한다.</li><li><strong style="color:#f8fafc;">read의 0:</strong> requested length가 0이 아니라면 EOF다. error로 무한 retry하지 않는다.</li><li><strong style="color:#f8fafc;">EINTR:</strong> progress가 없는 실패만 현재 offset에서 재시도한다. wrapper가 일부 progress를 반환했는지 계약을 확인한다.</li><li><strong style="color:#f8fafc;">EAGAIN/EWOULDBLOCK:</strong> busy loop하지 말고 readiness·deadline·cancellation과 연결한다. regular file과 socket의 의미가 다르다.</li><li><strong style="color:#f8fafc;">ENOSPC/EDQUOT/EFBIG:</strong> retry budget을 태우지 말고 admission을 닫고 quota·capacity·file limit을 구분한다. 이미 기록된 prefix를 보존한다.</li><li><strong style="color:#f8fafc;">EPIPE:</strong> SIGPIPE 정책과 함께 처리한다. process 종료를 원하지 않으면 signal을 block/ignore하고 error를 상위로 전달한다.</li><li><strong style="color:#f8fafc;">EIO:</strong> 현재 request 또는 이전 buffered writeback에서 왔을 수 있다. file·filesystem·device evidence를 보존하고 durability를 성공으로 보고하지 않는다.</li><li><strong style="color:#f8fafc;">O_DIRECT EINVAL:</strong> 지원 여부와 buffer address·offset·length alignment를 <code>statx</code>와 filesystem 문서로 확인한다. silent buffered fallback을 자체 구현하지 않는다.</li><li><strong style="color:#f8fafc;">timeout/cancel:</strong> completion을 못 봤다고 write가 전혀 실행되지 않았다고 가정하지 않는다. idempotency·offset·record checksum으로 재조정한다.</li><li><strong style="color:#f8fafc;">verify:</strong> byte count, logical offset, checksum, sync 결과, device error를 검증한 뒤에만 durable success를 응답한다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. 놓치기 쉬운 함정</h2>
+<ul style="margin:0;padding-left:22px;"><li><strong style="color:#fecaca;">write가 양수면 전체 요청 성공:</strong> 반환 byte만 성공이며 남은 suffix는 아직 쓰지 않았다.</li><li><strong style="color:#fecaca;">write 성공은 disk durable:</strong> buffered path에서는 RAM의 dirty folio일 수 있고 direct도 O_SYNC 계약을 대신하지 않는다.</li><li><strong style="color:#fecaca;">fflush와 fsync가 같다:</strong> 전자는 stdio→kernel, 후자는 kernel dirty data/metadata→storage 계약이다.</li><li><strong style="color:#fecaca;">O_DIRECT는 kernel bypass:</strong> page-cache data path를 우회하지만 VFS·filesystem·block layer·metadata를 거친다.</li><li><strong style="color:#fecaca;">O_DIRECT가 항상 빠르다:</strong> readahead·coalescing·shared cache를 잃고 small I/O나 alignment 처리로 더 느릴 수 있다.</li><li><strong style="color:#fecaca;">direct alignment는 항상 4KiB:</strong> filesystem·kernel·file에 따라 다르므로 capability를 조회한다.</li><li><strong style="color:#fecaca;">EOF는 일시적 error:</strong> regular file read 0은 EOF이며 retry loop는 CPU를 태운다.</li><li><strong style="color:#fecaca;">한 번의 read가 record 하나:</strong> byte-stream API에서는 framing을 application이 복원해야 한다.</li><li><strong style="color:#fecaca;">buffered/direct/mmap 혼용은 공짜:</strong> cache flush·invalidate·serialization과 stale-read 위험이 생긴다.</li><li><strong style="color:#fecaca;">drop_caches가 공정한 benchmark:</strong> system-wide workload를 교란하고 production cache behavior를 왜곡한다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 30분 실습: short I/O와 page-cache state model</h2>
+<p style="margin:0 0 10px;">권한·platform에 의존하지 않는 교육용 model이다. short read/write를 강제로 만들고 buffered write가 dirty에서 writeback으로 이동하는 흐름을 검증한다. 실제 kernel timing이나 filesystem 구현을 재현하지 않는다.</p>
+<pre style="margin:0;white-space:pre;overflow-x:auto;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;">python3 - &lt;&lt;'PY'
+class ShortWriter:
+    def __init__(self, limit): self.limit, self.data = limit, bytearray()
+    def write(self, chunk):
+        n = min(self.limit, len(chunk))
+        self.data.extend(chunk[:n])
+        return n
+
+class ShortReader:
+    def __init__(self, data, limit): self.data, self.limit, self.pos = data, limit, 0
+    def read(self, count):
+        if self.pos == len(self.data): return b""
+        n = min(count, self.limit, len(self.data) - self.pos)
+        out = self.data[self.pos:self.pos+n]; self.pos += n
+        return out
+
+def write_all(dst, data):
+    done = 0
+    while done &lt; len(data):
+        n = dst.write(data[done:])
+        if n &lt;= 0: raise OSError("no write progress")
+        done += n
+    return done
+
+def read_exact(src, size):
+    out = bytearray()
+    while len(out) &lt; size:
+        chunk = src.read(size - len(out))
+        if not chunk: raise EOFError(f"wanted {size}, got {len(out)}")
+        out.extend(chunk)
+    return bytes(out)
+
+payload = b"page-cache-is-not-durability"
+w = ShortWriter(limit=5)
+assert write_all(w, payload) == len(payload) and bytes(w.data) == payload
+r = ShortReader(bytes(w.data), limit=4)
+assert read_exact(r, len(payload)) == payload
+
+cache, dirty, storage = {}, set(), {}
+def buffered_write(page, value):
+    cache[page] = value; dirty.add(page)  # syscall return model
+def writeback():
+    for page in list(dirty): storage[page] = cache[page]; dirty.remove(page)
+def direct_read(page):
+    return storage.get(page)              # page cache data path bypass
+
+buffered_write(7, b"new")
+assert cache[7] == b"new" and direct_read(7) is None and 7 in dirty
+writeback()
+assert direct_read(7) == b"new" and not dirty
+print("short_io_bytes", len(payload))
+print("cache", cache, "storage", storage, "dirty", dirty)
+PY</pre>
+<ol style="margin:12px 0 0;padding-left:22px;"><li><strong style="color:#f8fafc;">0~10분:</strong> loop를 제거해 5 byte만 남는 실패를 관찰하고 byte progress invariant를 적는다.</li><li><strong style="color:#f8fafc;">10~20분:</strong> buffered write 직후 cache와 storage가 다른 이유를 state diagram으로 설명한다.</li><li><strong style="color:#f8fafc;">20~30분:</strong> zero progress, early EOF, writeback error를 model에 주입하고 상위 API의 응답 계약을 설계한다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. Linux production 관찰</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;"># dirty/writeback와 system I/O pressure
+grep -E '^(Cached|Dirty|Writeback|WritebackTmp):' /proc/meminfo
+grep -E '^(nr_dirty|nr_writeback|pgpgin|pgpgout|pswpin|pswpout) ' /proc/vmstat
+cat /proc/pressure/io
+
+# process가 syscall에서 실제로 받은 byte와 error
+strace -ttT -e trace=read,write,pread64,pwrite64,readv,writev,fsync,fdatasync -p &lt;PID&gt;
+cat /proc/&lt;PID&gt;/io
+
+# block device latency·queue: sysstat가 설치된 Linux
+iostat -xz 1
+
+# direct I/O alignment: Linux 6.1+이며 filesystem 지원 필요
+statx --dioalign /path/to/file
+
+# VM tunable은 읽기만. production에서 즉시 변경하지 않는다.
+grep . /proc/sys/vm/dirty_{background_bytes,background_ratio,bytes,ratio,expire_centisecs,writeback_centisecs}</pre>
+<p style="margin:10px 0 0;">metric은 같은 시간축으로 묶는다. application p99가 오를 때 Dirty 증가→writer throttle, PSI I/O, device await·queue가 함께 움직이는지 본다. <code>/proc/PID/io</code>는 permission, cache, shared writer, filesystem 특성 때문에 단독 인과 증거가 아니다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 실패 시나리오: 평균 1ms write, p99는 8초</h2>
+<p style="margin:0;">upload service는 <code>write()</code> 반환 즉시 “저장 완료”를 응답했다. 평소에는 page cache copy만 측정돼 1ms였지만 storage가 느려지자 dirty memory가 limit에 닿고 request thread가 writeback에 throttling되어 p99가 8초가 됐다. 이후 device error가 <code>fsync()</code>에서 나타났지만 service는 sync 결과를 보지 않아 이미 성공을 응답했다. 대응은 admission control, per-file byte progress, Dirty·Writeback·PSI·device latency correlation, preallocation·quota alert, 명시적 durability boundary와 sync error 전파였다. O_DIRECT로 즉시 바꾸지 않고 workload replay로 cache·queue trade-off를 검증했다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 대기업 면접 질문 3개</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;">buffered read/write가 storage까지 가는 경로를 설명해 보세요.</strong><br>답변 포인트: syscall→VFS read_iter/write_iter→address_space/page cache, hit/miss·readahead, copy_to/from_user, dirty→writeback→bio/device, return과 durability 분리.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">O_DIRECT를 언제 선택하고 어떤 함정이 있나요?</strong><br>답변 포인트: 자체 buffer pool, cache ownership과 memory pollution, alignment capability 탐지, partial/tail 처리, buffered·mmap coherency, 작은 I/O·readahead 손실, O_SYNC와 차이.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">write가 요청보다 적게 성공하면 어떻게 복구하나요?</strong><br>답변 포인트: positive progress 보존, remaining slice와 logical offset 갱신, EINTR/EAGAIN/deadline, ENOSPC/EIO 분류, idempotency, sync error까지 성공 계약에 포함.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 퀴즈·누적 리뷰</h2>
+<ol style="margin:0;padding-left:22px;"><li><code>fwrite</code>, <code>fflush</code>, <code>write</code>, <code>fsync</code>가 각각 넘는 boundary는 무엇인가?</li><li>buffered write가 빠른데도 갑자기 request가 writeback에 막히는 이유는?</li><li><code>read()</code>가 0을 반환했을 때 EOF와 zero-length request를 어떻게 구분하는가?</li><li>O_DIRECT가 건너뛰는 cache와 건너뛰지 않는 kernel layer를 말해 보자.</li><li>buffer address만 aligned하고 offset·length를 확인하지 않으면 어떤 실패가 가능한가?</li><li>Day 36 연결: dup한 fd 두 개의 shared offset race를 <code>pread/pwrite</code>가 어떻게 줄이는가?</li><li>Day 26 연결: page cache의 dirty/writeback이 memory pressure와 I/O latency를 어떻게 연결하는가?</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">15. 다음 날 연결</h2>
+<p style="margin:0;">Day 39는 <strong style="color:#f8fafc;">durability, fsync, ordering, atomic rename</strong>이다. 오늘의 “write success ≠ durable”을 출발점으로 data·metadata flush ordering, directory fsync, temp-file+rename protocol, crash window를 설계한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">16. 공식·1차 출처</h2>
+<ul style="margin:0;padding-left:22px;word-break:break-word;"><li><a href="https://docs.kernel.org/filesystems/vfs.html" style="color:#7dd3fc;">Linux Kernel — Overview of the Linux Virtual File System</a>: file_operations의 read/write iter와 address_space/page-cache operation.</li><li><a href="https://docs.kernel.org/filesystems/iomap/operations.html" style="color:#7dd3fc;">Linux Kernel — iomap Supported File Operations</a>: buffered I/O, folio state, writeback, direct read/write, cache flush·invalidate와 return code.</li><li><a href="https://docs.kernel.org/admin-guide/sysctl/vm.html" style="color:#7dd3fc;">Linux Kernel — /proc/sys/vm documentation</a>: dirty background/process threshold, writeback interval과 drop_caches 경고.</li><li><a href="https://docs.kernel.org/admin-guide/cgroup-v2.html" style="color:#7dd3fc;">Linux Kernel — Control Group v2</a>: page-cache dirtying과 cgroup writeback·I/O control 관계.</li><li><a href="https://man7.org/linux/man-pages/man2/read.2.html" style="color:#7dd3fc;">Linux man-pages — read(2)</a>: short read, EOF, EINTR, EAGAIN 계약.</li><li><a href="https://man7.org/linux/man-pages/man2/write.2.html" style="color:#7dd3fc;">Linux man-pages — write(2)</a>: partial write, ENOSPC, EPIPE, delayed writeback EIO.</li><li><a href="https://man7.org/linux/man-pages/man2/open.2.html" style="color:#7dd3fc;">Linux man-pages — open(2)</a>: O_DIRECT 의미, 성능 trade-off, misalignment와 O_SYNC 차이.</li><li><a href="https://man7.org/linux/man-pages/man2/statx.2.html" style="color:#7dd3fc;">Linux man-pages — statx(2)</a>: STATX_DIOALIGN의 memory·offset alignment capability.</li><li><a href="https://man7.org/linux/man-pages/man2/pread.2.html" style="color:#7dd3fc;">Linux man-pages — pread(2)/pwrite(2)</a>: shared file offset을 변경하지 않는 positional I/O.</li><li><a href="https://man7.org/linux/man-pages/man2/readv.2.html" style="color:#7dd3fc;">Linux man-pages — readv(2)/writev(2)</a>: scatter/gather와 partial byte count.</li><li><a href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/read.html" style="color:#7dd3fc;">POSIX.1-2024 — read</a>: portable read semantics.</li><li><a href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/write.html" style="color:#7dd3fc;">POSIX.1-2024 — write</a>: partial write와 atomicity 범위.</li></ul>
+<p style="margin:28px 0 0;padding-top:18px;border-top:1px solid #27435d;color:#8fb3c9;font-size:13px;">Day 38 완료 기준: buffered/direct I/O 경로를 application buffer부터 storage까지 그리고, short I/O·dirty writeback·alignment·coherency·durability 실패를 올바르게 처리하며 workload 근거로 mode를 선택할 수 있다.</p>
+</td></tr></table></td></tr></table>
+</body></html>
