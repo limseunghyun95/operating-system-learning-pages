@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Operating System 심화 커리큘럼 Day 39 - durability, fsync, ordering, atomic rename</title></head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.72;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#07111f;"><tr><td align="center" style="padding:24px 12px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:680px;background:#0f1d2e;border:1px solid #23415d;border-radius:18px;overflow:hidden;">
+<tr><td style="padding:30px 28px 22px;background:#102a43;border-bottom:1px solid #28506f;">
+<div style="font-size:13px;letter-spacing:.12em;color:#5eead4;font-weight:800;">OPERATING SYSTEM · DAY 39 / 63 · CRASH CONSISTENCY</div>
+<h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">durability, fsync, ordering, atomic rename</h1>
+<p style="margin:0;color:#b9d6eb;">한 줄 요약: <strong style="color:#f8fafc;">crash-safe file 교체는 temp file의 data·필수 metadata를 먼저 동기화하고, 같은 filesystem 안에서 rename으로 이름을 원자적으로 바꾼 뒤, parent directory를 fsync해 namespace 변경까지 durable하게 만든다.</strong> atomic visibility와 power-loss durability는 서로 다른 계약이다.</p>
+</td></tr><tr><td style="padding:26px 28px 34px;">
+
+<h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:14px;">
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;width:31%;">visibility</td><td style="border-bottom:1px solid #27435d;">다른 thread/process가 새 값을 관찰할 수 있는 성질. reboot 뒤에도 남는다는 뜻은 아니다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">durability</td><td style="border-bottom:1px solid #27435d;">성공으로 응답한 data가 power loss·kernel crash 뒤에도 storage에서 복구되는 성질.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">atomicity</td><td style="border-bottom:1px solid #27435d;">관찰 가능한 상태가 operation 전 또는 후이고 중간 상태는 보이지 않는 성질. atomic rename도 자동 durability를 뜻하지 않는다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">ordering</td><td style="border-bottom:1px solid #27435d;">A가 stable storage에 도달한 뒤 B가 도달하도록 crash 후에도 필요한 선후관계를 만드는 것.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">fsync</td><td style="border-bottom:1px solid #27435d;">file의 modified data와 관련 metadata를 storage로 동기화하고 device completion을 기다리는 system call.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">fdatasync</td><td style="border-bottom:1px solid #27435d;">data와 이를 다시 읽는 데 필요한 metadata만 동기화한다. file size는 필요하지만 mtime 같은 metadata는 생략될 수 있다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">O_SYNC / O_DSYNC</td><td style="border-bottom:1px solid #27435d;">각 write가 file-integrity / data-integrity completion 계약을 만족한 뒤 반환하도록 하는 open flag.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">directory entry</td><td style="border-bottom:1px solid #27435d;">directory 안의 name→inode 연결. file fsync만으로 새 이름이나 rename 자체가 durable하다고 보장되지 않는다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">atomic rename</td><td style="border-bottom:1px solid #27435d;">기존 target name을 새 inode로 한 번에 교체해 pathname observer가 target이 사라진 순간을 보지 않게 하는 namespace operation.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">flush</td><td style="border-bottom:1px solid #27435d;">volatile cache의 이전 write를 non-volatile media로 밀어내는 storage command. language의 flush나 stdio <code>fflush</code>와 구분한다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">FUA</td><td style="border-bottom:1px solid #27435d;">Force Unit Access. 특정 write의 completion을 non-volatile storage 도달 뒤에 보고하도록 요청하는 device/block-layer mechanism.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">volatile write cache</td><td style="border-bottom:1px solid #27435d;">power loss 시 사라질 수 있지만 media보다 빠른 controller/device cache.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">torn write</td><td style="border-bottom:1px solid #27435d;">하나의 logical record/block 일부만 새 값으로 남는 failure. rename atomicity만으로 temp file 내부 torn/corruption을 막지 못한다.</td></tr>
+<tr><td style="color:#7dd3fc;font-weight:700;">crash consistency</td><td>어느 instruction 사이에서 crash가 나도 reboot 후 filesystem/application invariant를 만족하는 복구 가능한 상태를 유지하는 성질.</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 원장과 색인 카드</h2>
+<p style="margin:0;">file data는 창고의 원장이고 directory entry는 원장을 찾는 색인 카드다. 새 원장을 완성해 금고에 넣는 것이 file fsync, 색인 카드를 새 원장으로 한 번에 바꾸는 것이 rename, 바뀐 색인 카드 자체를 금고에 확정하는 것이 directory fsync다. 원장을 먼저 확정하지 않으면 색인은 빈 원장을 가리킬 수 있고, 색인까지 확정하지 않으면 reboot 뒤 예전 이름 관계로 돌아갈 수 있다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: write부터 non-volatile media까지</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">application state machine
+  │ write / rename / fsync
+  ▼
+VFS ─ file data + inode metadata + directory entries
+  ▼
+filesystem page cache / journal / COW transaction
+  │ dirty data·metadata, dependency ordering
+  ▼
+block layer ─ queue / merge / reorder
+  │ REQ_PREFLUSH: 이전 write를 stable하게 만든 뒤 진행
+  │ REQ_FUA: 이 write가 non-volatile해진 뒤 completion
+  ▼
+device/controller volatile write cache
+  ▼
+non-volatile media
+
+CPU memory fence는 core 사이 memory ordering을 다룬다.
+fsync·flush·FUA는 filesystem→device의 persistence ordering을 다룬다.</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. 상태 전이: crash-safe replace protocol</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">[target = OLD, directory durable]
+       │ 1. 같은 directory에 unique temp 생성(O_EXCL, safe mode)
+       ▼
+[temp inode allocated]
+       │ 2. write_all + checksum/version + chmod/chown/xattr if required
+       ▼
+[temp dirty and complete]
+       │ 3. fsync(temp) 또는 적합한 fdatasync
+       ▼
+[NEW contents retrievable after crash]
+       │ 4. rename(temp, target) — runtime namespace atomic switch
+       ▼
+[lookup(target) = NEW, open OLD fd는 OLD inode 유지]
+       │ 5. fsync(parent directory)
+       ▼
+[NEW name→inode relation도 durable] → success response
+
+Crash A: 3 전 → OLD 유지, temp는 없거나 incomplete
+Crash B: 3 후 4 전 → OLD 유지, complete orphan temp 가능
+Crash C: 4 후 5 전 → 실행 중에는 NEW, reboot 후 name relation은 보장 못 함
+Crash D: 5 후 → NEW가 durable contract</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. CS·kernel deep dive</h2>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.1 write success, visibility, durability를 분리하라</h3><p style="margin:0;">buffered <code>write()</code>는 page cache에 copy된 byte count를 성공으로 돌려줄 수 있다. 다른 reader가 새 data를 볼 수 있어도 controller cache·media까지 persistence가 끝났다는 뜻은 아니다. API 성공 조건을 “memory accepted”, “namespace published”, “power-loss durable” 중 하나로 명시해야 한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.2 fsync의 scope는 열린 file object다</h3><p style="margin:0;"><code>fsync(fd)</code>는 해당 file의 dirty data와 metadata를 flush하고 device가 완료를 보고할 때까지 기다린다. 그러나 그 file을 새 이름으로 연결한 parent directory entry까지 자동으로 sync한다고 일반화할 수 없다. 새 file 생성·unlink·rename의 durable namespace가 필요하면 directory fd도 fsync한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.3 fdatasync는 “data만”보다 정확한 계약이다</h3><p style="margin:0;">후속 read에 필요한 metadata는 함께 sync한다. append로 늘어난 <code>st_size</code>는 필요하지만 단순 mtime 변경은 생략될 수 있다. metadata 보존이 correctness에 포함되거나 filesystem별 차이를 감당하기 어렵다면 fsync를 선택하고 측정한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.4 O_SYNC는 per-write durability, fsync는 batching boundary다</h3><p style="margin:0;"><code>O_SYNC</code>는 매 write마다 file-integrity completion을 요구해 단순하지만 flush 횟수와 tail latency가 커질 수 있다. 여러 record를 쓰고 한 번 fsync하는 group commit은 throughput을 높이는 대신 마지막 sync 전 crash-loss window를 만든다. RPO·p99 SLO로 batch size와 interval을 정한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.5 atomic rename은 runtime namespace atomicity다</h3><p style="margin:0;">같은 mounted filesystem 안에서 기존 <code>newpath</code>는 atomically replaced되어 lookup이 “없음”을 보는 순간이 없다. 하지만 기존 fd는 old inode를 계속 참조할 수 있고, 잠깐 oldpath와 newpath가 같은 inode를 가리킬 수 있다. cross-filesystem rename은 <code>EXDEV</code>로 실패한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.6 rename atomicity와 crash durability는 독립 축이다</h3><p style="margin:0;">rename이 성공했어도 directory metadata가 stable하지 않으면 crash 후 새 name 관계를 요구할 수 없다. 반대로 file data를 fsync하지 않고 rename·directory fsync만 하면 이름은 새 inode를 가리키지만 content가 비거나 오래된 상태일 수 있다. 순서는 data before name이다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.7 block layer는 flush와 FUA로 volatile cache를 제어한다</h3><p style="margin:0;">device는 write completion을 non-volatile media 도달 전에 보고할 수 있다. Linux filesystem은 <code>REQ_PREFLUSH</code>로 이전 write를 먼저 stable하게 만들고 <code>REQ_FUA</code>로 특정 write의 stable completion을 요구한다. application은 raw command를 조립하기보다 filesystem이 제공하는 fsync/O_SYNC 계약을 사용한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.8 filesystem journal을 application protocol 대신 쓰지 마라</h3><p style="margin:0;">journal·copy-on-write filesystem은 내부 metadata invariant와 ordering을 제공하지만 mode, mount option, kernel version, hardware flush correctness에 따라 보장 범위가 다르다. “ext4니까 rename만 해도 된다” 같은 undocumented dependency는 피하고 documented sync boundary를 호출한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.9 temp file은 target과 같은 directory에 둔다</h3><p style="margin:0;">같은 directory면 동일 filesystem일 가능성을 확보하고 rename의 atomic replacement를 사용할 수 있다. <code>/tmp</code>에서 만들면 target과 mount가 달라 <code>EXDEV</code>가 날 수 있다. <code>O_CREAT|O_EXCL</code> 또는 지원 환경의 <code>O_TMPFILE</code>로 collision·symlink race를 줄인다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.10 두 directory 사이 rename은 둘 다 고려한다</h3><p style="margin:0;">source와 destination directory가 다르면 한 directory에서는 name이 제거되고 다른 곳에는 추가된다. crash-safe contract가 양쪽 namespace 변화를 포함한다면 관련 directory fd를 모두 sync하고 filesystem 문서를 검증한다. mount가 다르면 atomic rename 자체가 불가능하다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.11 network filesystem은 결과가 uncertain할 수 있다</h3><p style="margin:0;">NFS에서 server가 rename을 수행한 뒤 crash하고 client RPC가 재전송되면 call이 실패해도 rename은 이미 적용됐을 수 있다. timeout/error를 “아무 일도 안 일어남”으로 해석하지 말고 target version·checksum을 reread해 reconcile한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.12 close는 durability primitive가 아니다</h3><p style="margin:0;">successful close도 disk 저장을 보장하지 않는다. close가 delayed error를 보고할 수는 있지만 fsync를 대신하지 않으며, Linux에서 close error 뒤 fd는 이미 재사용될 수 있어 retry close는 다른 fd를 닫는 위험이 있다. durability가 필요하면 fsync 결과를 먼저 확인하고 close error도 진단에 포함한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. 보장 조합표</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:12px;">
+<tr style="background:#15314a;color:#bae6fd;"><td>operation</td><td>runtime visibility</td><td>crash 후 보장</td></tr>
+<tr><td style="border-top:1px solid #27435d;">write only</td><td style="border-top:1px solid #27435d;">새 byte를 reader가 볼 수 있음</td><td style="border-top:1px solid #27435d;">일반적으로 요구 불가</td></tr>
+<tr><td style="border-top:1px solid #27435d;">fsync(temp)</td><td style="border-top:1px solid #27435d;">temp name으로 complete data</td><td style="border-top:1px solid #27435d;">temp content, target name switch는 아님</td></tr>
+<tr><td style="border-top:1px solid #27435d;">rename only</td><td style="border-top:1px solid #27435d;">target lookup은 OLD 또는 NEW</td><td style="border-top:1px solid #27435d;">directory relation durability는 별도</td></tr>
+<tr><td style="border-top:1px solid #27435d;">fsync(temp) → rename</td><td style="border-top:1px solid #27435d;">complete NEW가 atomically visible</td><td style="border-top:1px solid #27435d;">reboot 후 NEW name을 아직 확정 못 함</td></tr>
+<tr><td style="border-top:1px solid #27435d;">fsync(temp) → rename → fsync(dir)</td><td style="border-top:1px solid #27435d;">complete NEW visible</td><td style="border-top:1px solid #27435d;">지원 filesystem 계약 아래 NEW name+data durable</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. 실무 best practice</h2>
+<ul style="margin:0;padding-left:22px;"><li>temp를 target과 같은 directory에 mode 0600·unique name·exclusive create로 만들고, 최종 permission·owner·xattr를 publication 전에 설정한다.</li><li>short write·EINTR을 처리하는 <code>write_all</code>과 checksum/version footer로 complete payload를 검증한다.</li><li>data와 required metadata 설정을 끝낸 뒤 temp fd를 fsync한다. fsync 뒤 metadata를 바꾸면 다시 sync한다.</li><li>rename 성공 뒤 parent directory fd를 fsync하고, 그 성공 뒤에만 durable success를 외부에 응답한다.</li><li>동시 writer가 있으면 generation, lock, compare-and-swap policy 또는 <code>RENAME_NOREPLACE</code> 같은 명시적 conflict 규칙을 둔다.</li><li>RPO가 허용하면 group commit을 사용하되 batch interval·record count·fsync p99와 crash-loss window를 함께 공개한다.</li><li><code>posix_fallocate</code> 등으로 space를 미리 확보해도 quota·device·writeback failure를 제거하지는 못한다. sync error path는 유지한다.</li><li>startup recovery는 owned temp naming pattern, embedded version/checksum, target state를 기준으로 orphan을 판별한다. 오래됐다는 이유만으로 임의 file을 삭제하지 않는다.</li><li>fsync latency histogram, EIO·ENOSPC·EDQUOT, dirty/writeback, device flush latency, queue saturation을 같은 trace에 묶는다.</li><li>filesystem·mount·storage stack별 crash test를 실제 power-cut/fault-injection 환경에서 수행하고, unsupported directory fsync나 network semantics를 문서화한다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. error handling runbook</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;">create:</strong> <code>EEXIST</code>는 temp collision/leftover를 조사하고 새 nonce를 사용한다. symlink를 따라가며 overwrite하지 않는다.</li><li><strong style="color:#f8fafc;">write:</strong> positive short count는 progress로 보존한다. <code>ENOSPC/EDQUOT/EIO</code>면 target을 rename하지 않고 temp를 격리·진단한다.</li><li><strong style="color:#f8fafc;">file sync:</strong> <code>EINTR</code>는 platform contract에 맞춰 재시도하고, <code>EIO/ENOSPC/EDQUOT</code>면 durable success를 금지한다. fsync가 이전 writeback error를 늦게 전달할 수 있다.</li><li><strong style="color:#f8fafc;">rename:</strong> <code>EXDEV</code>면 copy+rename을 자동으로 atomic이라 가장하지 않는다. same-filesystem staging으로 다시 설계한다.</li><li><strong style="color:#f8fafc;">conflict:</strong> <code>EEXIST</code>나 generation mismatch는 overwrite retry가 아니라 application conflict로 처리한다.</li><li><strong style="color:#f8fafc;">uncertain result:</strong> timeout/NFS error 뒤 operation 미실행을 가정하지 말고 target version·inode·checksum을 reread해 reconcile한다.</li><li><strong style="color:#f8fafc;">directory sync:</strong> unsupported <code>EINVAL</code>을 무시하고 durable이라 보고하지 않는다. filesystem별 adapter·documented guarantee 또는 다른 storage protocol이 필요하다.</li><li><strong style="color:#f8fafc;">cleanup:</strong> rename 전이며 자신이 만든 temp name이라는 증거가 있을 때만 unlink한다. rename 후에는 target을 rollback 삭제하지 않는다.</li><li><strong style="color:#f8fafc;">close:</strong> fsync 뒤 close error를 기록하지만 Linux에서 실패한 close를 retry하지 않는다.</li><li><strong style="color:#f8fafc;">recovery:</strong> OLD/NEW 둘 중 어느 state가 valid한지 checksum·version invariant로 판별하고, 사람 승인 없이 “가장 최신 mtime”을 선택하지 않는다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. 놓치기 쉬운 함정</h2>
+<ul style="margin:0;padding-left:22px;"><li><strong style="color:#fecaca;">rename 성공 = durable:</strong> runtime namespace atomicity와 power-loss durability는 별개다.</li><li><strong style="color:#fecaca;">file fsync 하나면 새 이름도 durable:</strong> containing directory entry는 별도 sync가 필요하다.</li><li><strong style="color:#fecaca;">directory fsync만 하면 content도 안전:</strong> 먼저 new file data를 sync해야 한다.</li><li><strong style="color:#fecaca;">close가 자동 flush:</strong> successful close도 disk 저장을 보장하지 않는다.</li><li><strong style="color:#fecaca;">fflush가 storage flush:</strong> stdio user buffer를 kernel로 보낼 뿐이다.</li><li><strong style="color:#fecaca;">O_DIRECT가 durability 제공:</strong> page cache 우회와 synchronized persistence는 다른 flag/contract다.</li><li><strong style="color:#fecaca;">sync_file_range가 fsync 대체:</strong> metadata나 volatile device cache flush를 보장하지 않는다.</li><li><strong style="color:#fecaca;">temp를 /tmp에 만들면 안전:</strong> target과 filesystem이 달라 atomic rename이 EXDEV로 실패할 수 있다.</li><li><strong style="color:#fecaca;">journal filesystem이면 protocol 불필요:</strong> application invariant와 documented sync boundary를 대신하지 않는다.</li><li><strong style="color:#fecaca;">close error는 같은 fd로 retry:</strong> fd가 이미 release·reuse됐을 수 있다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 30분 실습: fault point별 safe replace 관찰</h2>
+<p style="margin:0 0 10px;">실제 같은-directory temp, file fsync, replace, directory fsync를 실행하고 child를 고의 종료한다. 이는 power-cut durability 증명이 아니라 visible state와 protocol 경계를 확인하는 실습이다.</p>
+<pre style="margin:0;white-space:pre;overflow-x:auto;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;">python3 - &lt;&lt;'PY'
+import os, pathlib, tempfile
+
+def sync_dir(path):
+    fd = os.open(path, os.O_RDONLY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+
+def write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        if n &lt;= 0: raise OSError("no progress")
+        view = view[n:]
+
+def child_update(directory, phase):
+    target = directory / "config"
+    fd, temp = tempfile.mkstemp(prefix=".config.tmp-", dir=directory)
+    try:
+        write_all(fd, b"version=NEW\n")
+        os.fsync(fd)                       # NEW content first
+        if phase == "after_file_fsync": os._exit(70)
+        os.close(fd); fd = -1
+        os.replace(temp, target)           # atomic visibility switch
+        if phase == "after_rename": os._exit(71)
+        sync_dir(directory)                # durable namespace boundary
+        os._exit(0)
+    finally:
+        if fd &gt;= 0: os.close(fd)
+
+for phase in ("after_file_fsync", "after_rename", "complete"):
+    with tempfile.TemporaryDirectory(prefix="os-day39-") as raw:
+        d = pathlib.Path(raw); target = d / "config"
+        target.write_bytes(b"version=OLD\n")
+        with target.open("rb") as f: os.fsync(f.fileno())
+        sync_dir(d)
+        pid = os.fork()
+        if pid == 0: child_update(d, phase)
+        _, status = os.waitpid(pid, 0)
+        temps = sorted(p.name for p in d.glob(".config.tmp-*"))
+        value = target.read_text().strip()
+        print(phase, "exit", os.waitstatus_to_exitcode(status), value, temps)
+        if phase == "after_file_fsync": assert value == "version=OLD" and len(temps) == 1
+        else: assert value == "version=NEW" and not temps
+PY</pre>
+<ol style="margin:12px 0 0;padding-left:22px;"><li><strong style="color:#f8fafc;">0~10분:</strong> file fsync 뒤 rename 전 종료에서 OLD와 orphan temp를 확인한다.</li><li><strong style="color:#f8fafc;">10~20분:</strong> rename 뒤 directory fsync 전 종료에서 runtime NEW는 보이지만 reboot durability는 아직 주장할 수 없는 이유를 설명한다.</li><li><strong style="color:#f8fafc;">20~30분:</strong> checksum mismatch·ENOSPC·concurrent writer를 추가하고 recovery decision table을 작성한다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. Linux production 관찰</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;"># syscall 순서·latency·error 확인
+strace -ff -ttT -e trace=openat,write,fdatasync,fsync,rename,renameat,renameat2,close \
+  ./config-updater
+
+# target과 parent directory가 같은 mount/filesystem인지 확인
+findmnt -T /srv/app/config -o TARGET,SOURCE,FSTYPE,OPTIONS
+stat -c 'dev=%d inode=%i mode=%a name=%n' /srv/app /srv/app/config
+
+# dirty/writeback와 block latency 연결
+grep -E '^(Dirty|Writeback):' /proc/meminfo
+cat /proc/pressure/io
+iostat -xz 1
+
+# kernel/filesystem·mount evidence 보존
+uname -r
+findmnt -no FSTYPE,OPTIONS -T /srv/app/config
+dmesg --ctime | tail -n 100</pre>
+<p style="margin:10px 0 0;">trace에서 기대 순서는 temp write 완료→temp fsync 성공→rename 성공→directory fsync 성공이다. 단순히 syscall이 호출됐다는 사실보다 return value와 duration을 기록하고, storage/virtualization이 flush를 정직하게 구현하는지도 infrastructure contract로 검증한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 실패 시나리오: config는 보였지만 reboot 후 되돌아왔다</h2>
+<p style="margin:0;">배포 agent가 temp를 쓰고 rename한 직후 “성공”을 응답했다. 새 process는 NEW config를 읽었지만 parent directory fsync 전에 host가 power loss를 겪었다. reboot 뒤 target name은 OLD로 돌아왔고 control plane은 이미 성공으로 기록해 drift가 생겼다. 해결은 temp data fsync→rename→directory fsync를 하나의 transaction boundary로 만들고, target에 monotonic generation+checksum을 넣어 restart 시 control-plane expected version과 reconcile하는 것이었다. fsync p99가 SLO를 위협하자 durable group commit과 rollout admission을 적용하되 RPO를 명시했다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 대기업 면접 질문 3개</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;">crash-safe하게 file을 교체하는 순서를 설명해 보세요.</strong><br>답변 포인트: same-directory exclusive temp, write_all·metadata, fsync temp, atomic rename, fsync parent directory, success response, 각 crash point의 OLD/NEW/orphan state.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">atomic rename과 durability는 왜 다른가요?</strong><br>답변 포인트: runtime lookup atomicity, file data vs directory entry, file fsync와 directory fsync scope, open fd old inode, same-filesystem 조건.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">fsync가 느릴 때 어떻게 최적화하나요?</strong><br>답변 포인트: correctness contract 유지, fdatasync/O_DSYNC suitability, group commit의 RPO·latency trade-off, preallocation, flush/device metrics, workload benchmark와 crash test.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 퀴즈·누적 리뷰</h2>
+<ol style="margin:0;padding-left:22px;"><li>visibility, atomicity, durability의 차이를 file update 예로 설명해 보자.</li><li>temp file을 먼저 fsync하지 않고 rename하면 어떤 crash state가 가능한가?</li><li>rename 뒤 target file만 다시 fsync하면 parent directory relation까지 보장되는가?</li><li><code>fdatasync</code>가 반드시 sync해야 하는 metadata의 기준은 무엇인가?</li><li>O_DIRECT와 O_SYNC가 해결하는 문제가 어떻게 다른가?</li><li>Day 38 연결: delayed writeback EIO가 왜 fsync에서 나타날 수 있는가?</li><li>NFS rename error 뒤 blind retry 대신 reconcile해야 하는 이유는?</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">15. 다음 날 연결</h2>
+<p style="margin:0;">Day 40은 <strong style="color:#f8fafc;">journaling, crash consistency, recovery</strong>다. 오늘 application이 만든 ordering contract를 filesystem journal의 write-ahead rule, metadata/data mode, transaction commit·replay가 어떻게 뒷받침하는지 추적한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">16. 공식·1차 출처</h2>
+<ul style="margin:0;padding-left:22px;word-break:break-word;"><li><a href="https://man7.org/linux/man-pages/man2/fsync.2.html" style="color:#7dd3fc;">Linux man-pages — fsync(2)</a>: file data·metadata 동기화, directory entry의 별도 fsync, fdatasync와 delayed error.</li><li><a href="https://man7.org/linux/man-pages/man2/rename.2.html" style="color:#7dd3fc;">Linux man-pages — rename(2)</a>: atomic replacement, same-filesystem EXDEV, renameat2 flag, NFS uncertain result.</li><li><a href="https://man7.org/linux/man-pages/man2/open.2.html" style="color:#7dd3fc;">Linux man-pages — open(2)</a>: O_SYNC/O_DSYNC, O_DIRECT와 durability 차이, O_TMPFILE.</li><li><a href="https://man7.org/linux/man-pages/man2/close.2.html" style="color:#7dd3fc;">Linux man-pages — close(2)</a>: close의 비-durability, delayed error와 retry-close 위험.</li><li><a href="https://man7.org/linux/man-pages/man2/sync_file_range.2.html" style="color:#7dd3fc;">Linux man-pages — sync_file_range(2)</a>: metadata·device cache flush를 보장하지 않아 data-integrity 대체가 아님.</li><li><a href="https://docs.kernel.org/block/writeback_cache_control.html" style="color:#7dd3fc;">Linux Kernel — Explicit volatile write back cache control</a>: REQ_PREFLUSH·REQ_FUA와 volatile device cache.</li><li><a href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/fsync.html" style="color:#7dd3fc;">POSIX.1-2024 — fsync</a>: synchronized I/O completion contract.</li><li><a href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/rename.html" style="color:#7dd3fc;">POSIX.1-2024 — rename</a>: atomic directory operation semantics.</li><li><a href="https://pubs.opengroup.org/onlinepubs/9799919799/xrat/V4_xbd_chap01.html" style="color:#7dd3fc;">POSIX Rationale — Directory Operations</a>: directory atomicity와 durability의 구분, temp sync→rename→directory sync pattern.</li></ul>
+<p style="margin:28px 0 0;padding-top:18px;border-top:1px solid #27435d;color:#8fb3c9;font-size:13px;">Day 39 완료 기준: file data·metadata·directory entry·device cache의 persistence boundary를 그리고, 모든 crash point에서 OLD/NEW invariant를 유지하는 replace protocol과 error recovery를 설계할 수 있다.</p>
+</td></tr></table></td></tr></table>
+</body></html>

@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-10-14T09:01:29+09:00",
+  "updatedAt": "2026-10-15T09:14:09+09:00",
   "lessons": [
     {
       "day": 1,
@@ -347,6 +347,15 @@
       "path": "day-38.html",
       "kind": "lesson",
       "publishedAt": "2026-10-14T09:01:29+09:00"
+    },
+    {
+      "day": 39,
+      "week": 6,
+      "title": "durability, fsync, ordering, atomic rename",
+      "summary": "write·fsync·rename·directory fsync의 persistence ordering을 따라 atomic visibility와 durability를 분리하고 crash-safe replace protocol을 설계합니다.",
+      "path": "day-39.html",
+      "kind": "lesson",
+      "publishedAt": "2026-10-15T09:14:09+09:00"
     }
   ]
 }
