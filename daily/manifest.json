@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-10-15T09:14:09+09:00",
+  "updatedAt": "2026-10-17T09:02:30+09:00",
   "lessons": [
     {
       "day": 1,
@@ -356,6 +356,15 @@
       "path": "day-39.html",
       "kind": "lesson",
       "publishedAt": "2026-10-15T09:14:09+09:00"
+    },
+    {
+      "day": 40,
+      "week": 6,
+      "title": "journaling, crash consistency, recovery",
+      "summary": "WAL·commit block·checkpoint·replay 흐름과 ext4 data mode를 따라 filesystem crash consistency와 production recovery를 연결합니다.",
+      "path": "day-40.html",
+      "kind": "lesson",
+      "publishedAt": "2026-10-17T09:02:30+09:00"
     }
   ]
 }
