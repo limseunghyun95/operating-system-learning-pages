@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Operating System 심화 커리큘럼 Day 41 - 실패 실습: partial write와 crash-safe file update</title></head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.72;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#07111f;"><tr><td align="center" style="padding:24px 12px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:680px;background:#0f1d2e;border:1px solid #23415d;border-radius:18px;overflow:hidden;">
+<tr><td style="padding:30px 28px 22px;background:#102a43;border-bottom:1px solid #28506f;">
+<div style="font-size:13px;letter-spacing:.12em;color:#5eead4;font-weight:800;">OPERATING SYSTEM · DAY 41 / 63 · FAILURE LAB</div>
+<h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">실패 실습: partial write와 crash-safe file update</h1>
+<p style="margin:0;color:#b9d6eb;">한 줄 요약: <strong style="color:#f8fafc;"><code>write()</code> 성공은 요청한 모든 byte나 disk durability를 뜻하지 않는다. 반환한 byte 수만큼 전진하는 loop와 temp write→file fsync→same-filesystem rename→directory fsync protocol을 사용해야 crash 뒤 OLD 또는 완전한 NEW만 허용할 수 있다.</strong></p>
+</td></tr><tr><td style="padding:26px 28px 34px;">
+
+<h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:14px;">
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;width:30%;">short / partial write</td><td style="border-bottom:1px solid #27435d;"><code>write(fd, buf, N)</code>가 오류가 아닌 양수 <code>n &lt; N</code>을 반환해 일부 byte만 받아들인 상태.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">torn write</td><td style="border-bottom:1px solid #27435d;">crash·device failure로 하나의 logical record/block 일부만 새 값이 된 상태. syscall partial return과 원인은 다르지만 결과 검증이 필요하다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">EINTR</td><td style="border-bottom:1px solid #27435d;">signal 때문에 syscall이 중단됐다는 errno. Linux write는 byte를 하나도 쓰기 전에 중단된 경우 EINTR을 반환한다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">ENOSPC / EDQUOT</td><td style="border-bottom:1px solid #27435d;">device 공간 부족 / 사용자·project quota 초과. 이미 일부 write가 성공한 다음 호출에서 나타날 수 있다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">delayed EIO</td><td style="border-bottom:1px solid #27435d;">page cache에 받아들인 write가 나중 writeback에서 실패해 이후 write나 fsync에서 보고되는 I/O error.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">O_TRUNC</td><td style="border-bottom:1px solid #27435d;">기존 regular file을 open 시 길이 0으로 줄이는 flag. 이후 write 실패 시 원본이 이미 사라졌을 수 있다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">temp file</td><td style="border-bottom:1px solid #27435d;">완성 전에는 target pathname으로 공개하지 않는 staging file. target과 같은 directory/filesystem에 둬야 atomic rename을 쓸 수 있다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">atomic rename</td><td style="border-bottom:1px solid #27435d;">같은 mounted filesystem에서 target name을 한 순간에 교체하는 namespace operation. visibility atomicity이지 자동 durability는 아니다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">fsync</td><td style="border-bottom:1px solid #27435d;">file의 dirty data와 관련 metadata를 storage로 보내고 completion 또는 error를 기다리는 system call.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">directory fsync</td><td style="border-bottom:1px solid #27435d;">rename으로 바뀐 name→inode 관계 자체의 durability를 요구하는 단계.</td></tr>
+<tr><td style="color:#7dd3fc;font-weight:700;">reconciliation</td><td>결과가 uncertain할 때 retry만 하지 않고 version·checksum·target 상태를 다시 읽어 실제 적용 여부를 판정하는 절차.</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 완성본 교체와 프린터 잉크 부족</h2>
+<p style="margin:0;">기존 계약서 위에 바로 인쇄하다 잉크가 떨어지면 앞부분만 새 내용이고 뒤는 옛 내용이거나 file 길이가 잘린다. 안전한 방법은 별도 종이에 끝까지 인쇄하고 검수·봉인한 뒤, 표지의 계약서 이름을 한 번에 새 종이로 바꾸고 서류함 색인까지 확정하는 것이다. <code>write_all</code>은 끝까지 인쇄, file fsync는 봉인, rename은 표지 교체, directory fsync는 색인 확정이다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: byte가 durable name이 되기까지</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">application buffer [0 .. N)
+  │ write(fd, remaining)
+  │   return n&gt;0 → cursor += n, 남은 byte 재시도
+  │   EINTR      → 같은 remaining 재시도
+  │   ENOSPC/EIO → publication 금지, temp 격리
+  ▼
+VFS → filesystem page cache → writeback → block layer → device cache → media
+          │                      │
+          └ write 성공 가능      └ delayed EIO는 fsync에서 관측 가능
+
+safe publication path
+same-dir temp ─write_all→ complete temp ─fsync→ durable temp
+      ─rename→ NEW atomically visible ─fsync(parent dir)→ durable NEW name</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. 상태 전이·crash matrix</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">[OLD durable]
+  │ create exclusive temp in target directory
+  ▼
+[TEMP incomplete] --crash/failure--> OLD + removable owned temp
+  │ write_all + checksum/version + metadata
+  ▼
+[TEMP complete, dirty] --crash--> OLD; temp durability 불명
+  │ fsync(temp) success
+  ▼
+[TEMP complete, durable] --crash--> OLD + durable orphan temp 가능
+  │ rename(temp, target)
+  ▼
+[NEW visible] --crash before dir fsync--> reboot name 결과를 일반화 못 함
+  │ fsync(parent directory) success
+  ▼
+[NEW durable] → 이때만 external success 응답
+
+금지 상태: target pathname이 prefix NEW + suffix OLD, truncated NEW,
+checksum 불일치 payload를 정상으로 공개하는 것.</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. CS·kernel deep dive</h2>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.1 write의 return value가 protocol state다</h3><p style="margin:0;"><code>write</code>는 최대 count byte를 쓰며 성공해도 더 작은 양수를 반환할 수 있다. cursor는 요청량이 아니라 실제 반환값만큼만 전진해야 한다. 처음부터 다시 쓰면 중복, 요청량만큼 전진하면 hole/누락이 생긴다. 0 return은 regular-file progress invariant 위반으로 fatal 처리하는 편이 안전하다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.2 EINTR와 partial success를 함께 처리한다</h3><p style="margin:0;">Linux에서는 아무 byte도 쓰기 전에 signal로 중단되면 -1/EINTR이다. byte를 쓴 뒤 중단되면 성공한 byte 수를 반환한다. 따라서 EINTR은 remaining buffer 그대로 retry하고, 양수는 errno와 무관하게 그 수만큼 progress로 반영한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.3 successful write는 allocation·media completion이 아니다</h3><p style="margin:0;">buffered write는 page cache copy 뒤 성공할 수 있다. NFS를 포함한 일부 filesystem에서는 space reservation 실패도 뒤늦게 나타날 수 있다. 완료한 payload 전체를 쓴 뒤 fsync 결과까지 확인해야 durable success를 말할 수 있다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.4 Linux writeback error cursor</h3><p style="margin:0;">kernel은 address_space의 writeback error stream을 추적하고, file description별 cursor를 통해 당시 열려 있던 descriptor의 fsync에 error를 보고한다. “write에서 EIO가 없었다”는 증거만으로 storage 성공을 결론 내리면 안 된다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.5 in-place overwrite는 multi-byte atomicity가 없다</h3><p style="margin:0;">regular-file write가 여러 page/block을 건너가면 crash 시 어떤 prefix가 persistence됐는지 application이 통제하기 어렵다. <code>O_TRUNC</code> 후 overwrite는 시작 순간 OLD를 제거하므로 error rollback이 불가능하다. small aligned write라도 hardware/filesystem별 atomicity를 문서 없이 가정하지 않는다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.6 O_DIRECT error는 범위 전체 실패를 뜻하지 않는다</h3><p style="margin:0;">Linux write(2)는 direct I/O error 뒤에도 일부 data가 써졌을 수 있어 해당 range를 inconsistent로 취급하라고 명시한다. direct I/O는 page cache 우회이지 transaction 또는 durability primitive가 아니다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.7 preallocation은 실패 확률을 줄이지 원자성을 만들지 않는다</h3><p style="margin:0;"><code>fallocate</code>로 space를 예약하면 late ENOSPC 위험과 fragmentation을 줄일 수 있지만 quota change, device EIO, metadata failure는 남는다. allocation 성공 뒤에도 write loop, fsync, checksum, rename protocol이 필요하다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.8 rename의 atomicity는 같은 mounted filesystem 안이다</h3><p style="margin:0;">target이 있으면 rename은 atomically replace하지만 cross-mount는 <code>EXDEV</code>로 실패한다. <code>/tmp</code>에서 copy 후 target을 덮는 fallback을 atomic이라고 부르면 안 된다. temp를 target directory에 만들고 directory fd 기반 API로 path race도 줄인다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.9 checksum과 generation은 publication 검증 계약이다</h3><p style="margin:0;">payload에 schema version, monotonic generation, length, checksum을 넣으면 startup이 partial/torn/stale file을 구분할 수 있다. checksum은 corruption을 고치는 backup은 아니므로 OLD copy, replica 또는 source of truth도 필요하다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.10 concurrent writer는 last rename wins 문제다</h3><p style="margin:0;">각 writer가 crash-safe해도 둘이 동시에 OLD를 읽고 서로 다른 NEW를 rename하면 lost update가 생긴다. lock, generation compare-and-swap, single writer, <code>RENAME_NOREPLACE</code> 등 별도의 concurrency policy가 필요하다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. 안전하지 않은 방법과 안전한 protocol</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:12px;">
+<tr style="background:#15314a;color:#bae6fd;"><td>방법</td><td>실패 시 상태</td><td>판정</td></tr>
+<tr><td style="border-top:1px solid #27435d;">O_TRUNC + 1회 write</td><td style="border-top:1px solid #27435d;">0-byte/partial target, OLD 소실</td><td style="border-top:1px solid #27435d;color:#fecaca;">금지</td></tr>
+<tr><td style="border-top:1px solid #27435d;">in-place pwrite</td><td style="border-top:1px solid #27435d;">old/new block 혼합 가능</td><td style="border-top:1px solid #27435d;color:#fecaca;">transaction 없는 whole-file 교체에 부적합</td></tr>
+<tr><td style="border-top:1px solid #27435d;">temp + rename만</td><td style="border-top:1px solid #27435d;">runtime 완전본 공개, reboot durability 미완성</td><td style="border-top:1px solid #27435d;color:#fde68a;">visibility만</td></tr>
+<tr><td style="border-top:1px solid #27435d;">write_all→fsync(temp)→rename→fsync(dir)</td><td style="border-top:1px solid #27435d;">documented stack에서 OLD 또는 complete NEW</td><td style="border-top:1px solid #27435d;color:#bbf7d0;">권장</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. 실무 best practice</h2>
+<ul style="margin:0;padding-left:22px;"><li>write wrapper는 short count, EINTR, zero progress, count overflow를 명시적으로 처리하고 실제 byte count를 metric으로 남긴다.</li><li>target과 같은 directory에 mode 0600·exclusive unique temp를 만들고 완성 뒤 최종 permission·owner·xattr를 설정한다.</li><li>payload는 header(version, generation, length) + body + checksum/footer 구조로 만들어 startup 검증이 가능하게 한다.</li><li>모든 byte와 필수 metadata 설정 후 file fsync, 그 뒤 rename, 그 뒤 parent directory fsync 순서를 고정한다.</li><li>fsync 성공 뒤에만 durable acknowledgment를 외부에 보낸다. group commit을 쓰면 최대 loss window를 RPO로 명시한다.</li><li>ENOSPC 대비 reserve, quota alert, temp cleanup policy를 두되 preallocation 성공을 durability로 오해하지 않는다.</li><li>temp filename에 service instance와 random nonce를 넣고, recovery는 checksum·ownership marker를 확인한 자기 temp만 정리한다.</li><li>same-directory protocol, NFS/overlay/container volume 의미, directory fsync 지원을 실제 배포 filesystem에서 crash test한다.</li><li>concurrent writer는 generation conflict로 검출하고 blind overwrite/retry하지 않는다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. error handling runbook</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;">short positive:</strong> written prefix를 확정하고 buffer pointer·offset·remaining을 n만큼만 이동한다.</li><li><strong style="color:#f8fafc;">EINTR:</strong> progress가 없는 호출만 같은 remaining으로 retry한다. retry budget보다 cancellation/deadline 상태도 확인한다.</li><li><strong style="color:#f8fafc;">EAGAIN:</strong> nonblocking fd면 readiness를 기다리고 busy loop를 피한다. regular file API와 stream API의 정책을 분리한다.</li><li><strong style="color:#f8fafc;">ENOSPC/EDQUOT/EFBIG:</strong> target publication을 중단하고 temp를 진단 가능하게 격리한다. 공간을 비운 뒤 같은 fd를 맹목적으로 이어 쓰지 말고 payload checksum부터 재평가한다.</li><li><strong style="color:#f8fafc;">EIO/fsync failure:</strong> 성공을 응답하지 않고 filesystem/device health를 조사한다. 다른 file의 writeback failure일 가능성도 correlation한다.</li><li><strong style="color:#f8fafc;">EXDEV:</strong> atomic rename 요구를 낮추지 않는다. target filesystem 안에 staging 영역을 다시 설계한다.</li><li><strong style="color:#f8fafc;">rename uncertain:</strong> NFS timeout/error라면 미실행을 가정하지 말고 target generation/checksum을 reread한다.</li><li><strong style="color:#f8fafc;">directory fsync failure:</strong> NEW가 runtime에 보일 수 있지만 durable success는 아니다. 상태를 uncertain으로 기록하고 reboot-safe reconciliation을 예약한다.</li><li><strong style="color:#f8fafc;">startup:</strong> target checksum/version을 검증하고 owned orphan temp만 quarantine/cleanup하며 source of truth와 reconcile한다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. 놓치기 쉬운 함정</h2>
+<ul style="margin:0;padding-left:22px;"><li><strong style="color:#fecaca;">ret &gt;= 0이면 전체 성공:</strong> 반드시 <code>ret == requested</code> 또는 loop 완료를 확인한다.</li><li><strong style="color:#fecaca;">EINTR이면 아무것도 안 써짐:</strong> portable code는 반환 byte 수를 우선 해석한다.</li><li><strong style="color:#fecaca;">close가 fsync 대체:</strong> close 성공도 disk durability를 보장하지 않는다.</li><li><strong style="color:#fecaca;">fflush가 media flush:</strong> stdio buffer를 kernel로 보낼 뿐이다.</li><li><strong style="color:#fecaca;">O_DIRECT가 atomic/durable:</strong> cache bypass와 crash consistency는 다른 문제다.</li><li><strong style="color:#fecaca;">O_TRUNC 뒤 실패하면 OLD로 rollback:</strong> truncation 자체가 이미 namespace의 inode 내용을 파괴했다.</li><li><strong style="color:#fecaca;">rename 뒤 file fsync만 추가:</strong> directory entry durability는 parent directory fsync가 담당한다.</li><li><strong style="color:#fecaca;">orphan temp를 나이만 보고 삭제:</strong> 다른 live writer의 staging file일 수 있다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 30분 실패 실습</h2>
+<p style="margin:0 0 10px;">고의 short writer와 fault point를 사용해 unsafe in-place update는 target을 훼손하고 safe replace는 OLD를 보존함을 검증한다. process crash를 흉내 낸 논리 실습이며 실제 power-cut 보장 시험은 별도 장비/VM에서 수행한다.</p>
+<pre style="margin:0;white-space:pre;overflow-x:auto;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;">python3 - &lt;&lt;'PY'
+import hashlib, os, pathlib, tempfile
+
+OLD=b'gen=1\nbody=OLD\n'
+NEW=b'gen=2\nbody=NEW-COMPLETE\n'
+
+def write_all(fd, data, max_chunk=5, fail_after=None):
+    done=0
+    while done &lt; len(data):
+        if fail_after is not None and done &gt;= fail_after:
+            raise OSError('injected ENOSPC')
+        chunk=data[done:done+max_chunk]
+        n=os.write(fd, chunk)       # 실제 반환값만큼 전진
+        if n == 0: raise OSError('zero progress')
+        done += n
+    return done
+
+def sync_dir(path):
+    fd=os.open(path, os.O_RDONLY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+
+with tempfile.TemporaryDirectory(prefix='os-day41-') as raw:
+    d=pathlib.Path(raw); target=d/'config'
+    target.write_bytes(OLD)
+
+    # unsafe: truncate 뒤 일부만 쓰고 실패 → OLD 소실
+    fd=os.open(target, os.O_WRONLY|os.O_TRUNC)
+    try:
+        try: write_all(fd, NEW, fail_after=10)
+        except OSError: pass
+    finally: os.close(fd)
+    assert target.read_bytes() == NEW[:10]
+    print('unsafe=',target.read_bytes())
+
+    # safe: temp 실패는 target OLD를 건드리지 않음
+    target.write_bytes(OLD); temp=d/'.config.tmp-owned'
+    fd=os.open(temp, os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600)
+    try:
+        try: write_all(fd, NEW, fail_after=10)
+        except OSError: pass
+    finally: os.close(fd)
+    assert target.read_bytes() == OLD
+    temp.unlink()
+
+    # complete protocol
+    fd=os.open(temp, os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600)
+    try:
+        assert write_all(fd, NEW) == len(NEW)
+        os.fsync(fd)
+    finally: os.close(fd)
+    os.replace(temp, target)
+    sync_dir(d)
+    assert target.read_bytes() == NEW
+    print('safe_sha256=',hashlib.sha256(target.read_bytes()).hexdigest())
+PY</pre>
+<ol style="margin:12px 0 0;padding-left:22px;"><li><strong style="color:#f8fafc;">0~10분:</strong> max_chunk를 바꾸며 write_all이 정확히 N byte를 전달하는지 확인한다.</li><li><strong style="color:#f8fafc;">10~20분:</strong> fail_after=10에서 unsafe target은 partial NEW, safe target은 OLD임을 비교한다.</li><li><strong style="color:#f8fafc;">20~30분:</strong> generation·length·checksum header를 추가하고 startup quarantine decision table을 작성한다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. Linux 관찰</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;"># 실제 return value·순서·latency 확인
+strace -ff -ttT -e trace=openat,write,fsync,fdatasync,rename,renameat,close \
+  ./config-updater
+
+# target과 staging이 같은 mount인지 확인
+findmnt -T /srv/app/config -o TARGET,SOURCE,FSTYPE,OPTIONS
+stat -c 'dev=%d inode=%i size=%s name=%n' /srv/app /srv/app/config
+
+# 공간·inode·quota·writeback evidence
+df -h /srv/app; df -i /srv/app
+grep -E '^(Dirty|Writeback):' /proc/meminfo
+cat /proc/pressure/io
+dmesg --ctime | tail -n 100</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 실패 시나리오</h2>
+<p style="margin:0;">배포 agent가 config를 <code>O_TRUNC</code>로 열고 한 번의 write를 성공으로 간주했다. quota가 임계치에 도달해 64KiB 중 12KiB만 써졌지만 return value를 확인하지 않았고, close 뒤 성공을 응답했다. 새 process는 partial JSON을 읽지 못해 재시작 loop에 빠졌다. 해결은 same-directory temp, write_all, schema/generation/checksum 검증, fsync(temp), atomic rename, fsync(dir), durable ack 순서였고, ENOSPC injection과 startup fallback을 release gate에 추가했다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 대기업 면접 질문 3개</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;"><code>write()</code>가 성공했는데 왜 전체 data가 저장되지 않을 수 있나요?</strong><br>답변 포인트: short positive return, EINTR 전후 progress, page cache acceptance, delayed ENOSPC/EIO, fsync boundary, direct I/O partial inconsistency.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">crash-safe whole-file update protocol을 crash point별로 설명해 보세요.</strong><br>답변 포인트: same-dir exclusive temp, write_all+checksum, fsync file, atomic rename, fsync directory, OLD/NEW/orphan states, ack timing.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">두 writer가 동시에 안전하게 update하려면 충분한가요?</strong><br>답변 포인트: crash consistency와 concurrency control 분리, last-rename-wins lost update, generation/CAS, lock/single writer, conflict reconciliation.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 퀴즈·누적 리뷰</h2>
+<ol style="margin:0;padding-left:22px;"><li>write가 1000을 요청하고 400을 반환했다. 다음 pointer와 remaining은?</li><li>O_TRUNC 직후 crash하면 target의 OLD는 어떻게 되는가?</li><li>file fsync 성공 뒤 rename 전 crash에서 허용되는 상태는?</li><li>rename 성공 뒤 directory fsync 실패를 성공으로 응답하면 안 되는 이유는?</li><li>preallocation과 checksum이 각각 줄이는 failure class는?</li><li>Day 39 연결: atomic visibility와 durability를 protocol 단계에 매핑하라.</li><li>Day 40 연결: filesystem journal과 application checksum/reconciliation의 책임 차이는?</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">15. 다음 날 연결</h2>
+<p style="margin:0;">Day 42는 <strong style="color:#f8fafc;">리뷰: “write 성공”과 “durable”의 차이</strong>다. Week 6 전체를 file descriptor→page cache→journal→device까지 하나의 장애 진단 runbook과 면접 답변으로 압축한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">16. 공식·1차 출처</h2>
+<ul style="margin:0;padding-left:22px;word-break:break-word;"><li><a href="https://man7.org/linux/man-pages/man2/write.2.html" style="color:#7dd3fc;">Linux man-pages — write(2)</a>: partial return, EINTR, delayed EIO, non-durability와 direct I/O partial inconsistency.</li><li><a href="https://man7.org/linux/man-pages/man2/fsync.2.html" style="color:#7dd3fc;">Linux man-pages — fsync(2)</a>: data·metadata completion, directory entry의 별도 fsync와 writeback error.</li><li><a href="https://man7.org/linux/man-pages/man2/rename.2.html" style="color:#7dd3fc;">Linux man-pages — rename(2)</a>: atomic replacement, EXDEV, renameat2와 NFS uncertain result.</li><li><a href="https://man7.org/linux/man-pages/man2/open.2.html" style="color:#7dd3fc;">Linux man-pages — open(2)</a>: O_TRUNC, O_SYNC/O_DSYNC, O_EXCL과 O_TMPFILE.</li><li><a href="https://man7.org/linux/man-pages/man2/ftruncate.2.html" style="color:#7dd3fc;">Linux man-pages — truncate(2)</a>: file length 축소·확장 semantics와 오류.</li><li><a href="https://man7.org/linux/man-pages/man2/fallocate.2.html" style="color:#7dd3fc;">Linux man-pages — fallocate(2)</a>: space reservation과 mode별 의미.</li><li><a href="https://docs.kernel.org/filesystems/vfs.html" style="color:#7dd3fc;">Linux Kernel — VFS</a>: address_space writeback error tracking과 fsync error cursor.</li><li><a href="https://docs.kernel.org/block/writeback_cache_control.html" style="color:#7dd3fc;">Linux Kernel — volatile write-back cache control</a>: flush·FUA와 device persistence ordering.</li><li><a href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/write.html" style="color:#7dd3fc;">POSIX.1-2024 — write</a>: complete·partial·deferred write semantics.</li><li><a href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/fsync.html" style="color:#7dd3fc;">POSIX.1-2024 — fsync</a>: synchronized I/O completion contract.</li></ul>
+<p style="margin:28px 0 0;padding-top:18px;border-top:1px solid #27435d;color:#8fb3c9;font-size:13px;">Day 41 완료 기준: short write·EINTR·delayed EIO를 정확히 처리하고, 각 crash point에서 OLD 또는 complete NEW만 허용하는 update protocol을 구현·검증하며, uncertain state의 reconciliation 절차를 설명할 수 있다.</p>
+</td></tr></table></td></tr></table>
+</body></html>
