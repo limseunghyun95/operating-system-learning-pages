@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-10-18T09:17:05+09:00",
+  "updatedAt": "2026-10-19T09:23:10+09:00",
   "lessons": [
     {
       "day": 1,
@@ -374,6 +374,15 @@
       "path": "day-41.html",
       "kind": "lab",
       "publishedAt": "2026-10-18T09:17:05+09:00"
+    },
+    {
+      "day": 42,
+      "week": 6,
+      "title": "리뷰: “write 성공”과 “durable”의 차이",
+      "summary": "fd→page cache→journal→block layer→device의 보장 사다리를 따라 accepted·visible·atomic·durable을 구분하고 filesystem 장애 진단 runbook을 완성합니다.",
+      "path": "day-42.html",
+      "kind": "review",
+      "publishedAt": "2026-10-19T09:23:10+09:00"
     }
   ]
 }

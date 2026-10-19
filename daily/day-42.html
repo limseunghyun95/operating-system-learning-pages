@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Operating System 심화 커리큘럼 Day 42 - 리뷰: “write 성공”과 “durable”의 차이</title></head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.72;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#07111f;"><tr><td align="center" style="padding:24px 12px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:680px;background:#0f1d2e;border:1px solid #23415d;border-radius:18px;overflow:hidden;">
+<tr><td style="padding:30px 28px 22px;background:#102a43;border-bottom:1px solid #28506f;">
+<div style="font-size:13px;letter-spacing:.12em;color:#5eead4;font-weight:800;">OPERATING SYSTEM · DAY 42 / 63 · WEEK 6 REVIEW</div>
+<h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">리뷰: “write 성공”과 “durable”의 차이</h1>
+<p style="margin:0;color:#b9d6eb;">한 줄 요약: <strong style="color:#f8fafc;"><code>write()</code> 성공은 kernel이 일부 또는 전부를 받아들였다는 뜻이고, runtime atomic visibility는 rename이, power-loss durability는 file fsync→rename→directory fsync와 storage flush 계약이 만든다. filesystem consistency와 application correctness도 별도의 복구 계층이다.</strong></p>
+</td></tr><tr><td style="padding:26px 28px 34px;">
+
+<h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:14px;">
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;width:30%;">accepted</td><td style="border-bottom:1px solid #27435d;">system call이 byte를 kernel buffer/page cache에 받아들인 상태. media 저장 완료와 다르다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">visible</td><td style="border-bottom:1px solid #27435d;">다른 reader가 새 byte 또는 새 pathname mapping을 관찰할 수 있는 상태.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">atomic</td><td style="border-bottom:1px solid #27435d;">관찰 가능한 결과가 operation 전 또는 후이고 중간 상태가 보이지 않는 성질. scope를 반드시 붙인다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">ordered</td><td style="border-bottom:1px solid #27435d;">crash 뒤에도 A가 먼저 persistent된 뒤 B가 persistent되도록 선후관계를 만든 상태.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">durable</td><td style="border-bottom:1px solid #27435d;">성공을 응답한 data가 power loss·kernel crash 뒤에도 복구된다는 계약.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">crash consistent</td><td style="border-bottom:1px solid #27435d;">어느 시점에서 멈춰도 reboot 후 정의된 invariant를 만족하는 OLD/NEW 상태로 복구 가능한 성질.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">page cache</td><td style="border-bottom:1px solid #27435d;">file data를 RAM page로 cache하며 buffered read/write와 writeback의 중심이 되는 kernel 계층.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">writeback</td><td style="border-bottom:1px solid #27435d;">dirty page를 filesystem/block layer로 비동기 전송하는 과정. error가 fsync에서 늦게 보일 수 있다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">journal</td><td style="border-bottom:1px solid #27435d;">home metadata보다 먼저 transaction을 log해 commit된 update만 replay하는 filesystem 복구 장치.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">flush / FUA</td><td style="border-bottom:1px solid #27435d;">device의 volatile cache까지 고려해 persistence ordering과 completion을 전달하는 block-layer mechanism.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">RPO</td><td style="border-bottom:1px solid #27435d;">Recovery Point Objective. 장애 때 허용하는 최대 data loss 구간. group commit 주기와 직접 연결된다.</td></tr>
+<tr><td style="color:#7dd3fc;font-weight:700;">reconciliation</td><td>version·checksum·source of truth를 비교해 실제 상태를 판정하고 missing/duplicate work를 조정하는 application 복구.</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 여러 개의 “완료 도장”</h2>
+<p style="margin:0;">택배 접수, 허브 도착, 수취인 전달은 모두 “완료”처럼 보이지만 보장 범위가 다르다. write return은 접수증, 다른 reader가 읽는 것은 허브 조회, fsync 성공은 storage 전달 확인, directory fsync는 주소록 변경 확인이다. 설계 문서와 API 응답에서 “성공” 대신 <strong style="color:#f8fafc;">무엇이 어디까지 완료됐는지</strong>를 명시해야 한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: application에서 non-volatile media까지</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">application buffer
+  │ write(fd, buf, N) → ret=n: n byte accepted, short write 가능
+  ▼
+libc/runtime → syscall → VFS (fd→open file description→inode/dentry)
+  ▼
+filesystem page cache: dirty data + metadata
+  │ background writeback / fsync boundary
+  ▼
+filesystem: allocation + ext4/JBD2 metadata transaction
+  │ descriptor → metadata image → commit → checkpoint/replay
+  ▼
+block layer: queue / merge / reorder / flush / FUA
+  ▼
+controller·device volatile cache
+  ▼
+non-volatile media
+
+별도 축: directory namespace(name→inode), mount namespace,
+application version/checksum, replica/backup, external acknowledgment</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. 보장 사다리와 상태 전이</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">[0] caller memory only
+  │ write_all 완료
+[1] kernel accepted + current readers may see NEW
+  │ fsync(temp) success
+[2] temp data/필수 metadata durable
+  │ same-filesystem rename
+[3] target name atomically points to complete NEW at runtime
+  │ fsync(parent directory) success
+[4] NEW name→inode + content durable
+  │ application checksum/version + business commit/reconcile
+[5] application invariant durable
+  │ replica/backup quorum·retention 확인
+[6] node/storage loss에도 recoverable
+
+낮은 단계의 성공은 높은 단계를 자동 포함하지 않는다.
+API acknowledgment는 요구된 가장 높은 단계 뒤에만 반환한다.</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. Week 6 연결 지도</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:12px;">
+<tr style="background:#15314a;color:#bae6fd;"><td>Day</td><td>핵심 경계</td><td>면접 한 문장</td></tr>
+<tr><td style="border-top:1px solid #27435d;">36</td><td style="border-top:1px solid #27435d;">pathname·dentry·inode·OFD·fd</td><td style="border-top:1px solid #27435d;">name과 open handle의 수명은 다르다.</td></tr>
+<tr><td style="border-top:1px solid #27435d;">37</td><td style="border-top:1px solid #27435d;">VFS·mount tree·namespace</td><td style="border-top:1px solid #27435d;">같은 pathname도 process의 mount view에 따라 다른 object다.</td></tr>
+<tr><td style="border-top:1px solid #27435d;">38</td><td style="border-top:1px solid #27435d;">buffered I/O·page cache·O_DIRECT</td><td style="border-top:1px solid #27435d;">cache bypass와 durability는 다른 계약이다.</td></tr>
+<tr><td style="border-top:1px solid #27435d;">39</td><td style="border-top:1px solid #27435d;">fsync·ordering·atomic rename</td><td style="border-top:1px solid #27435d;">visibility atomicity와 power-loss durability를 분리한다.</td></tr>
+<tr><td style="border-top:1px solid #27435d;">40</td><td style="border-top:1px solid #27435d;">journal commit·checkpoint·replay</td><td style="border-top:1px solid #27435d;">filesystem consistency가 application transaction을 대신하지 않는다.</td></tr>
+<tr><td style="border-top:1px solid #27435d;">41</td><td style="border-top:1px solid #27435d;">partial write·failure injection</td><td style="border-top:1px solid #27435d;">return count와 각 crash point를 protocol state로 다룬다.</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. CS·kernel deep dive</h2>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.1 fd는 file 자체가 아니라 process-local handle이다</h3><p style="margin:0;">fd table entry는 open file description을 가리키고, OFD는 offset/status flag와 inode reference를 가진다. rename/unlink 뒤에도 열린 fd는 inode를 계속 참조할 수 있다. pathname 확인만으로 현재 writer가 어느 object에 쓰는지 단정하면 안 된다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.2 write return은 byte-level progress다</h3><p style="margin:0;">write는 최대 count만큼 쓰며 양수 <code>n&lt;count</code>도 성공이다. caller는 n만큼만 pointer·offset을 전진한다. buffered write가 완료돼도 dirty page가 RAM에 있을 수 있고, delayed ENOSPC/EIO가 후속 write·fsync에서 나타날 수 있다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.3 visibility, atomicity, ordering, durability는 독립 축이다</h3><p style="margin:0;">다른 process가 page cache의 NEW를 읽는 것은 visibility다. rename은 target lookup의 runtime atomicity를 제공한다. fsync와 block flush/FUA는 persistence ordering을 만든다. 이 중 하나를 확인했다고 나머지를 주장할 수 없다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.4 file fsync와 directory fsync의 scope</h3><p style="margin:0;">file fsync는 data와 inode metadata를 storage로 동기화하지만 containing directory entry까지 자동으로 보장하지 않는다. 새 file 생성·rename·unlink의 durable namespace가 필요하면 관련 directory fd도 fsync한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.5 journal은 multi-block metadata invariant를 보호한다</h3><p style="margin:0;">ext4/JBD2는 descriptor·metadata image·revoke·commit block을 journal에 쓰고 checksum-valid commit만 replay한다. checkpoint는 뒤에 home block을 갱신한다. metadata consistency를 빠르게 복구하지만 fsync 없는 user data나 business invariant를 보장하지 않는다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.6 block layer와 device는 write를 reorder할 수 있다</h3><p style="margin:0;">submission order만으로 persistence order가 되지 않는다. filesystem은 flush로 이전 write를 stable하게 만들고 FUA로 특정 write가 non-volatile해진 뒤 completion을 요구한다. device/controller가 flush contract를 지키지 않으면 상위 algorithm만으로 보장할 수 없다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.7 O_SYNC·O_DSYNC·fdatasync는 비용과 scope가 다르다</h3><p style="margin:0;"><code>O_SYNC</code>는 각 write마다 file-integrity completion, <code>O_DSYNC</code>는 data와 읽기에 필요한 metadata completion을 요구한다. <code>fdatasync</code>는 batching boundary를 caller가 선택한다. latency·throughput·RPO로 결정하고 실제 stack에서 측정한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.8 close·fflush·O_DIRECT는 fsync의 동의어가 아니다</h3><p style="margin:0;">fflush는 user-space stdio buffer를 kernel로 보내며, close 성공은 disk persistence를 보장하지 않는다. O_DIRECT는 page cache 우회를 목표로 하며 partial error 뒤 range가 inconsistent할 수 있다. 기능 이름이 아니라 documented completion semantics를 선택한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.9 local filesystem과 network filesystem의 failure semantics가 다르다</h3><p style="margin:0;">NFS는 server가 operation을 수행한 뒤 응답 전에 crash하면 client가 error를 받아도 rename이 이미 적용됐을 수 있다. timeout/error를 미실행으로 간주한 blind retry 대신 version·checksum reread와 reconciliation이 필요하다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">6.10 durability는 end-to-end contract다</h3><p style="margin:0;">application ack, kernel, filesystem, block layer, hypervisor, controller, media, replica가 각자 계약을 지켜야 한다. fsync가 성공해도 잘못 구성된 storage cache, snapshot 정책, replication acknowledgment가 end-to-end 목표를 깨뜨릴 수 있다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. 보장별 API 선택표</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:12px;">
+<tr style="background:#15314a;color:#bae6fd;"><td>필요한 보장</td><td>최소 protocol</td><td>남은 위험</td></tr>
+<tr><td style="border-top:1px solid #27435d;">현재 process가 byte 전달</td><td style="border-top:1px solid #27435d;">write_all + return count/error</td><td style="border-top:1px solid #27435d;">crash loss, delayed EIO</td></tr>
+<tr><td style="border-top:1px solid #27435d;">runtime complete-file 교체</td><td style="border-top:1px solid #27435d;">same-dir temp + write_all + rename</td><td style="border-top:1px solid #27435d;">reboot durability</td></tr>
+<tr><td style="border-top:1px solid #27435d;">power-loss durable 교체</td><td style="border-top:1px solid #27435d;">fsync(temp)→rename→fsync(dir)</td><td style="border-top:1px solid #27435d;">hardware lie, app invariant</td></tr>
+<tr><td style="border-top:1px solid #27435d;">multi-record transaction</td><td style="border-top:1px solid #27435d;">application WAL/DB transaction + idempotence</td><td style="border-top:1px solid #27435d;">node/site loss</td></tr>
+<tr><td style="border-top:1px solid #27435d;">node/storage loss 복구</td><td style="border-top:1px solid #27435d;">replica/backup + verified restore + RPO/RTO</td><td style="border-top:1px solid #27435d;">correlated failure, operator error</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. 실무 best practice</h2>
+<ul style="margin:0;padding-left:22px;"><li>API success를 accepted, visible, durable, replicated 중 하나로 명명하고 acknowledgment point를 sequence diagram에 표시한다.</li><li>whole-file update는 same-directory exclusive temp, write_all, checksum/version, file fsync, rename, directory fsync 순서를 library로 표준화한다.</li><li>record append는 length+checksum+generation을 넣고 torn tail을 detect/truncate/replay할 recovery rule을 갖춘다.</li><li>fsync p50/p95/p99, writeback EIO·ENOSPC·EDQUOT, dirty/writeback, block latency, journal pressure를 같은 dashboard와 trace에 연결한다.</li><li>group commit은 throughput 최적화가 아니라 명시적 RPO trade-off다. batch interval과 최대 loss를 사용자 계약에 포함한다.</li><li>filesystem type·mount option·volume type·controller cache·replication acknowledgment를 배포 inventory로 관리한다.</li><li>crash injection을 syscall 직후, file fsync 전후, rename 전후, directory fsync 전후에 배치하고 허용 상태를 자동 assertion한다.</li><li>startup은 checksum/generation으로 target·orphan temp를 검증하고, uncertain external result는 source of truth와 reconcile한다.</li><li>backup은 존재가 아니라 정기 restore 성공, checksum, retention, 접근권한까지 검증한다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. error handling·장애 진단 runbook</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;">계약 확인:</strong> 실패한 API가 accepted·visible·durable·replicated 중 어디까지 약속했는지 먼저 고정한다.</li><li><strong style="color:#f8fafc;">대상 resolve:</strong> fd→inode, pathname→mount, filesystem type/options, block device·volume chain을 확인한다.</li><li><strong style="color:#f8fafc;">return/error:</strong> short count, EINTR, EIO, ENOSPC, EDQUOT, EXDEV, timeout과 발생 단계(write/fsync/rename/dir fsync)를 기록한다.</li><li><strong style="color:#f8fafc;">격리:</strong> 반복 write가 손상을 확대하면 admission을 막고 read-only/failover를 검토한다. 원본 삭제·즉흥 fsck를 피한다.</li><li><strong style="color:#f8fafc;">증거:</strong> strace timing, application generation/checksum, mount info, kernel log, dirty/writeback, iostat/PSI, device health를 같은 시간축에 수집한다.</li><li><strong style="color:#f8fafc;">분류:</strong> partial syscall, delayed writeback, namespace publication, journal replay, device/cache, replication/application invariant 중 failure domain을 나눈다.</li><li><strong style="color:#f8fafc;">복구:</strong> snapshot/copy에서 journal replay 또는 offline fsck를 수행하고 application checksum·source of truth로 후속 reconcile한다.</li><li><strong style="color:#f8fafc;">재개:</strong> OLD/NEW invariant, no duplicate/missing business action, replica/backup 상태와 error counter 안정 후 traffic을 단계적으로 연다.</li><li><strong style="color:#f8fafc;">재발 방지:</strong> fault point test, acknowledgment 이동, capacity/quota headroom, flush contract 검증을 release gate로 만든다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 놓치기 쉬운 함정</h2>
+<ul style="margin:0;padding-left:22px;"><li><strong style="color:#fecaca;">write ret&gt;=0 = 전체 성공:</strong> 실제 반환 byte 수만큼만 progress다.</li><li><strong style="color:#fecaca;">reader가 NEW를 봄 = reboot 뒤도 NEW:</strong> page cache visibility와 media durability는 다르다.</li><li><strong style="color:#fecaca;">rename atomic = durable:</strong> file sync와 directory sync가 별도다.</li><li><strong style="color:#fecaca;">journal = user data/DB transaction:</strong> filesystem metadata invariant가 application 의미를 모른다.</li><li><strong style="color:#fecaca;">fsync error면 아무것도 적용 안 됨:</strong> 일부 persistence가 완료된 uncertain state일 수 있어 reconcile해야 한다.</li><li><strong style="color:#fecaca;">read-only mount = write 없음:</strong> journal replay가 storage를 바꿀 수 있다.</li><li><strong style="color:#fecaca;">O_DIRECT = durable:</strong> cache path와 persistence contract를 혼동한다.</li><li><strong style="color:#fecaca;">backup 있음 = 복구 가능:</strong> restore를 검증하지 않은 backup은 가설이다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. 30분 실습: durability state machine 리뷰</h2>
+<p style="margin:0 0 10px;">각 step 뒤 crash를 삽입해 허용 state를 계산한다. 모델은 filesystem 구현 증명이 아니라 protocol invariant를 명시적으로 만드는 review 도구다.</p>
+<pre style="margin:0;white-space:pre;overflow-x:auto;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;">python3 - &lt;&lt;'PY'
+STEPS=('write_all','fsync_file','rename','fsync_dir','ack')
+
+def crash_after(step):
+    i=STEPS.index(step)
+    visible='NEW' if i &gt;= STEPS.index('rename') else 'OLD'
+    durable=('NEW' if i &gt;= STEPS.index('fsync_dir') else
+             'OLD_OR_NEW' if i &gt;= STEPS.index('rename') else 'OLD')
+    acked=i &gt;= STEPS.index('ack')
+    return visible,durable,acked
+
+expected={
+ 'write_all': ('OLD','OLD',False),
+ 'fsync_file':('OLD','OLD',False),
+ 'rename':    ('NEW','OLD_OR_NEW',False),
+ 'fsync_dir': ('NEW','NEW',False),
+ 'ack':       ('NEW','NEW',True),
+}
+for step in STEPS:
+    got=crash_after(step)
+    assert got == expected[step]
+    print(f'{step:10} visible={got[0]:3} durable={got[1]:10} ack={got[2]}')
+
+# 핵심: ack가 참이면 durable은 반드시 NEW
+assert all(not crash_after(s)[2] or crash_after(s)[1]=='NEW' for s in STEPS)
+PY</pre>
+<ol style="margin:12px 0 0;padding-left:22px;"><li><strong style="color:#f8fafc;">0~10분:</strong> 각 step의 visibility·durability·ack state를 말로 설명한다.</li><li><strong style="color:#f8fafc;">10~20분:</strong> directory fsync를 제거해 ack-before-durable assertion이 깨지는 test를 만든다.</li><li><strong style="color:#f8fafc;">20~30분:</strong> replication_ack와 application_commit 단계를 추가하고 RPO 0/1초 policy를 비교한다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 관찰 명령과 증거 읽기</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;"># syscall return, 순서, latency
+strace -ff -ttT -e trace=openat,write,fdatasync,fsync,rename,close ./writer
+
+# pathname이 실제 어느 mount/filesystem인지
+findmnt -T /srv/app/data -o TARGET,SOURCE,FSTYPE,OPTIONS
+stat -c 'dev=%d inode=%i links=%h size=%s name=%n' /srv/app/data
+
+# page-cache/writeback와 device saturation
+grep -E '^(Dirty|Writeback):' /proc/meminfo
+cat /proc/pressure/io
+iostat -xz 1
+dmesg --ctime | grep -Ei 'I/O error|EXT4-fs|JBD2|nvme|reset'
+
+# capacity·inode·quota 단서
+df -h /srv/app; df -i /srv/app
+quota -s 2&gt;/dev/null || true</pre>
+<p style="margin:10px 0 0;">strace에서 기대하는 safe order는 모든 write return 누적=N→file fsync=0→rename=0→directory fsync=0→success response다. latency가 긴 syscall만 보지 말고 그 아래 block/device saturation과 위의 acknowledgment timing을 함께 본다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 실패 시나리오: 성공 로그는 있는데 reboot 후 설정이 돌아왔다</h2>
+<p style="margin:0;">service가 temp를 완성하고 rename한 직후 success log를 남겼지만 directory fsync 전에 host가 power loss됐다. 실행 중 reader는 NEW를 봤고 monitoring도 정상이라 배포 control plane은 성공으로 기록했다. reboot 뒤 pathname은 OLD로 복구되어 desired state와 drift가 생겼다. 대응은 success log/ack를 directory fsync 뒤로 옮기고 target에 generation+checksum을 넣어 startup reconciliation을 수행한 것이다. fsync p99 증가는 batch/RPO와 rollout concurrency로 조정했으며 durability 단계를 생략하지 않았다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 대기업 면접 질문 3개</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;">“write가 성공했다”는 정확히 무슨 뜻인가요?</strong><br>답변 포인트: up to count, short return, page cache acceptance, visibility, delayed EIO/ENOSPC, fsync와 media completion의 분리.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">file을 atomic하고 durable하게 교체하는 과정을 kernel/storage까지 설명해 보세요.</strong><br>답변 포인트: same-dir temp, write_all, checksum, file fsync, journal/flush, atomic rename, directory fsync, ack, 각 crash state.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">fsync가 성공하면 데이터베이스 transaction도 안전한가요?</strong><br>답변 포인트: file scope vs multi-record invariant, application WAL/commit, idempotence, uncertain result, replica/backup과 end-to-end contract.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">15. 퀴즈·누적 리뷰</h2>
+<ol style="margin:0;padding-left:22px;"><li>accepted, visible, atomic, durable을 한 file update 예로 구분하라.</li><li>file fsync와 directory fsync가 각각 보호하는 object는?</li><li>journal commit 뒤 checkpoint 전 crash가 안전한 이유는?</li><li>O_DIRECT·O_SYNC·fdatasync의 목적 차이는?</li><li>fsync가 EIO를 반환했을 때 “미적용”으로 단정하면 안 되는 이유는?</li><li>same pathname이 container와 host에서 다른 file을 가리킬 수 있는 이유는?</li><li>application acknowledgment를 어느 단계에 둘지 RPO·latency로 방어하라.</li><li>backup과 journal, replica, application WAL의 책임을 구분하라.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">16. 다음 날 연결</h2>
+<p style="margin:0;">Day 43은 Week 7의 시작인 <strong style="color:#f8fafc;">device, controller, driver, interrupt</strong>다. 오늘 file write가 block layer 아래로 내려간 뒤 hardware completion이 어떻게 interrupt로 CPU와 driver에 전달되는지 추적한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">17. 공식·1차 출처</h2>
+<ul style="margin:0;padding-left:22px;word-break:break-word;"><li><a href="https://man7.org/linux/man-pages/man2/write.2.html" style="color:#7dd3fc;">Linux man-pages — write(2)</a>: partial return, delayed error, non-durability와 O_DIRECT partial inconsistency.</li><li><a href="https://man7.org/linux/man-pages/man2/fsync.2.html" style="color:#7dd3fc;">Linux man-pages — fsync(2)</a>: data·metadata completion, directory fsync와 writeback error reporting.</li><li><a href="https://man7.org/linux/man-pages/man2/rename.2.html" style="color:#7dd3fc;">Linux man-pages — rename(2)</a>: atomic replacement, same-mount EXDEV, NFS uncertain result.</li><li><a href="https://man7.org/linux/man-pages/man2/open.2.html" style="color:#7dd3fc;">Linux man-pages — open(2)</a>: fd/OFD, O_SYNC·O_DSYNC·O_DIRECT·O_TMPFILE semantics.</li><li><a href="https://docs.kernel.org/filesystems/vfs.html" style="color:#7dd3fc;">Linux Kernel — VFS</a>: filesystem object model, writeback·fsync operation과 error tracking.</li><li><a href="https://docs.kernel.org/filesystems/ext4/journal.html" style="color:#7dd3fc;">Linux Kernel — ext4 JBD2 journal</a>: descriptor·commit·revoke·checksum·replay.</li><li><a href="https://docs.kernel.org/admin-guide/ext4.html" style="color:#7dd3fc;">Linux Kernel — ext4 administration</a>: data modes와 mount/recovery semantics.</li><li><a href="https://docs.kernel.org/block/writeback_cache_control.html" style="color:#7dd3fc;">Linux Kernel — volatile write-back cache control</a>: flush·FUA persistence ordering.</li><li><a href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/write.html" style="color:#7dd3fc;">POSIX.1-2024 — write</a>: complete·partial·deferred write model.</li><li><a href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/fsync.html" style="color:#7dd3fc;">POSIX.1-2024 — fsync</a>: synchronized I/O completion.</li></ul>
+<p style="margin:28px 0 0;padding-top:18px;border-top:1px solid #27435d;color:#8fb3c9;font-size:13px;">Day 42 완료 기준: fd에서 media까지 보장 사다리를 그리고, API acknowledgment 위치를 RPO·latency로 방어하며, partial write·writeback·namespace·journal·device·application failure를 증거로 분류할 수 있다.</p>
+</td></tr></table></td></tr></table>
+</body></html>
