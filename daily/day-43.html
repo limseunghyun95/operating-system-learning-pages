@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Operating System 심화 커리큘럼 Day 43 - device, controller, driver, interrupt</title></head>
+<body style="margin:0;padding:0;background:#07111f;color:#dbeafe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.72;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#07111f;"><tr><td align="center" style="padding:24px 12px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:680px;background:#0f1d2e;border:1px solid #23415d;border-radius:18px;overflow:hidden;">
+<tr><td style="padding:30px 28px 22px;background:#102a43;border-bottom:1px solid #28506f;">
+<div style="font-size:13px;letter-spacing:.12em;color:#5eead4;font-weight:800;">OPERATING SYSTEM · DAY 43 / 63 · I/O &amp; INTERRUPTS</div>
+<h1 style="margin:10px 0 8px;font-size:28px;line-height:1.3;color:#f8fafc;">device, controller, driver, interrupt</h1>
+<p style="margin:0;color:#b9d6eb;">한 줄 요약: <strong style="color:#f8fafc;">device controller는 register·queue·DMA engine으로 hardware work를 수행하고, driver는 kernel의 공통 I/O 모델과 device protocol을 연결하며, interrupt는 완료·오류 event를 CPU에 비동기로 알린다. 빠른 IRQ handler는 원인을 확인·ack/mask하고 긴 처리는 thread/workqueue로 넘긴다.</strong></p>
+</td></tr><tr><td style="padding:26px 28px 34px;">
+
+<h2 style="margin:0 0 12px;color:#5eead4;font-size:21px;">1. 초보자 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:14px;">
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;width:29%;">device</td><td style="border-bottom:1px solid #27435d;">NIC, NVMe SSD, keyboard처럼 CPU 밖에서 입력·출력·저장을 수행하는 hardware endpoint.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">controller</td><td style="border-bottom:1px solid #27435d;">device의 command, queue, status, DMA, interrupt 생성을 담당하는 제어 회로. CPU는 보통 controller register와 descriptor를 다룬다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">driver</td><td style="border-bottom:1px solid #27435d;">kernel subsystem의 공통 요청을 device별 register·descriptor protocol로 번역하고 completion/error를 다시 올려주는 software.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">bus</td><td style="border-bottom:1px solid #27435d;">PCIe, USB, I2C처럼 device 발견·addressing·data transfer를 제공하는 연결 fabric/protocol.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">MMIO</td><td style="border-bottom:1px solid #27435d;">Memory-Mapped I/O. CPU address 일부를 RAM이 아닌 device register 접근으로 해석하는 방식.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">doorbell</td><td style="border-bottom:1px solid #27435d;">driver가 새 command/descriptor가 준비됐다고 controller에 알리기 위해 쓰는 register.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">interrupt / IRQ</td><td style="border-bottom:1px solid #27435d;">device나 controller가 CPU의 정상 instruction 흐름을 중단시켜 event 처리를 요청하는 비동기 신호.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">interrupt controller</td><td style="border-bottom:1px solid #27435d;">여러 IRQ source를 mask·priority·routing하여 특정 CPU/vector로 전달하는 hardware와 kernel abstraction.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">INTx</td><td style="border-bottom:1px solid #27435d;">PCI의 legacy pin/line 기반 level interrupt. 여러 device가 line을 공유할 수 있어 handler가 자기 device 원인인지 확인한다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">MSI / MSI-X</td><td style="border-bottom:1px solid #27435d;">device가 특정 address로 memory-write message를 보내 interrupt vector를 발생시키는 PCI 방식. MSI-X는 더 많은 독립 vector와 affinity를 제공한다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">hard IRQ context</td><td style="border-bottom:1px solid #27435d;">interrupt 진입 직후의 제한된 실행 context. block/sleep하면 안 되며 최소 작업으로 끝내야 한다.</td></tr>
+<tr><td style="border-bottom:1px solid #27435d;color:#7dd3fc;font-weight:700;">threaded IRQ</td><td style="border-bottom:1px solid #27435d;">빠른 primary handler가 device를 안정화한 뒤 sleep 가능한 kernel thread가 긴 처리를 수행하는 방식.</td></tr>
+<tr><td style="color:#7dd3fc;font-weight:700;">EOI / acknowledge</td><td>End Of Interrupt 또는 device status clear. 처리 완료를 interrupt controller/device에 알려 재전달·unmask가 가능하게 하는 단계.</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">2. mental model: 식당 주문표와 호출벨</h2>
+<p style="margin:0;">application은 주문자, kernel subsystem은 홀 직원, driver는 주방 언어를 아는 담당자, controller는 주문표 queue와 조리 장비를 관리하는 주방장, device는 실제 조리 장비다. 주문표를 queue에 두고 doorbell을 누르면 controller가 일한다. CPU가 계속 주방을 들여다보는 polling 대신 완성 호출벨이 interrupt다. 벨을 받은 직원은 어떤 주문이 끝났는지 빠르게 확인하고, 계산·서빙처럼 긴 일은 다른 worker에 넘긴다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">3. architecture: I/O submit부터 completion까지</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">user process
+  │ read/write/ioctl/send → syscall
+  ▼
+VFS / block / net subsystem
+  │ common request (bio, skb, request ...)
+  ▼
+device driver
+  │ map buffer, fill descriptor/ring, MMIO doorbell
+  ▼
+device controller ─── device/media/link
+  │ execute command, update completion/status
+  │ optionally DMA result into host memory
+  ▼
+INTx line 또는 MSI/MSI-X memory-write message
+  ▼
+interrupt controller → CPU vector → arch entry
+  ▼
+Linux generic IRQ: irq_desc → flow handler → driver handler
+  │ status 확인, ack/mask, completion 수집
+  ├─ 빠른 완료 → wakeup/completion
+  └─ 긴 처리 → threaded IRQ / workqueue / subsystem polling
+  ▼
+blocked task wakeup → syscall return</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">4. 상태 전이: device lifetime과 한 요청</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#c4f1ea;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;">driver lifetime
+[DISCOVERED] → probe → BAR/MMIO map → queue/DMA alloc
+  → IRQ vector alloc → request_irq → device enable → [RUNNING]
+  → quiesce new I/O → mask device IRQ → drain handler/work
+  → stop DMA → free_irq/vector/buffer → unmap → [REMOVED]
+
+single request
+[FREE descriptor] → [PREPARED] → memory barrier → [DOORBELL]
+  → [DEVICE OWNED] → [COMPLETION WRITTEN] → [IRQ RAISED]
+  → handler ack/consume → [HOST OWNED] → waiter wakeup
+
+teardown invariant: DMA와 IRQ callback이 참조할 memory를 먼저 free하지 않는다.</pre>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">5. CS·kernel deep dive</h2>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.1 device, controller, driver를 구분하라</h3><p style="margin:0;">device는 물리 기능, controller는 queue/register/interrupt state machine, driver는 kernel software다. NVMe “disk” 하나에도 PCIe function, NVMe controller, namespace, block driver가 계층적으로 존재한다. 장애 위치를 한 단어 “disk 문제”로 뭉치면 reset scope와 evidence를 놓친다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.2 probe는 resource ownership graph를 만든다</h3><p style="margin:0;">bus가 발견한 device ID와 driver table이 match되면 probe가 실행된다. MMIO region, DMA mask/buffer, queue, IRQ vector, subsystem registration을 단계적으로 얻는다. 중간 실패 시 획득 역순으로 unwind해야 reload·hotplug가 안전하다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.3 MMIO는 일반 RAM load/store가 아니다</h3><p style="margin:0;">driver는 raw physical address를 직접 dereference하지 않고 <code>ioremap</code>과 <code>readl/writel</code> 같은 accessor를 사용한다. compiler·CPU·bus ordering과 posted write 때문에 memory barrier나 readback이 protocol의 일부가 될 수 있다. device spec과 kernel API 없이 volatile pointer만 쓰면 안 된다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.4 line interrupt와 message interrupt</h3><p style="margin:0;">legacy INTx는 level-asserted line이 공유될 수 있어 각 handler가 status register를 보고 자기 interrupt가 아니면 <code>IRQ_NONE</code>을 반환한다. MSI/MSI-X는 device의 special memory write가 CPU vector를 만들며 exclusive vector와 multi-queue 분산에 유리하다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.5 Linux generic IRQ abstraction</h3><p style="margin:0;">hardware IRQ number는 irq_domain을 거쳐 Linux IRQ와 <code>irq_desc</code>에 매핑된다. generic layer는 edge, level, fasteoi, per-CPU flow를 irq_chip의 mask/ack/unmask/eoi primitive와 분리한다. driver는 <code>request_irq</code>/<code>request_threaded_irq</code>로 handler와 <code>dev_id</code>를 연결한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.6 hard handler가 짧아야 하는 이유</h3><p style="margin:0;">hard IRQ context는 해당 CPU의 normal work를 선점하며 sleep 가능한 lock/I/O를 사용할 수 없다. status snapshot, 원인 clear/mask, 최소 completion 수집만 하고 긴 packet processing·error recovery는 threaded IRQ, workqueue, NAPI 같은 deferred context로 옮긴다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.7 edge와 level은 ack/mask 순서가 다르다</h3><p style="margin:0;">edge는 순간 변화가 event라 pending edge를 잃지 않는 흐름이 중요하다. level은 원인이 남아 있는 동안 line이 계속 asserted되어 원인을 clear하지 않고 unmask하면 즉시 재진입한다. generic flow handler와 device status clear ordering을 함부로 바꾸면 lost 또는 storm interrupt가 생긴다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.8 MSI는 DMA visibility ordering을 돕는다</h3><p style="margin:0;">PCI 문서상 device의 DMA data write는 MSI 전달 전에 host에서 visible하다. 따라서 completion interrupt를 받은 CPU가 stale descriptor를 보는 race를 줄인다. 그렇다고 driver의 producer/consumer index barrier와 ownership protocol이 사라지는 것은 아니다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.9 affinity와 multi-queue는 locality trade-off다</h3><p style="margin:0;">MSI-X vector를 queue별로 배정하고 IRQ affinity를 consumer CPU와 맞추면 cache locality와 parallelism이 좋아진다. 반대로 한 CPU에 interrupt가 몰리면 softirq backlog·tail latency가 커지고, 너무 자주 migrate하면 cache miss가 늘어난다. workload와 NUMA topology로 조정한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.10 interrupt coalescing은 latency와 CPU 비용을 교환한다</h3><p style="margin:0;">event마다 IRQ를 내면 latency는 낮지만 high rate에서 CPU가 handler 진입 비용에 잠긴다. count/time threshold로 여러 completion을 한 interrupt에 묶으면 throughput은 좋아지지만 tail latency가 늘어난다. static maximum이 아니라 p99 SLO와 packets/interrupt로 tuning한다.</p>
+<h3 style="margin:16px 0 6px;color:#f8fafc;font-size:17px;">5.11 teardown 순서는 correctness다</h3><p style="margin:0;">새 I/O 차단→device IRQ source disable→pending handler/work 동기화→DMA stop→buffer unmap/free→IRQ free→MMIO release 순서가 핵심이다. DMA를 멈추기 전에 buffer를 free하면 device가 다른 object의 memory를 덮는 use-after-free가 된다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">6. interrupt 방식 비교</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="8" border="0" style="border-collapse:collapse;background:#0b1726;border:1px solid #27435d;font-size:12px;">
+<tr style="background:#15314a;color:#bae6fd;"><td>방식</td><td>특징</td><td>실무 고려</td></tr>
+<tr><td style="border-top:1px solid #27435d;">INTx</td><td style="border-top:1px solid #27435d;">pin/level, 공유 가능, device status 확인</td><td style="border-top:1px solid #27435d;">shared-line storm, IRQ_NONE, 정확한 clear</td></tr>
+<tr><td style="border-top:1px solid #27435d;">MSI</td><td style="border-top:1px solid #27435d;">message, exclusive vector, 연속 vector 제약</td><td style="border-top:1px solid #27435d;">platform fallback, DMA ordering, affinity</td></tr>
+<tr><td style="border-top:1px solid #27435d;">MSI-X</td><td style="border-top:1px solid #27435d;">많은 독립 vector, vector별 target/mask</td><td style="border-top:1px solid #27435d;">multi-queue scaling, vector scarcity와 NUMA</td></tr>
+<tr><td style="border-top:1px solid #27435d;">threaded IRQ</td><td style="border-top:1px solid #27435d;">primary + sleep 가능한 thread function</td><td style="border-top:1px solid #27435d;">mask 기간, scheduling latency, priority</td></tr>
+</table>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">7. 실무 best practice</h2>
+<ul style="margin:0;padding-left:22px;"><li>probe의 각 resource acquisition에 대응 cleanup label을 두고 fault injection으로 모든 실패 지점을 검증한다.</li><li><code>request_irq</code> 전에 device를 quiesce하고 pending status를 clear한다. handler가 준비되기 전 interrupt 발생을 막는다.</li><li>hard handler에서는 status snapshot·ack/mask·queue ownership transfer만 수행하고 block/sleep/긴 loop를 금지한다.</li><li>shared IRQ는 고유 <code>dev_id</code>로 등록하고 자기 device 원인이 아니면 빠르게 <code>IRQ_NONE</code>을 반환한다.</li><li>queue별 MSI-X와 IRQ affinity를 RSS/application CPU/NUMA node에 맞추되 자동 balancing과 충돌하지 않게 운영 정책을 명시한다.</li><li>interrupt count/rate, per-CPU 분포, handler duration, workqueue/softirq backlog, packets 또는 completions per interrupt를 함께 본다.</li><li>coalescing 값은 throughput만이 아니라 p99/p999 latency, CPU utilization, queue drop으로 검증한다.</li><li>remove/reset은 새 submit 차단, IRQ source disable, handler synchronize, DMA stop, memory free 순서를 code review checklist로 고정한다.</li><li>watchdog는 “IRQ가 없다”가 아니라 outstanding command age와 progress counter를 기준으로 reset/escalation한다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">8. error handling runbook</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;">scope:</strong> 어떤 device/function/queue/vector/CPU에서 progress가 멈췄는지 식별한다.</li><li><strong style="color:#f8fafc;">evidence:</strong> <code>/proc/interrupts</code> delta, affinity, sysfs driver binding, lspci, kernel log, queue indices, outstanding age를 같은 시간축에 수집한다.</li><li><strong style="color:#f8fafc;">lost IRQ:</strong> completion queue는 늘었는데 IRQ count가 멈췄다면 mask state, MSI enable, vector routing, EOI/rearm, affinity CPU online 상태를 확인한다.</li><li><strong style="color:#f8fafc;">storm:</strong> IRQ count만 급증하고 useful completion이 없다면 status clear 실패, level source 지속, shared-line misclaim을 본다. 무작정 global IRQ disable은 다른 device도 멈춘다.</li><li><strong style="color:#f8fafc;">handler slow:</strong> hardirq time과 deferred backlog를 분리하고 긴 MMIO loop, lock contention, queue budget 부족을 찾는다.</li><li><strong style="color:#f8fafc;">timeout:</strong> request를 즉시 재사용하지 말고 device ownership을 확인한다. abort→queue reset→controller reset 순으로 blast radius를 넓힌다.</li><li><strong style="color:#f8fafc;">reset:</strong> 새 submit 차단, IRQ/DMA quiesce, outstanding request를 정의된 error로 완료, hardware reinit 후 generation을 바꿔 stale completion을 거부한다.</li><li><strong style="color:#f8fafc;">teardown:</strong> handler/work synchronization과 DMA stop 완료를 확인한 뒤 memory/vector/MMIO를 release한다.</li><li><strong style="color:#f8fafc;">recovery verify:</strong> IRQ count 증가만 보지 말고 end-to-end request completion, checksum, drop/error counter 안정까지 확인한다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">9. 놓치기 쉬운 함정</h2>
+<ul style="margin:0;padding-left:22px;"><li><strong style="color:#fecaca;">interrupt number = 고정 hardware line:</strong> irq_domain과 MSI vector를 거치는 logical mapping일 수 있다.</li><li><strong style="color:#fecaca;">IRQ count 증가 = useful work:</strong> spurious/storm interrupt일 수 있어 completion delta와 함께 본다.</li><li><strong style="color:#fecaca;">handler에서 mutex·sleep:</strong> hard IRQ context 규칙 위반이다. threaded IRQ/workqueue로 넘긴다.</li><li><strong style="color:#fecaca;">status clear 전에 unmask:</strong> level source가 남아 즉시 재진입할 수 있다.</li><li><strong style="color:#fecaca;">MSI-X vector가 많을수록 무조건 빠름:</strong> vector scarcity, cache/NUMA, queue imbalance 비용이 있다.</li><li><strong style="color:#fecaca;">IRQ free 뒤 DMA buffer free면 항상 안전:</strong> device DMA engine을 먼저 멈추고 ownership을 회수해야 한다.</li><li><strong style="color:#fecaca;">timeout 뒤 동일 request 재사용:</strong> 늦은 completion이 새 request로 오인될 수 있다.</li><li><strong style="color:#fecaca;">MMIO를 RAM처럼 접근:</strong> accessor, ordering, posted-write semantics가 다르다.</li></ul>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">10. 30분 실습: interrupt coalescing simulator</h2>
+<p style="margin:0 0 10px;">event마다 IRQ를 내는 경우와 count threshold로 묶는 경우를 비교한다. 단순 모델이지만 IRQ rate와 completion latency의 trade-off를 수치로 확인한다.</p>
+<pre style="margin:0;white-space:pre;overflow-x:auto;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;">python3 - &lt;&lt;'PY'
+def simulate(events, threshold):
+    pending=[]; irqs=0; latencies=[]
+    for tick in events:
+        pending.append(tick)
+        if len(pending) &gt;= threshold:
+            irqs += 1
+            latencies += [tick-arrival for arrival in pending]
+            pending.clear()
+    if pending:
+        tick=events[-1]+1                 # timer flush 모델
+        irqs += 1
+        latencies += [tick-arrival for arrival in pending]
+    return irqs, max(latencies), sum(latencies)/len(latencies)
+
+events=list(range(100))
+one=simulate(events,1)
+eight=simulate(events,8)
+assert one == (100,0,0.0)
+assert eight[0] == 13 and eight[1] == 7
+print('threshold=1 ',one)
+print('threshold=8 ',eight)
+print('irq_reduction=',one[0]/eight[0])
+PY</pre>
+<ol style="margin:12px 0 0;padding-left:22px;"><li><strong style="color:#f8fafc;">0~10분:</strong> threshold 1과 8의 IRQ 수·최대 latency를 비교한다.</li><li><strong style="color:#f8fafc;">10~20분:</strong> burst와 idle gap을 추가하고 time-based flush가 없을 때 starvation을 관찰한다.</li><li><strong style="color:#f8fafc;">20~30분:</strong> 4 queue/CPU affinity 모델을 추가해 imbalance와 p99를 계산한다.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">11. Linux 관찰</h2>
+<pre style="margin:0;white-space:pre-wrap;background:#07111f;border:1px solid #27435d;border-radius:10px;padding:14px;color:#d1fae5;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;"># IRQ별 per-CPU count와 handler 이름
+cat /proc/interrupts
+watch -n 1 'cat /proc/interrupts'
+
+# IRQ affinity와 effective routing (IRQ 번호는 실제 환경에서 확인)
+cat /proc/irq/IRQ/smp_affinity_list
+cat /proc/irq/IRQ/effective_affinity_list
+
+# device→driver·NUMA·MSI capability
+lspci -nnk
+lspci -vv -s BDF
+readlink /sys/bus/pci/devices/BDF/driver
+cat /sys/bus/pci/devices/BDF/numa_node
+
+# CPU가 hardirq/softirq에 쓰는 시간과 backlog
+cat /proc/softirqs
+mpstat -P ALL 1
+dmesg --ctime | grep -Ei 'irq|msi|timeout|reset|AER'</pre>
+<p style="margin:10px 0 0;">한 번의 snapshot보다 workload 전후 delta가 중요하다. IRQ count, completions, queue depth, hardirq/softirq CPU, reset/error log를 함께 보며 “신호가 없는지”, “신호만 많고 일이 없는지”, “deferred 처리가 밀리는지”를 구분한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">12. 실패 시나리오: 한 CPU만 100%인데 NIC throughput은 하락</h2>
+<p style="margin:0;">NIC의 모든 RX queue interrupt가 CPU 0에 고정되고 coalescing도 지나치게 낮았다. <code>/proc/interrupts</code>는 CPU 0에서 수십만 IRQ/s, softirq backlog와 packet drop을 보였지만 다른 CPU는 idle했다. 해결은 MSI-X queue 수를 workload에 맞추고 RSS·IRQ affinity·application worker를 같은 NUMA node에 배치하며 adaptive coalescing을 p99 기준으로 조정한 것이다. 단순히 IRQ를 더 많은 CPU로 흩뿌리지 않고 flow locality와 cache miss도 함께 측정했다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">13. 대기업 면접 질문 3개</h2>
+<ol style="margin:0;padding-left:22px;"><li><strong style="color:#f8fafc;">device, controller, driver의 차이와 I/O 완료 경로를 설명해 보세요.</strong><br>답변 포인트: subsystem request, driver descriptor/MMIO, controller execution, DMA/status, interrupt controller/vector, hard handler, deferred work, task wakeup.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">INTx와 MSI/MSI-X는 무엇이 다른가요?</strong><br>답변 포인트: line/level/shared vs memory-write/exclusive, vector 수·affinity, DMA visibility ordering, platform fallback, multi-queue scaling.</li><li style="margin-top:8px;"><strong style="color:#f8fafc;">interrupt storm과 lost interrupt를 어떻게 구분하고 복구하나요?</strong><br>답변 포인트: IRQ count와 useful completion delta, status/mask/EOI, queue indices, handler duration, watchdog, quiesce→reset 단계, stale completion generation.</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">14. 퀴즈·누적 리뷰</h2>
+<ol style="margin:0;padding-left:22px;"><li>controller와 driver가 각각 유지하는 state를 세 가지씩 말하라.</li><li>shared INTx handler가 IRQ_NONE을 반환해야 하는 경우는?</li><li>hard IRQ handler에서 sleep할 수 없는 이유는?</li><li>level interrupt 원인을 clear하지 않고 unmask하면 어떻게 되는가?</li><li>MSI-X queue별 vector와 affinity가 locality에 주는 장단점은?</li><li>remove 시 IRQ, DMA, buffer free의 올바른 순서는?</li><li>Day 42 연결: fsync completion 아래에서 controller와 interrupt가 맡는 역할은?</li></ol>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">15. 다음 날 연결</h2>
+<p style="margin:0;">Day 44는 <strong style="color:#f8fafc;">polling, interrupt, DMA</strong>다. CPU가 device를 직접 확인하는 polling과 event-driven interrupt, device가 memory를 직접 옮기는 DMA를 latency·throughput·CPU overhead 관점에서 비교한다.</p>
+
+<h2 style="margin:28px 0 12px;color:#5eead4;font-size:21px;">16. 공식·1차 출처</h2>
+<ul style="margin:0;padding-left:22px;word-break:break-word;"><li><a href="https://docs.kernel.org/core-api/genericirq.html" style="color:#7dd3fc;">Linux Kernel — Generic IRQ handling</a>: irq_desc, irq_chip, flow handler, request_irq/threaded IRQ와 affinity API.</li><li><a href="https://docs.kernel.org/driver-api/driver-model/overview.html" style="color:#7dd3fc;">Linux Kernel — Driver Model</a>: bus·device·driver의 공통 model과 probe/power/hotplug lifecycle.</li><li><a href="https://docs.kernel.org/driver-api/device-io.html" style="color:#7dd3fc;">Linux Kernel — Bus-Independent Device Accesses</a>: ioremap, MMIO accessor와 ordering.</li><li><a href="https://docs.kernel.org/PCI/pci.html" style="color:#7dd3fc;">Linux Kernel — How To Write Linux PCI Drivers</a>: PCI initialization, IRQ registration, MSI와 안전한 shutdown 순서.</li><li><a href="https://docs.kernel.org/PCI/msi-howto.html" style="color:#7dd3fc;">Linux Kernel — MSI Driver Guide</a>: MSI/MSI-X vector allocation, affinity, fallback와 진단.</li><li><a href="https://docs.kernel.org/PCI/controller/pci-controller-drivers.html" style="color:#7dd3fc;">Linux Kernel — PCI Host Controller Drivers</a>: INTx demultiplexing과 MSI IRQ domain.</li><li><a href="https://docs.kernel.org/core-api/workqueue.html" style="color:#7dd3fc;">Linux Kernel — Workqueue</a>: sleep 가능한 asynchronous execution context와 worker model.</li><li><a href="https://docs.kernel.org/core-api/wrappers/memory-barriers.html" style="color:#7dd3fc;">Linux Kernel — Memory barriers</a>: device/CPU memory ordering과 accessor semantics.</li></ul>
+<p style="margin:28px 0 0;padding-top:18px;border-top:1px solid #27435d;color:#8fb3c9;font-size:13px;">Day 43 완료 기준: 한 I/O의 submit→hardware execution→IRQ→deferred completion 흐름을 그리고, INTx/MSI-X와 hard/threaded handler의 trade-off, storm·lost IRQ·teardown race 진단을 설명할 수 있다.</p>
+</td></tr></table></td></tr></table>
+</body></html>

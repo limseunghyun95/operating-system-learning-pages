@@ -4,7 +4,7 @@
   "tagline": "process에서 kernel·hardware·production incident까지",
   "accent": "#5eead4",
   "totalDays": 63,
-  "updatedAt": "2026-10-19T09:23:10+09:00",
+  "updatedAt": "2026-10-28T01:29:06+09:00",
   "lessons": [
     {
       "day": 1,
@@ -383,6 +383,15 @@
       "path": "day-42.html",
       "kind": "review",
       "publishedAt": "2026-10-19T09:23:10+09:00"
+    },
+    {
+      "day": 43,
+      "week": 7,
+      "title": "device, controller, driver, interrupt",
+      "summary": "device→controller→driver→interrupt controller→CPU handler의 I/O 완료 경로를 따라 INTx·MSI-X·hard/threaded IRQ와 production 장애 대응을 연결합니다.",
+      "path": "day-43.html",
+      "kind": "lesson",
+      "publishedAt": "2026-10-28T01:29:06+09:00"
     }
   ]
 }
